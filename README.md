@@ -1,0 +1,2 @@
+# session_notify_server
+把开发工具的会话状态同步到多台设备
