@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://session-notify.local/protocol/ws-events.schema.json",
+  "title": "Session Notify WebSocket Event",
+  "type": "object",
+  "required": ["schema_version", "event_id", "event_type", "created_at"],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "notification.created",
+        "notification.acknowledged",
+        "notification.expired"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "notification": {
+      "type": ["object", "null"],
+      "required": [
+        "id",
+        "source",
+        "session_id",
+        "title",
+        "body",
+        "level",
+        "status",
+        "created_at",
+        "updated_at",
+        "requires_ack",
+        "metadata"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "source": { "type": "string" },
+        "session_id": { "type": "string" },
+        "title": { "type": "string" },
+        "body": { "type": "string" },
+        "level": {
+          "type": "string",
+          "enum": ["info", "success", "important", "critical"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "acknowledged", "expired", "cancelled"]
+        },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "expires_at": { "type": ["string", "null"], "format": "date-time" },
+        "requires_ack": { "type": "boolean" },
+        "metadata": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "notification_id": {
+      "type": ["string", "null"]
+    },
+    "ack_by_device_id": {
+      "type": ["string", "null"]
+    },
+    "ack_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "reason": {
+      "type": ["string", "null"]
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": { "event_type": { "const": "notification.created" } }
+      },
+      "then": {
+        "required": ["notification"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "event_type": { "const": "notification.acknowledged" } }
+      },
+      "then": {
+        "required": ["notification_id", "ack_by_device_id", "ack_at", "reason"]
+      }
+    }
+  ]
+}

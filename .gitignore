@@ -1,0 +1,55 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*.tmp
+*.log
+
+# LLM / agent tooling
+.claude/
+.codex/
+.cursor/
+.continue/
+.windsurf/
+.aider*
+.agents/
+.roo/
+
+# Python / uv
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Runtime data / secrets
+runtime/
+logs/
+*.db
+*.db-*
+.env
+.env.*
+!.env.example
+server.crt
+server.key
+*.pem
+*.pfx
+*.p12
+
+# Docker / local compose overrides
+compose.override.yaml

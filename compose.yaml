@@ -1,0 +1,26 @@
+services:
+  server:
+    build: .
+    ports:
+      - "8765:8765"
+    environment:
+      SESSION_NOTIFY_DB: /data/session_notify.db
+      SESSION_NOTIFY_CERT_FILE: /run/secrets/server.crt
+      SESSION_NOTIFY_KEY_FILE: /run/secrets/server.key
+    volumes:
+      - session_notify_data:/data
+      - ./runtime/secrets:/run/secrets:ro
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8765"
+      - --ssl-certfile
+      - /run/secrets/server.crt
+      - --ssl-keyfile
+      - /run/secrets/server.key
+
+volumes:
+  session_notify_data:

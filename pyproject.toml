@@ -1,0 +1,21 @@
+[project]
+name = "session-notify-server"
+version = "0.1.0"
+description = "FastAPI server for syncing AI session notifications across devices."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "pydantic>=2.10",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28",
+    "pytest>=8.3",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider --basetemp=runtime/pytest"

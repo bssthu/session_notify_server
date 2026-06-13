@@ -1,0 +1,298 @@
+openapi: 3.1.0
+info:
+  title: Session Notify API
+  version: 0.1.0
+servers:
+  - url: https://localhost:8765
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      security: []
+      responses:
+        "200":
+          description: Service health.
+  /api/v1/devices/bind:
+    post:
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceBindRequest"
+      responses:
+        "200":
+          description: Device credentials.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceBindResponse"
+  /api/v1/auth/refresh:
+    post:
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenRefreshRequest"
+      responses:
+        "200":
+          description: New access token for an existing device.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccessTokenResponse"
+  /api/v1/notifications:
+    get:
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: array
+            items:
+              $ref: "#/components/schemas/NotificationStatus"
+      responses:
+        "200":
+          description: Notifications.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Notification"
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NotificationCreate"
+      responses:
+        "200":
+          description: Created notification.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Notification"
+  /api/v1/notifications/{notification_id}/ack:
+    post:
+      parameters:
+        - name: notification_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AckRequest"
+      responses:
+        "200":
+          description: Ack result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AckResponse"
+  /api/v1/events:
+    get:
+      parameters:
+        - name: since_event_id
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Event stream catch-up.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventsResponse"
+  /api/v1/hooks/{source}:
+    post:
+      parameters:
+        - name: source
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HookPayload"
+      responses:
+        "200":
+          description: Notification generated from hook payload.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Notification"
+  /api/v1/ws:
+    get:
+      summary: WebSocket endpoint.
+      parameters:
+        - name: token
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "101":
+          description: WebSocket upgrade. Messages conform to ws-events.schema.json.
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    DeviceBindRequest:
+      type: object
+      required: [name, platform]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 80
+        platform:
+          type: string
+          enum: [windows, android]
+    DeviceBindResponse:
+      type: object
+      required: [device, refresh_token, access_token, token_type]
+      properties:
+        device:
+          $ref: "#/components/schemas/Device"
+        refresh_token:
+          type: string
+        access_token:
+          type: string
+        token_type:
+          type: string
+          const: bearer
+    TokenRefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+    AccessTokenResponse:
+      type: object
+      required: [device, access_token, token_type]
+      properties:
+        device:
+          $ref: "#/components/schemas/Device"
+        access_token:
+          type: string
+        token_type:
+          type: string
+          const: bearer
+    Device:
+      type: object
+      required: [id, name, platform, created_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        platform:
+          type: string
+          enum: [windows, android]
+        created_at:
+          type: string
+          format: date-time
+        last_seen_at:
+          type: [string, "null"]
+          format: date-time
+        revoked_at:
+          type: [string, "null"]
+          format: date-time
+    NotificationLevel:
+      type: string
+      enum: [info, success, important, critical]
+    NotificationStatus:
+      type: string
+      enum: [active, acknowledged, expired, cancelled]
+    NotificationCreate:
+      type: object
+      required: [source, session_id, title, body]
+      properties:
+        source:
+          type: string
+        session_id:
+          type: string
+        title:
+          type: string
+        body:
+          type: string
+        level:
+          $ref: "#/components/schemas/NotificationLevel"
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+        requires_ack:
+          type: boolean
+        metadata:
+          type: object
+    Notification:
+      allOf:
+        - $ref: "#/components/schemas/NotificationCreate"
+        - type: object
+          required: [id, status, created_at, updated_at]
+          properties:
+            id:
+              type: string
+            status:
+              $ref: "#/components/schemas/NotificationStatus"
+            created_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time
+    AckRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          default: user_confirmed
+    AckResponse:
+      type: object
+      required: [notification, already_acknowledged]
+      properties:
+        notification:
+          $ref: "#/components/schemas/Notification"
+        already_acknowledged:
+          type: boolean
+    EventsResponse:
+      type: object
+      required: [events]
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "./ws-events.schema.json"
+    HookPayload:
+      type: object
+      properties:
+        event_type:
+          type: [string, "null"]
+        message:
+          type: [string, "null"]
+        prompt:
+          type: [string, "null"]
+        command:
+          type: [string, "null"]
+        summary:
+          type: [string, "null"]
+        session_id:
+          type: [string, "null"]
+        metadata:
+          type: object
