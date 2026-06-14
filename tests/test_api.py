@@ -8,14 +8,14 @@ from app.main import create_app
 from app.schemas import utc_now
 
 
-def bind(client: TestClient, name: str = "desktop") -> str:
-    response = client.post("/api/v1/devices/bind", json={"name": name, "platform": "windows"})
+def bind(client: TestClient, name: str = "desktop", platform: str = "windows") -> str:
+    response = client.post("/api/v1/devices/bind", json={"name": name, "platform": platform})
     assert response.status_code == 200, response.text
     return response.json()["access_token"]
 
 
-def bind_tokens(client: TestClient, name: str = "desktop") -> dict[str, str]:
-    response = client.post("/api/v1/devices/bind", json={"name": name, "platform": "windows"})
+def bind_tokens(client: TestClient, name: str = "desktop", platform: str = "windows") -> dict[str, str]:
+    response = client.post("/api/v1/devices/bind", json={"name": name, "platform": platform})
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -145,6 +145,29 @@ def test_refresh_token_rotates_access_token(tmp_path):
 
     bad = client.post("/api/v1/auth/refresh", json={"refresh_token": "bad"})
     assert bad.status_code == 401
+
+
+def test_android_device_bind_can_sync_and_refresh(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    tokens = bind_tokens(client, name="Pixel", platform="android")
+    assert tokens["device"]["platform"] == "android"
+    assert tokens["device"]["name"] == "Pixel"
+
+    listed = client.get("/api/v1/notifications", headers=auth(tokens["access_token"]))
+    assert listed.status_code == 200, listed.text
+    assert listed.json() == []
+
+    refresh = client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": tokens["refresh_token"]},
+    )
+    assert refresh.status_code == 200, refresh.text
+    refreshed = refresh.json()
+    assert refreshed["device"]["platform"] == "android"
+    assert refreshed["access_token"] != tokens["access_token"]
+
+    refreshed_list = client.get("/api/v1/notifications", headers=auth(refreshed["access_token"]))
+    assert refreshed_list.status_code == 200, refreshed_list.text
 
 
 def test_hook_mapping_and_expiry(tmp_path):
