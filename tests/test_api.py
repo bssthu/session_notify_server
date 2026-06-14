@@ -183,6 +183,43 @@ def test_hook_mapping_and_expiry(tmp_path):
     assert [item["title"] for item in active] == ["codex needs confirmation"]
 
 
+def test_official_hook_event_mapping(tmp_path):
+    app = create_app(tmp_path / "server.db")
+    client = TestClient(app)
+    token = bind(client)
+
+    completed = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json={
+            "hook_event_name": "Stop",
+            "last_assistant_message": "Refactor finished.",
+            "session_id": "s-stop",
+            "cwd": "I:/Projects/session_notify",
+        },
+    )
+    assert completed.status_code == 200, completed.text
+    assert completed.json()["level"] == "success"
+    assert completed.json()["title"] == "claude completed"
+    assert completed.json()["body"] == "Refactor finished."
+    assert completed.json()["metadata"]["hook_event_name"] == "Stop"
+    assert completed.json()["metadata"]["cwd"] == "I:/Projects/session_notify"
+
+    permission = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json={
+            "hook_event_name": "Notification",
+            "notification_type": "permission_prompt",
+            "message": "Claude needs your permission",
+            "session_id": "s-permission",
+        },
+    )
+    assert permission.status_code == 200, permission.text
+    assert permission.json()["level"] == "critical"
+    assert permission.json()["title"] == "claude needs confirmation"
+
+
 def test_requires_authorization(tmp_path):
     client = TestClient(create_app(tmp_path / "server.db"))
     response = client.get("/api/v1/notifications")

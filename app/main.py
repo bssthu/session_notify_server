@@ -26,6 +26,57 @@ from .schemas import (
 from .storage import Storage
 
 
+def _hook_text(payload: HookPayload) -> str:
+    command = payload.command
+    if command is None and payload.tool_input:
+        raw_command = payload.tool_input.get("command")
+        command = raw_command if isinstance(raw_command, str) else None
+    return (
+        payload.message
+        or payload.title
+        or payload.prompt
+        or command
+        or payload.summary
+        or payload.last_assistant_message
+        or "Session event received."
+    )
+
+
+def _hook_metadata(payload: HookPayload) -> dict[str, object]:
+    extra = payload.model_extra or {}
+    metadata: dict[str, object] = {
+        "hook_event_type": payload.event_type,
+        "hook_event_name": payload.hook_event_name,
+        "hook_status": payload.hook_status,
+        "notification_type": payload.notification_type,
+        "cwd": payload.cwd,
+        "transcript_path": payload.transcript_path,
+        "tool_name": payload.tool_name,
+        **extra,
+        **payload.metadata,
+    }
+    if payload.tool_input is not None:
+        metadata["tool_input"] = payload.tool_input
+    return {key: value for key, value in metadata.items() if value is not None}
+
+
+def _resolve_hook_notification(source: str, payload: HookPayload) -> tuple[NotificationLevel, str]:
+    event_type = (payload.event_type or payload.hook_event_name or "").lower()
+    notification_type = (payload.notification_type or "").lower()
+    hook_status = (payload.hook_status or "").lower()
+    text = " ".join((event_type, notification_type, hook_status))
+
+    if any(key in text for key in ("auth", "approval", "permission", "confirm", "input", "elicitation")):
+        return NotificationLevel.critical, f"{source} needs confirmation"
+    if any(key in text for key in ("failure", "failed", "error", "stopfailure")):
+        return NotificationLevel.important, f"{source} needs attention"
+    if any(key in text for key in ("done", "complete", "success", "finish", "stop", "taskcompleted")):
+        return NotificationLevel.success, f"{source} completed"
+    if "idle" in text:
+        return NotificationLevel.important, f"{source} idle"
+    return NotificationLevel.info, f"{source} update"
+
+
 def create_app(db_path: str | Path | None = None) -> FastAPI:
     storage = Storage(db_path or os.getenv("SESSION_NOTIFY_DB", "runtime/session_notify.db"))
     hub = WebSocketHub()
@@ -82,24 +133,14 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         payload: HookPayload,
         device: DevicePublic = Depends(current_device),
     ) -> NotificationPublic:
-        event_type = (payload.event_type or "").lower()
-        text = payload.message or payload.prompt or payload.command or payload.summary or "Session event received."
-        if any(key in event_type for key in ("auth", "approval", "permission", "confirm", "input")):
-            level = NotificationLevel.critical
-            title = f"{source} needs confirmation"
-        elif any(key in event_type for key in ("done", "complete", "success", "finish")):
-            level = NotificationLevel.success
-            title = f"{source} completed"
-        else:
-            level = NotificationLevel.info
-            title = f"{source} update"
+        level, title = _resolve_hook_notification(source, payload)
         request = NotificationCreate(
             source=source,
             session_id=payload.session_id or "local",
             title=title,
-            body=text,
+            body=_hook_text(payload),
             level=level,
-            metadata={"hook_event_type": payload.event_type, **payload.metadata},
+            metadata=_hook_metadata(payload),
         )
         notification, event = storage.create_notification(request)
         await hub.broadcast(event)

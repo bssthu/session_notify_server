@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 SCHEMA_VERSION = 1
@@ -136,10 +136,21 @@ class EventsResponse(BaseModel):
 
 
 class HookPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     event_type: str | None = None
+    hook_event_name: str | None = None
+    hook_status: str | None = None
+    notification_type: str | None = None
+    title: str | None = None
     message: str | None = None
     prompt: str | None = None
     command: str | None = None
     summary: str | None = None
+    last_assistant_message: str | None = None
     session_id: str | None = None
+    cwd: str | None = None
+    transcript_path: str | None = None
+    tool_name: str | None = None
+    tool_input: dict[str, Any] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
