@@ -26,23 +26,24 @@ from .schemas import (
 from .storage import Storage
 
 
-def _hook_text(payload: HookPayload) -> str:
+def _resolve_hook_body(payload: HookPayload) -> tuple[str, bool]:
     command = payload.command
     if command is None and payload.tool_input:
         raw_command = payload.tool_input.get("command")
         command = raw_command if isinstance(raw_command, str) else None
-    return (
+
+    body = (
         payload.message
         or payload.title
         or payload.prompt
         or command
         or payload.summary
         or payload.last_assistant_message
-        or "Session event received."
     )
+    return (body, False) if body else ("Session event received.", True)
 
 
-def _hook_metadata(payload: HookPayload) -> dict[str, object]:
+def _hook_metadata(payload: HookPayload, body_generated: bool) -> dict[str, object]:
     extra = payload.model_extra or {}
     metadata: dict[str, object] = {
         "hook_event_type": payload.event_type,
@@ -57,6 +58,7 @@ def _hook_metadata(payload: HookPayload) -> dict[str, object]:
     }
     if payload.tool_input is not None:
         metadata["tool_input"] = payload.tool_input
+    metadata["body_generated"] = body_generated
     return {key: value for key, value in metadata.items() if value is not None}
 
 
@@ -134,13 +136,14 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         device: DevicePublic = Depends(current_device),
     ) -> NotificationPublic:
         level, title = _resolve_hook_notification(source, payload)
+        body, body_generated = _resolve_hook_body(payload)
         request = NotificationCreate(
             source=source,
             session_id=payload.session_id or "local",
             title=title,
-            body=_hook_text(payload),
+            body=body,
             level=level,
-            metadata=_hook_metadata(payload),
+            metadata=_hook_metadata(payload, body_generated),
         )
         notification, event = storage.create_notification(request)
         await hub.broadcast(event)

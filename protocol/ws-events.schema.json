@@ -57,7 +57,16 @@
         "updated_at": { "type": "string", "format": "date-time" },
         "expires_at": { "type": ["string", "null"], "format": "date-time" },
         "requires_ack": { "type": "boolean" },
-        "metadata": { "type": "object" }
+        "metadata": {
+          "type": "object",
+          "properties": {
+            "body_generated": {
+              "type": "boolean",
+              "description": "True when the server generated the notification body from its default fallback because the hook payload contained no displayable text."
+            }
+          },
+          "additionalProperties": true
+        }
       },
       "additionalProperties": false
     },

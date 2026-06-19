@@ -227,6 +227,21 @@ def test_official_hook_event_mapping(tmp_path):
     assert completed.json()["body"] == "Refactor finished."
     assert completed.json()["metadata"]["hook_event_name"] == "Stop"
     assert completed.json()["metadata"]["cwd"] == "I:/Projects/session_notify"
+    assert completed.json()["metadata"]["body_generated"] is False
+
+    generic_completed = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json={
+            "hook_event_name": "TaskCompleted",
+            "session_id": "s-task-completed",
+        },
+    )
+    assert generic_completed.status_code == 200, generic_completed.text
+    assert generic_completed.json()["level"] == "success"
+    assert generic_completed.json()["title"] == "claude completed"
+    assert generic_completed.json()["body"] == "Session event received."
+    assert generic_completed.json()["metadata"]["body_generated"] is True
 
     permission = client.post(
         "/api/v1/hooks/claude",

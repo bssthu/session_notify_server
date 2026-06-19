@@ -241,6 +241,12 @@ components:
           type: boolean
         metadata:
           type: object
+          description: Arbitrary notification metadata. Hook notifications include `body_generated=true` when the server generated the body from its default fallback because the hook payload contained no displayable text.
+          properties:
+            body_generated:
+              type: boolean
+              description: True when the server generated the notification body from its default fallback.
+          additionalProperties: true
     Notification:
       allOf:
         - $ref: "#/components/schemas/NotificationCreate"
