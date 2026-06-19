@@ -45,7 +45,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
+from typing import TextIO
 
 CACHE_PATH = Path("runtime/.test_device.json")
 DEFAULT_BASE_URL = "https://127.0.0.1:8765"
@@ -74,6 +76,14 @@ LEVEL_SAMPLES: dict[str, dict] = {
         "body": "Allow running `npm test` in the current workspace?",
     },
 }
+
+
+def _timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _log(message: str = "", *, file: TextIO = sys.stdout) -> None:
+    print(f"[{_timestamp()}] {message}", file=file)
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -136,7 +146,7 @@ def _bind_device(base_url: str) -> str:
     )
     token = resp["access_token"]
     _save_cache(base_url, token)
-    print(f"[bind] test device bound, token cached at {CACHE_PATH}")
+    _log(f"[bind] test device bound, token cached at {CACHE_PATH}")
     return token
 
 
@@ -209,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.clear:
         count = _ack_all(args.base_url, token)
-        print(f"[clear] acknowledged {count} active notification(s).")
+        _log(f"[clear] acknowledged {count} active notification(s).")
         return 0
 
     sent = 0
@@ -218,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.meeting is not None:
         notif = _make_meeting(args.meeting)
         created = _create(args.base_url, token, notif)
-        print(f"[meeting] {created['level']:9s} | {created['title']} ({args.meeting}s)")
+        _log(f"[meeting] {created['level']:9s} | {created['title']} ({args.meeting}s)")
         sent += 1
 
     if args.stack:
@@ -228,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
             notif = _make_notification(level, sample, seq + i)
             notif["title"] = f"{sample['title']} #{i + 1}"
             created = _create(args.base_url, token, notif)
-            print(f"[stack {i + 1}/{args.stack}] {created['level']:9s} | {created['title']}")
+            _log(f"[stack {i + 1}/{args.stack}] {created['level']:9s} | {created['title']}")
             sent += 1
 
     levels = list(LEVEL_SAMPLES) if args.all else [args.level]
@@ -237,12 +247,13 @@ def main(argv: list[str] | None = None) -> int:
         # is not set; with --all we emit every level exactly once.
         notif = _make_notification(level, LEVEL_SAMPLES[level], seq + sent)
         created = _create(args.base_url, token, notif)
-        print(f"[notify] {created['level']:9s} | {created['title']}")
-        print(f"         {created['body']}")
+        _log(f"[notify] {created['level']:9s} | {created['title']}")
+        _log(f"         {created['body']}")
         sent += 1
 
-    print(f"\nSent {sent} notification(s) to {args.base_url}")
-    print("On Android: open the app or run the e2e script to sync and show the floating island.")
+    _log()
+    _log(f"Sent {sent} notification(s) to {args.base_url}")
+    _log("On Android: open the app or run the e2e script to sync and show the floating island.")
     return 0
 
 
@@ -250,9 +261,9 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except HttpError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _log(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
     except urllib.error.URLError as exc:
-        print(f"error: cannot reach {DEFAULT_BASE_URL if '--base-url' not in sys.argv else ''} "
-              f"server: {exc}", file=sys.stderr)
+        _log(f"error: cannot reach {DEFAULT_BASE_URL if '--base-url' not in sys.argv else ''} "
+             f"server: {exc}", file=sys.stderr)
         raise SystemExit(1) from None

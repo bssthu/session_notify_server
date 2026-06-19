@@ -5,6 +5,15 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+function Get-LogTimestamp {
+    Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+}
+
+function Write-LogHost([string]$Message) {
+    Write-Host "[$(Get-LogTimestamp)] $Message"
+}
+
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $keyPath = Join-Path $OutDir "server.key"
 $crtPath = Join-Path $OutDir "server.crt"
@@ -54,7 +63,7 @@ try {
         $env:RANDFILE = $previousRandFile
     }
 }
-Write-Host "Certificate: $crtPath"
-Write-Host "Private key:  $keyPath"
-Write-Host $fingerprint
-Write-Host "Configure this SHA-256 fingerprint in Windows and Android clients."
+Write-LogHost "Certificate: $crtPath"
+Write-LogHost "Private key:  $keyPath"
+Write-LogHost $fingerprint
+Write-LogHost "Configure this SHA-256 fingerprint in Windows and Android clients."

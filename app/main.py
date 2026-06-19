@@ -8,6 +8,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 
 from .hub import WebSocketHub
+from .logging_setup import configure_server_logging
 from .schemas import (
     AckRequest,
     AckResponse,
@@ -24,6 +25,8 @@ from .schemas import (
     TokenRefreshRequest,
 )
 from .storage import Storage
+
+configure_server_logging()
 
 
 def _resolve_hook_body(payload: HookPayload) -> tuple[str, bool]:

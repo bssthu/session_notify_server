@@ -6,7 +6,7 @@
 
 ```powershell
 uv sync
-uv run uvicorn app.main:app --reload --port 8765
+uv run uvicorn app.main:app --reload --port 8765 --log-config logging.json
 ```
 
 HTTPS/WSS 开发运行：
