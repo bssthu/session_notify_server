@@ -4,7 +4,7 @@ import json
 import sqlite3
 import threading
 from collections.abc import Iterable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +35,39 @@ def _parse_dt(value: str | None) -> datetime | None:
     if value is None:
         return None
     return datetime.fromisoformat(value).astimezone(timezone.utc)
+
+
+# 与客户端 hookResolutionKey(notification-logic.js)/rawToolCommand 等价的配对键。
+# 关键:command 必须从 metadata.raw 取 —— incoming(payload 经 _hook_metadata)与
+# stored(notification.metadata)的 raw 同源(同一份 bridge metadata.raw),保证两端
+# 一致;若改用顶层 payload.command(bridge 已 FormatSummary 50+50 截断)会与 raw
+# (TrimLongStrings 截断)不一致,长命令配对失败。
+def _hook_resolution_key(*, source: str, session_id: str | None, metadata: Any) -> str:
+    meta = metadata if isinstance(metadata, dict) else {}
+    raw = meta.get("raw") if isinstance(meta.get("raw"), dict) else {}
+
+    def norm(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    cwd = norm(meta.get("cwd")) or norm(raw.get("cwd"))
+    tool_name = (
+        norm(meta.get("tool_name")) or norm(meta.get("toolName"))
+        or norm(raw.get("tool_name")) or norm(raw.get("toolName"))
+    )
+    # rawToolCommand 顺序:metadata.command → raw.command → tool_input.command
+    command = (
+        norm(meta.get("command"))
+        or norm(raw.get("command"))
+        or norm((raw.get("tool_input") or {}).get("command"))
+        or norm((meta.get("tool_input") or {}).get("command"))
+    )
+    return "".join([
+        norm(source) or "session",
+        norm(session_id) or "local",
+        cwd,
+        tool_name,
+        command,
+    ])
 
 
 class Storage:
@@ -287,6 +320,69 @@ class Storage:
 
         return AckResponse(notification=notification, already_acknowledged=already_acknowledged), event
 
+    def resolve_pending_permission(
+        self,
+        *,
+        source: str,
+        session_id: str | None,
+        metadata: dict[str, Any],
+        device_id: str,
+        reason: str,
+    ) -> SyncEvent | None:
+        """PostToolUse 到达时,按配对键 resolve 最近一条匹配的活跃 permission request。
+
+        与客户端 hookResolutionKey 等价(见 _hook_resolution_key):command 从 metadata.raw
+        取,incoming 与 stored 同源。无匹配返回 None(静默 no-op)。命中最近一条
+        (ORDER BY created_at DESC 首条):写 acks、置 acknowledged、追加
+        notification.acknowledged 事件并返回,供调用方广播。
+        """
+        incoming_key = _hook_resolution_key(source=source, session_id=session_id, metadata=metadata)
+        now = utc_now()
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                "SELECT * FROM notifications WHERE status = ? ORDER BY created_at DESC",
+                (NotificationStatus.active.value,),
+            ).fetchall()
+            for row in rows:
+                notification = self._notification_from_row(row)
+                meta = notification.metadata or {}
+                if str(meta.get("hook_event_name") or "").lower() != "permissionrequest":
+                    continue
+                stored_key = _hook_resolution_key(
+                    source=notification.source,
+                    session_id=notification.session_id,
+                    metadata=meta,
+                )
+                if stored_key != incoming_key:
+                    continue
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO acks(notification_id, device_id, ack_at, reason)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (notification.id, device_id, _dt(now), reason),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE notifications
+                    SET status = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (NotificationStatus.acknowledged.value, _dt(now), notification.id),
+                )
+                return self._append_event(
+                    SyncEvent(
+                        event_id=new_id(),
+                        event_type=EventType.notification_acknowledged,
+                        created_at=now,
+                        notification_id=notification.id,
+                        ack_by_device_id=device_id,
+                        ack_at=now,
+                        reason=reason,
+                    )
+                )
+        return None
+
     def events_after(self, since_event_id: str | None) -> list[SyncEvent]:
         values: tuple[Any, ...]
         where = ""
@@ -339,6 +435,33 @@ class Storage:
                     )
                 )
         return events
+
+    def backfill_hook_expiry(self, ttl: timedelta) -> int:
+        """幂等回填:给 expires_at 为空且属于 hook 来源(metadata.hook_event_name 非空)
+        的通知补上 expires_at = created_at + ttl。用于一次性兼容历史数据(创建于 TTL 上线前)。
+        仅改 expires_at IS NULL 的,已设过的不动。返回回填行数。
+        """
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                "SELECT id, created_at, metadata FROM notifications WHERE expires_at IS NULL"
+            ).fetchall()
+            count = 0
+            for row in rows:
+                try:
+                    metadata = json.loads(row["metadata"])
+                except (TypeError, ValueError):
+                    continue
+                if not metadata.get("hook_event_name"):
+                    continue
+                created = _parse_dt(row["created_at"])
+                if created is None:
+                    continue
+                self._conn.execute(
+                    "UPDATE notifications SET expires_at = ? WHERE id = ?",
+                    (_dt(created + ttl), row["id"]),
+                )
+                count += 1
+        return count
 
     def _insert_notification(self, notification: NotificationPublic) -> None:
         self._conn.execute(

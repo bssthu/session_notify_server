@@ -262,3 +262,156 @@ def test_requires_authorization(tmp_path):
     client = TestClient(create_app(tmp_path / "server.db"))
     response = client.get("/api/v1/notifications")
     assert response.status_code == 401
+
+
+def _hook_payload(event_name, session_id, command, *, event_type=None, cwd="I:/Projects/x", tool_name="Bash"):
+    if event_name == "PermissionRequest":
+        event_type = event_type or "approval_requested"
+    else:
+        event_type = event_type or "completed"
+    return {
+        "hook_event_name": event_name,
+        "event_type": event_type,
+        "hook_status": event_type,
+        "session_id": session_id,
+        "cwd": cwd,
+        "tool_name": tool_name,
+        "metadata": {"raw": {"command": command, "cwd": cwd, "tool_name": tool_name}},
+    }
+
+
+def test_posttooluse_resolves_matching_permission_request(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    perm = client.post("/api/v1/hooks/claude", headers=auth(token),
+                       json=_hook_payload("PermissionRequest", "s-perm", "npm test"))
+    assert perm.status_code == 200, perm.text
+    assert perm.json()["title"] == "claude needs confirmation"
+    perm_id = perm.json()["id"]
+
+    post = client.post("/api/v1/hooks/claude", headers=auth(token),
+                       json=_hook_payload("PostToolUse", "s-perm", "npm test"))
+    assert post.status_code == 200, post.text
+
+    active = client.get("/api/v1/notifications", headers=auth(token)).json()
+    assert perm_id not in [item["id"] for item in active]
+    assert "claude needs confirmation" not in [item["title"] for item in active]
+    # PostToolUse 自身的 completed 通知仍是 active(服务端不 suppress)
+    assert "claude completed" in [item["title"] for item in active]
+
+    events = client.get("/api/v1/events", headers=auth(token)).json()["events"]
+    ack_events = [e for e in events if e["event_type"] == "notification.acknowledged"]
+    assert len(ack_events) == 1
+    assert ack_events[0]["notification_id"] == perm_id
+    assert ack_events[0]["reason"] == "auto_resolved"
+
+
+def test_posttooluse_without_match_is_noop(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    post = client.post("/api/v1/hooks/claude", headers=auth(token),
+                       json=_hook_payload("PostToolUse", "s-alone", "npm test"))
+    assert post.status_code == 200, post.text
+
+    events = client.get("/api/v1/events", headers=auth(token)).json()["events"]
+    assert all(e["event_type"] != "notification.acknowledged" for e in events)
+    assert len([item for item in client.get("/api/v1/notifications", headers=auth(token)).json()]) == 1
+
+
+def test_unrelated_permission_request_not_resolved(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    matched = client.post("/api/v1/hooks/claude", headers=auth(token),
+                          json=_hook_payload("PermissionRequest", "s-shared", "npm test"))
+    other = client.post("/api/v1/hooks/claude", headers=auth(token),
+                        json=_hook_payload("PermissionRequest", "s-shared", "npm run build"))
+    assert matched.status_code == 200 and other.status_code == 200
+
+    post = client.post("/api/v1/hooks/claude", headers=auth(token),
+                       json=_hook_payload("PostToolUse", "s-shared", "npm test"))
+    assert post.status_code == 200, post.text
+
+    active_ids = {item["id"] for item in client.get("/api/v1/notifications", headers=auth(token)).json()}
+    assert matched.json()["id"] not in active_ids
+    assert other.json()["id"] in active_ids
+
+    events = client.get("/api/v1/events", headers=auth(token)).json()["events"]
+    ack_events = [e for e in events if e["event_type"] == "notification.acknowledged"]
+    assert len(ack_events) == 1
+    assert ack_events[0]["notification_id"] == matched.json()["id"]
+
+
+def test_long_command_pairing_aligns_via_raw(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    long_command = "echo " + "x" * 500
+
+    perm = client.post("/api/v1/hooks/claude", headers=auth(token),
+                       json=_hook_payload("PermissionRequest", "s-long", long_command))
+    assert perm.status_code == 200, perm.text
+    perm_id = perm.json()["id"]
+
+    post = client.post("/api/v1/hooks/claude", headers=auth(token),
+                       json=_hook_payload("PostToolUse", "s-long", long_command))
+    assert post.status_code == 200, post.text
+
+    events = client.get("/api/v1/events", headers=auth(token)).json()["events"]
+    ack_events = [e for e in events if e["event_type"] == "notification.acknowledged"]
+    assert len(ack_events) == 1
+    assert ack_events[0]["notification_id"] == perm_id
+    assert perm_id not in [item["id"] for item in client.get("/api/v1/notifications", headers=auth(token)).json()]
+
+
+def test_hook_notifications_get_default_ttl(tmp_path):
+    from datetime import datetime
+
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+    resp = client.post("/api/v1/hooks/claude", headers=auth(token), json={
+        "hook_event_name": "Stop",
+        "last_assistant_message": "done",
+        "session_id": "s-ttl",
+    })
+    assert resp.status_code == 200, resp.text
+    expires_at = resp.json()["expires_at"]
+    assert expires_at is not None
+    expires = datetime.fromisoformat(expires_at)
+    delta = expires - datetime.now(expires.tzinfo)
+    assert timedelta(hours=23, minutes=55) < delta < timedelta(hours=24, minutes=5)
+
+
+def test_backfill_expires_stale_hook_history(tmp_path):
+    from app.storage import Storage, _dt
+    from app.schemas import NotificationCreate, NotificationLevel, NotificationStatus
+
+    storage = Storage(tmp_path / "s.db")
+    stale, _ = storage.create_notification(NotificationCreate(
+        source="claude", session_id="s-old", title="claude needs confirmation",
+        body="stale history", level=NotificationLevel.critical,
+        metadata={"hook_event_name": "PermissionRequest"},
+    ))
+    user_notif, _ = storage.create_notification(NotificationCreate(
+        source="session", session_id="s-user", title="Standup",
+        body="meeting", level=NotificationLevel.important,
+        metadata={},
+    ))
+    # 模拟历史堆积:把 stale 的 created_at 改到 25h 前(expires_at 仍为 NULL)
+    with storage._lock, storage._conn:
+        storage._conn.execute(
+            "UPDATE notifications SET created_at = ? WHERE id = ?",
+            (_dt(utc_now() - timedelta(hours=25)), stale.id),
+        )
+
+    backfilled = storage.backfill_hook_expiry(timedelta(hours=24))
+    assert backfilled == 1  # 只有 hook 来源的 stale 被回填,非 hook 通知不动
+
+    events = storage.expire_due_notifications()
+    assert any(e.notification_id == stale.id for e in events)
+    active_ids = {n.id for n in storage.list_notifications([NotificationStatus.active])}
+    assert stale.id not in active_ids        # 25h 前 + 24h TTL = 已过期
+    assert user_notif.id in active_ids       # 非 hook 通知不受 TTL 影响
+    storage.close()

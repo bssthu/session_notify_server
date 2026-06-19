@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Annotated
 
@@ -23,10 +25,17 @@ from .schemas import (
     NotificationPublic,
     NotificationStatus,
     TokenRefreshRequest,
+    utc_now,
 )
 from .storage import Storage
 
 configure_server_logging()
+
+# hook 来源的通知默认 24h 后过期(可由 SESSION_NOTIFY_HOOK_TTL_HOURS 覆盖):permission
+# request 等若无对应 PostToolUse resolve(用户拒绝 / Notification 超时提醒 / 历史堆积),
+# 靠 TTL 兜底,避免永远 active、被客户端重启 reload 重显。
+HOOK_NOTIFICATION_TTL = timedelta(hours=int(os.getenv("SESSION_NOTIFY_HOOK_TTL_HOURS", "24")))
+_EXPIRE_POLL_INTERVAL_SECONDS = int(os.getenv("SESSION_NOTIFY_EXPIRE_POLL_SECONDS", "60"))
 
 
 def _resolve_hook_body(payload: HookPayload) -> tuple[str, bool]:
@@ -88,9 +97,22 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        # 一次性回填历史 hook 通知的 TTL(幂等),并立即过期一轮 + 广播,
+        # 清理 TTL 上线前堆积的 active hook 通知(重启即生效)。
+        storage.backfill_hook_expiry(HOOK_NOTIFICATION_TTL)
+        for event in storage.expire_due_notifications():
+            await hub.broadcast(event)
+        expire_task = asyncio.create_task(_expire_due_loop(storage, hub))
         try:
             yield
         finally:
+            expire_task.cancel()
+            try:
+                await expire_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # pragma: no cover
+                pass
             storage.close()
 
     app = FastAPI(title="Session Notify", version="0.1.0", lifespan=lifespan)
@@ -140,16 +162,30 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     ) -> NotificationPublic:
         level, title = _resolve_hook_notification(source, payload)
         body, body_generated = _resolve_hook_body(payload)
+        hook_meta = _hook_metadata(payload, body_generated)
         request = NotificationCreate(
             source=source,
             session_id=payload.session_id or "local",
             title=title,
             body=body,
             level=level,
-            metadata=_hook_metadata(payload, body_generated),
+            expires_at=utc_now() + HOOK_NOTIFICATION_TTL,
+            metadata=hook_meta,
         )
         notification, event = storage.create_notification(request)
         await hub.broadcast(event)
+        # 工具执行完成(PostToolUse)意味着对应的权限请求已被批准:按配对键自动 resolve
+        # 匹配的活跃 permission request,避免它永远 active、被客户端重启时 reload 重显。
+        if (payload.hook_event_name or "").lower() == "posttooluse":
+            resolved = storage.resolve_pending_permission(
+                source=source,
+                session_id=payload.session_id or "local",
+                metadata=hook_meta,
+                device_id=device.id,
+                reason="auto_resolved",
+            )
+            if resolved is not None:
+                await hub.broadcast(resolved)
         return notification
 
     @app.get("/api/v1/notifications", response_model=list[NotificationPublic])
@@ -199,6 +235,19 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             await hub.disconnect(websocket)
 
     return app
+
+
+async def _expire_due_loop(storage: Storage, hub: WebSocketHub) -> None:
+    """定期过期到期通知并广播 expire 事件,让实时连接的客户端及时移除。
+    后台任务:瞬时错误不应终止循环。
+    """
+    while True:
+        await asyncio.sleep(_EXPIRE_POLL_INTERVAL_SECONDS)
+        try:
+            for event in storage.expire_due_notifications():
+                await hub.broadcast(event)
+        except Exception:  # pragma: no cover
+            pass
 
 
 app = create_app()
