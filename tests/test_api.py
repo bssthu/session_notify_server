@@ -522,6 +522,140 @@ def test_backfill_expires_stale_hook_history(tmp_path):
     storage.close()
 
 
+def test_session_stop_acknowledges_pending_permission(tmp_path):
+    # 用户在 CLI 拒绝权限 → 不发 PostToolUse → 会话 Stop 到达时按会话兜底清理,
+    # 避免残留 active 被重启 reload 重显。
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    perm = client.post("/api/v1/hooks/codex", headers=auth(token),
+                       json=_hook_payload("PermissionRequest", "s-deny", "rm -rf x"))
+    assert perm.status_code == 200, perm.text
+    perm_id = perm.json()["id"]
+
+    stop = client.post("/api/v1/hooks/codex", headers=auth(token),
+                       json=_hook_payload("Stop", "s-deny", ""))
+    assert stop.status_code == 200, stop.text
+
+    active = client.get("/api/v1/notifications", headers=auth(token)).json()
+    assert perm_id not in [item["id"] for item in active]
+    assert "codex needs confirmation" not in [item["title"] for item in active]
+
+    events = client.get("/api/v1/events", headers=auth(token)).json()["events"]
+    finalize_events = [
+        e for e in events
+        if e["event_type"] == "notification.acknowledged" and e["reason"] == "session_finalized"
+    ]
+    assert any(e["notification_id"] == perm_id for e in finalize_events)
+
+
+def test_session_stop_acknowledges_notification_permission_prompt(tmp_path):
+    # claude 权限请求的另一形态:Notification hook + notification_type=permission_prompt,
+    # hook_event_name=Notification(非 permissionrequest)。清理按 title(needs confirmation)
+    # 判定,也要覆盖这类,否则它会残留 active 被重启 reload 重显。
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    resp = client.post("/api/v1/hooks/claude", headers=auth(token), json={
+        "hook_event_name": "Notification",
+        "event_type": "approval_requested",
+        "hook_status": "approval_requested",
+        "notification_type": "permission_prompt",
+        "session_id": "s-notif",
+        "message": "Claude needs your permission to use Bash",
+        "cwd": "I:/Projects/x",
+        "tool_name": "Bash",
+    })
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["title"] == "claude needs confirmation"
+    nid = resp.json()["id"]
+
+    client.post("/api/v1/hooks/claude", headers=auth(token),
+                json=_hook_payload("Stop", "s-notif", ""))
+
+    active_ids = {item["id"] for item in client.get("/api/v1/notifications", headers=auth(token)).json()}
+    assert nid not in active_ids
+
+
+def test_session_finalize_does_not_touch_other_sessions(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    p_a = client.post("/api/v1/hooks/claude", headers=auth(token),
+                      json=_hook_payload("PermissionRequest", "s-a", "npm a")).json()["id"]
+    p_b = client.post("/api/v1/hooks/claude", headers=auth(token),
+                      json=_hook_payload("PermissionRequest", "s-b", "npm b")).json()["id"]
+
+    client.post("/api/v1/hooks/claude", headers=auth(token),
+                json=_hook_payload("Stop", "s-a", ""))
+
+    active_ids = {item["id"] for item in client.get("/api/v1/notifications", headers=auth(token)).json()}
+    assert p_a not in active_ids   # s-a 会话结束,其 permission 被清理
+    assert p_b in active_ids       # s-b 会话不受影响
+
+
+def test_permission_request_uses_short_ttl(tmp_path, monkeypatch):
+    import app.main
+    from datetime import datetime
+
+    monkeypatch.setattr(app.main, "HOOK_PERMISSION_TTL", timedelta(minutes=5))
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    resp = client.post("/api/v1/hooks/claude", headers=auth(token),
+                       json=_hook_payload("PermissionRequest", "s-ttl", "npm test"))
+    assert resp.status_code == 200, resp.text
+    expires = datetime.fromisoformat(resp.json()["expires_at"])
+    delta = expires - datetime.now(expires.tzinfo)
+    assert timedelta(minutes=4, seconds=30) < delta < timedelta(minutes=5, seconds=30)
+
+
+def test_lifespan_cleans_legacy_permission_requests(tmp_path):
+    from app.storage import Storage
+    from app.schemas import EventType, NotificationCreate, NotificationLevel, NotificationStatus
+
+    db_path = tmp_path / "s.db"
+    storage = Storage(db_path)
+    legacy, _ = storage.create_notification(NotificationCreate(
+        source="codex", session_id="s-old", title="codex needs confirmation",
+        body="stale history", level=NotificationLevel.critical,
+        expires_at=utc_now() + timedelta(hours=24),   # 未来,不会被 expire_due 清掉
+        metadata={"hook_event_name": "PermissionRequest"},
+    ))
+    storage.close()
+
+    # TestClient 作为 context manager 才触发 lifespan startup → 迁移清理
+    client = TestClient(create_app(db_path))
+    with client:
+        token = bind(client)
+        active = client.get("/api/v1/notifications", headers=auth(token)).json()
+        assert legacy.id not in [item["id"] for item in active]
+
+    storage = Storage(db_path)
+    assert legacy.id in {n.id for n in storage.list_notifications([NotificationStatus.acknowledged])}
+    cleanup_events = [
+        e for e in storage.events_after(None)
+        if e.event_type == EventType.notification_acknowledged
+        and e.notification_id == legacy.id
+        and e.reason == "migration_cleanup"
+    ]
+    assert len(cleanup_events) == 1
+    storage.close()
+
+    # 幂等:再起一次 app,legacy 已非 active,迁移不再产生新事件
+    with TestClient(create_app(db_path)):
+        pass
+    storage = Storage(db_path)
+    cleanup_events2 = [
+        e for e in storage.events_after(None)
+        if e.event_type == EventType.notification_acknowledged
+        and e.notification_id == legacy.id
+        and e.reason == "migration_cleanup"
+    ]
+    assert len(cleanup_events2) == 1
+    storage.close()
+
+
 def _expire_field(app, device_id, field, *, past: bool = True, null: bool = False):
     """直接把 devices 表某 token 过期列改到过去(模拟到期)或置 NULL(模拟老库迁移态)。"""
     from app.storage import _dt

@@ -38,6 +38,12 @@ configure_server_logging()
 # request 等若无对应 PostToolUse resolve(用户拒绝 / Notification 超时提醒 / 历史堆积),
 # 靠 TTL 兜底,避免永远 active、被客户端重启 reload 重显。
 HOOK_NOTIFICATION_TTL = timedelta(hours=int(os.getenv("SESSION_NOTIFY_HOOK_TTL_HOURS", "24")))
+# approval 类(needs confirmation)通知即时性强,用短 TTL:即便无 PostToolUse resolve、也无
+# 会话结束清理,也不会长期 active 被客户端重启 reload 重显。其它 hook 通知维持 24h。
+HOOK_PERMISSION_TTL = timedelta(minutes=int(os.getenv("SESSION_NOTIFY_PERMISSION_TTL_MINUTES", "30")))
+# 会话结束类 hook:到达即代表该会话的旧 permission request 必然已无意义(用户已拒绝/已处理/
+# 会话中断且不会有 PostToolUse),触发按会话批量 acknowledge 兜底清理。
+_HOOK_EVENTS_THAT_FINALIZE_SESSION = frozenset({"stop", "taskcompleted", "stopfailure", "subagentstop"})
 # 设备 token 寿命:access 短期(请求凭证,到期靠客户端自动 refresh)、refresh 长期(仅换新 access,
 # 不轮换)。refresh 到期后需重新绑定。默认 access 1h / refresh 90d。
 ACCESS_TOKEN_TTL = timedelta(seconds=int(os.getenv("SESSION_NOTIFY_ACCESS_TTL_SECONDS", "3600")))
@@ -117,6 +123,11 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         # 一次性回填历史 hook 通知的 TTL(幂等),并立即过期一轮 + 广播,
         # 清理 TTL 上线前堆积的 active hook 通知(重启即生效)。
         storage.backfill_hook_expiry(HOOK_NOTIFICATION_TTL)
+        # 一次性清理 resolve 机制(d67e95d, 2026-06-19)上线前的 active permission request 历史
+        # 残留(幂等,只动 active):它们永不会被 PostToolUse resolve,会一直 active 到 TTL,期间
+        # 客户端重启 reload 会重显。置 acknowledged 后不再重显。
+        for event in storage.acknowledge_legacy_permission_requests():
+            await hub.broadcast(event, storage.should_deliver_event_to_device)
         for event in storage.expire_due_notifications():
             await hub.broadcast(event, storage.should_deliver_event_to_device)
         expire_task = asyncio.create_task(_expire_due_loop(storage, hub))
@@ -251,13 +262,15 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         level, title = _resolve_hook_notification(source, payload)
         body, body_generated = _resolve_hook_body(payload)
         hook_meta = _hook_metadata(payload, body_generated)
+        # approval 类(needs confirmation)即时性强,用短 TTL;其它 hook 通知维持默认 24h。
+        permission_ttl = HOOK_PERMISSION_TTL if "needs confirmation" in title else HOOK_NOTIFICATION_TTL
         request = NotificationCreate(
             source=source,
             session_id=payload.session_id or "local",
             title=title,
             body=body,
             level=level,
-            expires_at=utc_now() + HOOK_NOTIFICATION_TTL,
+            expires_at=utc_now() + permission_ttl,
             metadata=hook_meta,
         )
         notification, event = storage.create_notification(request, origin_device=device)
@@ -274,6 +287,18 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             )
             if resolved is not None:
                 await hub.broadcast(resolved, storage.should_deliver_event_to_device)
+        # 会话结束类 hook = 该 session 的旧 permission request 必然已无意义(用户已拒绝/已处理/
+        # 会话中断,不会有 PostToolUse 到达)。按会话批量 acknowledge 兜底清理,覆盖
+        # resolve_pending_permission(只处理 PostToolUse)漏掉的拒绝/中断场景,避免短 TTL
+        # 窗口内客户端重启 reload 重显。
+        if (payload.hook_event_name or "").lower() in _HOOK_EVENTS_THAT_FINALIZE_SESSION:
+            for ev in storage.acknowledge_pending_permissions_for_session(
+                source=source,
+                session_id=payload.session_id or "local",
+                device_id=device.id,
+                reason="session_finalized",
+            ):
+                await hub.broadcast(ev, storage.should_deliver_event_to_device)
         return notification
 
     @app.get("/api/v1/notifications", response_model=list[NotificationPublic])

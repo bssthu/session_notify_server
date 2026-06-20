@@ -673,6 +673,73 @@ class Storage:
                 )
         return None
 
+    def acknowledge_pending_permissions_for_session(
+        self,
+        *,
+        source: str,
+        session_id: str | None,
+        device_id: str,
+        reason: str,
+    ) -> list[SyncEvent]:
+        """会话级兜底清理:把同一 (source, session_id) 下所有 active 的 permission
+        request 置为 acknowledged。不依赖 command 配对键,覆盖 PostToolUse 不会到达的
+        场景(用户在 CLI 拒绝权限、会话中断、配对失败)。由调用方在会话结束类 hook
+        (Stop/TaskCompleted/StopFailure/SubagentStop)到达时触发。
+
+        与 resolve_pending_permission 的区别:那是按 command 精确配对、命中最近一条;
+        本方法是按会话批量兜底。device_id 为真实 current_device,写 acks 外键合法。
+        返回每个被清理通知的 notification.acknowledged 事件,供调用方逐条广播。
+        """
+        now = utc_now()
+        target_session = session_id or "local"
+        events: list[SyncEvent] = []
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM notifications
+                WHERE status = ? AND source = ?
+                """,
+                (NotificationStatus.active.value, source),
+            ).fetchall()
+            for row in rows:
+                notification = self._notification_from_row(row)
+                if notification.session_id != target_session:
+                    continue
+                # approval 类(needs confirmation)都清理:claude 一次权限请求会产生
+                # PermissionRequest 与 Notification(permission_prompt) 两条通知,
+                # 二者都要在会话结束时清掉,否则任一残留都会被重启 reload 重显。
+                if "needs confirmation" not in (notification.title or "").lower():
+                    continue
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO acks(notification_id, device_id, ack_at, reason)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (notification.id, device_id, _dt(now), reason),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE notifications
+                    SET status = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (NotificationStatus.acknowledged.value, _dt(now), notification.id),
+                )
+                events.append(
+                    self._append_event(
+                        SyncEvent(
+                            event_id=new_id(),
+                            event_type=EventType.notification_acknowledged,
+                            created_at=now,
+                            notification_id=notification.id,
+                            ack_by_device_id=device_id,
+                            ack_at=now,
+                            reason=reason,
+                        )
+                    )
+                )
+        return events
+
     def events_after(self, since_event_id: str | None, device: DevicePublic | None = None) -> list[SyncEvent]:
         values: tuple[Any, ...]
         where = ""
@@ -755,6 +822,56 @@ class Storage:
                 )
                 count += 1
         return count
+
+    def acknowledge_legacy_permission_requests(self, reason: str = "migration_cleanup") -> list[SyncEvent]:
+        """一次性迁移:把所有 active 且 hook_event_name=permissionrequest 的历史残留
+        置为 acknowledged。幂等 —— 只动 status=active 的。用于 resolve 机制(main.py
+        d67e95d, 2026-06-19)上线前的历史堆积,避免它们在客户端重启时 reload 重显。
+
+        不写 acks 表:acks 有 device_id REFERENCES devices(id) 外键 + PRAGMA
+        foreign_keys=ON,迁移时无真实设备上下文,写入会违反外键。仅 UPDATE status
+        + 追加 notification.acknowledged 事件(ack_by_device_id=None),返回供启动广播。
+        """
+        now = utc_now()
+        events: list[SyncEvent] = []
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                "SELECT id, title, metadata FROM notifications WHERE status = ?",
+                (NotificationStatus.active.value,),
+            ).fetchall()
+            for row in rows:
+                # approval 类(needs confirmation)都清理(PermissionRequest 与 Notification
+                # permission_prompt 两类);但仅限 hook 来源,排除用户手动创建的同名通知。
+                if "needs confirmation" not in (row["title"] or "").lower():
+                    continue
+                try:
+                    metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+                except (TypeError, ValueError):
+                    metadata = {}
+                if not metadata.get("hook_event_name"):
+                    continue
+                self._conn.execute(
+                    """
+                    UPDATE notifications
+                    SET status = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (NotificationStatus.acknowledged.value, _dt(now), row["id"]),
+                )
+                events.append(
+                    self._append_event(
+                        SyncEvent(
+                            event_id=new_id(),
+                            event_type=EventType.notification_acknowledged,
+                            created_at=now,
+                            notification_id=row["id"],
+                            ack_by_device_id=None,
+                            ack_at=now,
+                            reason=reason,
+                        )
+                    )
+                )
+        return events
 
     def _insert_notification(self, notification: NotificationPublic) -> None:
         self._conn.execute(
