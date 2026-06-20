@@ -29,6 +29,47 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceBindResponse"
+  /api/v1/devices/pair/issue:
+    post:
+      responses:
+        "200":
+          description: One-time pairing code signed by an already-bound device.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PairIssueResponse"
+  /api/v1/devices/pair/consume:
+    post:
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PairConsumeRequest"
+      responses:
+        "200":
+          description: Newly bound device credentials (same shape as bind).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceBindResponse"
+  /api/v1/devices/reset:
+    post:
+      security: []
+      description: Revoke all devices and return to bootstrap state. Localhost-only (127.0.0.1/::1).
+      responses:
+        "200":
+          description: Count of revoked devices.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revoked:
+                    type: integer
+        "403":
+          description: Called from a non-localhost host.
   /api/v1/devices:
     get:
       responses:
@@ -210,6 +251,9 @@ components:
         platform:
           type: string
           enum: [windows, android]
+        refresh_token:
+          type: [string, "null"]
+          description: Optional. Under strict mode, proves local identity for a rebind instead of requiring a pairing code.
     DeviceBindResponse:
       type: object
       required: [device, refresh_token, access_token, token_type]
@@ -220,6 +264,9 @@ components:
           type: string
         access_token:
           type: string
+        access_expires_at:
+          type: [string, "null"]
+          format: date-time
         token_type:
           type: string
           const: bearer
@@ -246,9 +293,35 @@ components:
           $ref: "#/components/schemas/Device"
         access_token:
           type: string
+        access_expires_at:
+          type: [string, "null"]
+          format: date-time
         token_type:
           type: string
           const: bearer
+    PairIssueResponse:
+      type: object
+      required: [code, expires_at]
+      properties:
+        code:
+          type: string
+          description: One-time human-readable pairing code, e.g. 7Q4K-9XKM.
+        expires_at:
+          type: string
+          format: date-time
+    PairConsumeRequest:
+      type: object
+      required: [code, name, platform]
+      properties:
+        code:
+          type: string
+        name:
+          type: string
+          minLength: 1
+          maxLength: 80
+        platform:
+          type: string
+          enum: [windows, android]
     Device:
       type: object
       required: [id, name, platform, created_at, notifications_enabled]

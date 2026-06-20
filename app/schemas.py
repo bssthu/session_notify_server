@@ -47,6 +47,8 @@ class EventType(StrEnum):
 class DeviceBindRequest(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     platform: DevicePlatform
+    # 可选:strict 模式下用于本机重新绑定(rebind)。凭旧 refresh_token 证明本机身份。
+    refresh_token: str | None = None
 
 
 class DevicePublic(BaseModel):
@@ -68,6 +70,7 @@ class DeviceBindResponse(BaseModel):
     device: DevicePublic
     refresh_token: str
     access_token: str
+    access_expires_at: datetime | None = None
     token_type: Literal["bearer"] = "bearer"
 
 
@@ -78,7 +81,19 @@ class TokenRefreshRequest(BaseModel):
 class AccessTokenResponse(BaseModel):
     device: DevicePublic
     access_token: str
+    access_expires_at: datetime | None = None
     token_type: Literal["bearer"] = "bearer"
+
+
+class PairIssueResponse(BaseModel):
+    code: str
+    expires_at: datetime
+
+
+class PairConsumeRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=40)
+    name: str = Field(min_length=1, max_length=80)
+    platform: DevicePlatform
 
 
 class NotificationCreate(BaseModel):

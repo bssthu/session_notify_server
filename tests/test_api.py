@@ -520,3 +520,231 @@ def test_backfill_expires_stale_hook_history(tmp_path):
     assert stale.id not in active_ids        # 25h 前 + 24h TTL = 已过期
     assert user_notif.id in active_ids       # 非 hook 通知不受 TTL 影响
     storage.close()
+
+
+def _expire_field(app, device_id, field, *, past: bool = True, null: bool = False):
+    """直接把 devices 表某 token 过期列改到过去(模拟到期)或置 NULL(模拟老库迁移态)。"""
+    from app.storage import _dt
+    storage = app.state.storage
+    value = None if null else _dt(utc_now() - timedelta(seconds=1) if past else utc_now() + timedelta(days=1))
+    with storage._lock, storage._conn:
+        storage._conn.execute(
+            f"UPDATE devices SET {field} = ? WHERE id = ?",  # field is internal test constant
+            (value, device_id),
+        )
+
+
+def test_bind_response_includes_access_expiry(tmp_path):
+    from datetime import datetime
+
+    client = TestClient(create_app(tmp_path / "server.db"))
+    tokens = bind_tokens(client)
+    assert tokens["access_expires_at"] is not None
+    expires = datetime.fromisoformat(tokens["access_expires_at"])
+    delta = expires - datetime.now(expires.tzinfo)
+    # 默认 access TTL = 1h
+    assert timedelta(minutes=55) < delta < timedelta(hours=1, minutes=5)
+
+
+def test_expired_access_token_is_rejected_and_refreshable(tmp_path):
+    app = create_app(tmp_path / "server.db")
+    client = TestClient(app)
+    tokens = bind_tokens(client)
+    old_access = tokens["access_token"]
+    device_id = tokens["device"]["id"]
+
+    assert client.get("/api/v1/notifications", headers=auth(old_access)).status_code == 200
+
+    # access 到期 → 鉴权失败
+    _expire_field(app, device_id, "access_expires_at")
+    assert client.get("/api/v1/notifications", headers=auth(old_access)).status_code == 401
+
+    # refresh 换发新 access(refresh 仍有效)→ 恢复,且新响应带新的 access_expires_at
+    refreshed = client.post("/api/v1/auth/refresh", json={"refresh_token": tokens["refresh_token"]})
+    assert refreshed.status_code == 200, refreshed.text
+    new_access = refreshed.json()["access_token"]
+    assert new_access != old_access
+    assert refreshed.json()["access_expires_at"] is not None
+    assert client.get("/api/v1/notifications", headers=auth(new_access)).status_code == 200
+
+
+def test_expired_refresh_token_requires_rebind(tmp_path):
+    app = create_app(tmp_path / "server.db")
+    client = TestClient(app)
+    tokens = bind_tokens(client)
+    _expire_field(app, tokens["device"]["id"], "refresh_expires_at")
+
+    # refresh token 到期 → refresh 端点拒绝,需重新绑定
+    refresh = client.post("/api/v1/auth/refresh", json={"refresh_token": tokens["refresh_token"]})
+    assert refresh.status_code == 401
+
+
+def test_null_expiry_is_backward_compatible(tmp_path):
+    """老库 migration 后 *_expires_at 为 NULL → 视为不过期,不强制存量设备重绑。"""
+    app = create_app(tmp_path / "server.db")
+    client = TestClient(app)
+    tokens = bind_tokens(client)
+    token = tokens["access_token"]
+    _expire_field(app, tokens["device"]["id"], "access_expires_at", null=True)
+    _expire_field(app, tokens["device"]["id"], "refresh_expires_at", null=True)
+
+    assert client.get("/api/v1/notifications", headers=auth(token)).status_code == 200
+    refresh = client.post("/api/v1/auth/refresh", json={"refresh_token": tokens["refresh_token"]})
+    assert refresh.status_code == 200
+
+
+def test_pair_issue_requires_bearer(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    assert client.post("/api/v1/devices/pair/issue").status_code == 401
+
+
+def test_pair_issue_and_consume_binds_new_device(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    host = bind_tokens(client, name="Host", platform="windows")
+
+    issued = client.post("/api/v1/devices/pair/issue", headers=auth(host["access_token"]))
+    assert issued.status_code == 200, issued.text
+    code = issued.json()["code"]
+    assert code.count("-") == 1 and len(code.replace("-", "")) == 8  # XXXX-XXXX
+    assert issued.json()["expires_at"] is not None
+
+    consumed = client.post("/api/v1/devices/pair/consume", json={
+        "code": code, "name": "Pixel", "platform": "android"
+    })
+    assert consumed.status_code == 200, consumed.text
+    bound = consumed.json()
+    assert bound["device"]["name"] == "Pixel"
+    assert bound["device"]["platform"] == "android"
+    assert bound["access_token"] and bound["refresh_token"]
+    assert client.get("/api/v1/notifications", headers=auth(bound["access_token"])).status_code == 200
+
+
+def test_pair_consume_invalid_code_rejected(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    bad = client.post("/api/v1/devices/pair/consume", json={
+        "code": "NOPE-CODE", "name": "X", "platform": "android"
+    })
+    assert bad.status_code == 401
+
+
+def test_pair_code_is_one_shot(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    host = bind_tokens(client)
+    code = client.post("/api/v1/devices/pair/issue", headers=auth(host["access_token"])).json()["code"]
+
+    first = client.post("/api/v1/devices/pair/consume", json={"code": code, "name": "A", "platform": "windows"})
+    assert first.status_code == 200
+    second = client.post("/api/v1/devices/pair/consume", json={"code": code, "name": "B", "platform": "windows"})
+    assert second.status_code == 401
+
+
+def test_pair_code_expiry_rejects(tmp_path):
+    from app.storage import _dt
+
+    client = TestClient(create_app(tmp_path / "server.db"))
+    host = bind_tokens(client)
+    code = client.post("/api/v1/devices/pair/issue", headers=auth(host["access_token"])).json()["code"]
+    storage = client.app.state.storage
+    with storage._lock, storage._conn:
+        storage._conn.execute("UPDATE pair_codes SET expires_at = ?", (_dt(utc_now() - timedelta(seconds=1)),))
+
+    expired = client.post("/api/v1/devices/pair/consume", json={"code": code, "name": "A", "platform": "windows"})
+    assert expired.status_code == 401
+
+
+def test_strict_mode_first_device_binds_then_bare_bind_blocked(tmp_path, monkeypatch):
+    # conftest 默认 easy;此处显式切 strict 验证 bootstrap 门禁
+    monkeypatch.setenv("SESSION_NOTIFY_PAIR_MODE", "strict")
+    client = TestClient(create_app(tmp_path / "server.db"))
+
+    first = client.post("/api/v1/devices/bind", json={"name": "Host", "platform": "windows"})
+    assert first.status_code == 200, first.text
+    host = first.json()
+
+    # 已有已绑设备后,裸 bind 被拒(必须走配对码)
+    assert client.post("/api/v1/devices/bind", json={"name": "Sneak", "platform": "windows"}).status_code == 401
+
+    code = client.post("/api/v1/devices/pair/issue", headers=auth(host["access_token"])).json()["code"]
+    consumed = client.post("/api/v1/devices/pair/consume", json={"code": code, "name": "Pixel", "platform": "android"})
+    assert consumed.status_code == 200
+
+
+def test_easy_mode_allows_multiple_bare_binds(tmp_path, monkeypatch):
+    monkeypatch.setenv("SESSION_NOTIFY_PAIR_MODE", "easy")
+    client = TestClient(create_app(tmp_path / "server.db"))
+    assert client.post("/api/v1/devices/bind", json={"name": "A", "platform": "windows"}).status_code == 200
+    assert client.post("/api/v1/devices/bind", json={"name": "B", "platform": "windows"}).status_code == 200
+
+
+def test_strict_mode_rebind_with_old_refresh_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("SESSION_NOTIFY_PAIR_MODE", "strict")
+    client = TestClient(create_app(tmp_path / "server.db"))
+    first = client.post("/api/v1/devices/bind", json={"name": "Host", "platform": "windows"})
+    assert first.status_code == 200, first.text
+    old_refresh = first.json()["refresh_token"]
+    device_id = first.json()["device"]["id"]
+
+    # 裸 bind(无 refresh)被拒
+    assert client.post("/api/v1/devices/bind", json={"name": "Sneak", "platform": "windows"}).status_code == 401
+
+    # 带有效旧 refresh_token → 本机 rebind 放行:同一设备、换发新 token、轮换 refresh
+    rebound = client.post("/api/v1/devices/bind", json={
+        "name": "Host", "platform": "windows", "refresh_token": old_refresh
+    })
+    assert rebound.status_code == 200, rebound.text
+    assert rebound.json()["device"]["id"] == device_id
+    assert rebound.json()["refresh_token"] != old_refresh
+
+    # 旧 refresh 已轮换失效
+    again = client.post("/api/v1/devices/bind", json={
+        "name": "Host", "platform": "windows", "refresh_token": old_refresh
+    })
+    assert again.status_code == 401
+
+
+def test_revoke_all_devices_via_storage(tmp_path):
+    from app.schemas import DevicePlatform
+    from app.storage import Storage
+    storage = Storage(tmp_path / "s.db")
+    storage.bind_device("A", DevicePlatform.windows)
+    storage.bind_device("B", DevicePlatform.android)
+    assert storage.has_any_device()
+    assert storage.revoke_all_devices() == 2
+    assert not storage.has_any_device()
+    storage.close()
+
+
+def test_reset_endpoint_rejects_non_localhost(tmp_path):
+    # TestClient 的 client.host 非 127.0.0.1,reset 端点应 403(只允许本机调用)。
+    client = TestClient(create_app(tmp_path / "server.db"))
+    bind_tokens(client, name="A")
+    response = client.post("/api/v1/devices/reset")
+    assert response.status_code == 403
+
+
+def test_reset_devices_script_revokes_all(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+    from app.schemas import DevicePlatform
+    from app.storage import Storage
+
+    db = tmp_path / "s.db"
+    storage = Storage(db)
+    storage.bind_device("A", DevicePlatform.windows)
+    storage.bind_device("B", DevicePlatform.android)
+    storage.close()
+
+    script = Path(__file__).resolve().parent.parent / "scripts" / "reset_devices.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--yes", "--db", str(db)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "已撤销 2 台设备" in result.stdout
+
+    storage = Storage(db)
+    assert not storage.has_any_device()
+    storage.close()

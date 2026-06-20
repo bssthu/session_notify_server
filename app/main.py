@@ -7,7 +7,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 
 from .hub import WebSocketHub
 from .logging_setup import configure_server_logging
@@ -25,6 +25,8 @@ from .schemas import (
     NotificationLevel,
     NotificationPublic,
     NotificationStatus,
+    PairConsumeRequest,
+    PairIssueResponse,
     TokenRefreshRequest,
     utc_now,
 )
@@ -36,6 +38,12 @@ configure_server_logging()
 # request 等若无对应 PostToolUse resolve(用户拒绝 / Notification 超时提醒 / 历史堆积),
 # 靠 TTL 兜底,避免永远 active、被客户端重启 reload 重显。
 HOOK_NOTIFICATION_TTL = timedelta(hours=int(os.getenv("SESSION_NOTIFY_HOOK_TTL_HOURS", "24")))
+# 设备 token 寿命:access 短期(请求凭证,到期靠客户端自动 refresh)、refresh 长期(仅换新 access,
+# 不轮换)。refresh 到期后需重新绑定。默认 access 1h / refresh 90d。
+ACCESS_TOKEN_TTL = timedelta(seconds=int(os.getenv("SESSION_NOTIFY_ACCESS_TTL_SECONDS", "3600")))
+REFRESH_TOKEN_TTL = timedelta(days=int(os.getenv("SESSION_NOTIFY_REFRESH_TTL_DAYS", "90")))
+# 配对码有效期:已绑设备签发,新设备扫码/输码消费。一次性,默认 5 分钟。
+PAIR_CODE_TTL = timedelta(seconds=int(os.getenv("SESSION_NOTIFY_PAIR_CODE_TTL_SECONDS", "300")))
 _EXPIRE_POLL_INTERVAL_SECONDS = int(os.getenv("SESSION_NOTIFY_EXPIRE_POLL_SECONDS", "60"))
 
 
@@ -93,8 +101,16 @@ def _resolve_hook_notification(source: str, payload: HookPayload) -> tuple[Notif
 
 
 def create_app(db_path: str | Path | None = None) -> FastAPI:
-    storage = Storage(db_path or os.getenv("SESSION_NOTIFY_DB", "runtime/session_notify.db"))
+    storage = Storage(
+        db_path or os.getenv("SESSION_NOTIFY_DB", "runtime/session_notify.db"),
+        access_ttl=ACCESS_TOKEN_TTL,
+        refresh_ttl=REFRESH_TOKEN_TTL,
+        pair_code_ttl=PAIR_CODE_TTL,
+    )
     hub = WebSocketHub()
+    # 配对模式:strict(默认)= 已有已绑设备后新设备必须持配对码,首台裸 bind 放行;
+    # easy = 配对码仅便捷入口,bind 永远放行(逃生口)。在 create_app 内读便于测试切换。
+    pair_mode = os.getenv("SESSION_NOTIFY_PAIR_MODE", "strict").lower()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -126,7 +142,28 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
 
     @app.post("/api/v1/devices/bind", response_model=DeviceBindResponse)
     def bind_device(request: DeviceBindRequest) -> DeviceBindResponse:
+        # strict 模式:已存在已绑设备时,裸 bind 拒绝。但本机可凭旧 refresh_token 重新绑定
+        # (rebind,换发新 token),避免本机凭证丢失时死锁。首台(无设备)直接放行。
+        # easy 模式:bind 永远放行,配对码仅作免填地址的便捷入口。
+        if pair_mode == "strict" and storage.has_any_device():
+            if request.refresh_token:
+                rebound = storage.rebind_device(request.refresh_token, request.name, request.platform)
+                if rebound is not None:
+                    return rebound
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Pairing code required; use POST /api/v1/devices/pair/consume or rebind with refresh_token",
+            )
         return storage.bind_device(request.name, request.platform)
+
+    @app.post("/api/v1/devices/reset", response_model=dict)
+    def reset_all_devices(request: Request) -> dict:
+        # 撤销所有设备回到 bootstrap 态。仅限本机调用(自托管用户在服务端主机操作),
+        # 避免远程任意重置。用于 strict 模式下本机凭证全丢、又无其他设备签发配对码的死锁。
+        client_host = request.client.host if request.client else ""
+        if client_host not in ("127.0.0.1", "::1", "localhost"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Device reset is only allowed from localhost")
+        return {"revoked": storage.revoke_all_devices()}
 
     @app.post("/api/v1/auth/refresh", response_model=AccessTokenResponse)
     def refresh_access_token(request: TokenRefreshRequest) -> AccessTokenResponse:
@@ -145,6 +182,23 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         if device is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
         return device
+
+    @app.post("/api/v1/devices/pair/issue", response_model=PairIssueResponse)
+    def issue_pair_code(
+        device: DevicePublic = Depends(current_device),
+    ) -> PairIssueResponse:
+        code, expires_at = storage.issue_pair_code(device)
+        return PairIssueResponse(code=code, expires_at=expires_at)
+
+    @app.post("/api/v1/devices/pair/consume", response_model=DeviceBindResponse)
+    def consume_pair_code(request: PairConsumeRequest) -> DeviceBindResponse:
+        response = storage.consume_pair_code(request.code, request.name, request.platform)
+        if response is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid, expired, or already-used pairing code",
+            )
+        return response
 
     @app.get("/api/v1/devices", response_model=list[DevicePublic])
     def list_devices(

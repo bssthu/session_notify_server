@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 import threading
 from collections.abc import Iterable
@@ -25,6 +26,9 @@ from .schemas import (
     utc_now,
 )
 from .security import new_token, sha256_text
+
+# 配对码字符集:去掉易混淆的 I/L/O/U/0/1,生成形如 7Q4K-9XKM 的人类可读码。
+_PAIR_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
 def _dt(value: datetime) -> str:
@@ -71,10 +75,23 @@ def _hook_resolution_key(*, source: str, session_id: str | None, metadata: Any) 
 
 
 class Storage:
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        access_ttl: timedelta = timedelta(hours=1),
+        refresh_ttl: timedelta = timedelta(days=90),
+        pair_code_ttl: timedelta = timedelta(seconds=300),
+    ) -> None:
         self.db_path = Path(db_path)
         if str(self.db_path) != ":memory:":
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # access 短期、refresh 长期;bind/refresh 时写入 *_expires_at,authenticate/refresh
+        # 时校验。老库 migration 后该列为 NULL → 视为不过期(向后兼容,不强制存量重绑)。
+        self.access_ttl = access_ttl
+        self.refresh_ttl = refresh_ttl
+        # 配对码有效期:已绑设备签发,新设备消费后绑定。一次性,过期失效。
+        self.pair_code_ttl = pair_code_ttl
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(
             str(self.db_path),
@@ -102,7 +119,18 @@ class Storage:
                     created_at TEXT NOT NULL,
                     last_seen_at TEXT,
                     revoked_at TEXT,
-                    notifications_enabled INTEGER NOT NULL DEFAULT 1
+                    notifications_enabled INTEGER NOT NULL DEFAULT 1,
+                    access_expires_at TEXT,
+                    refresh_expires_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS pair_codes (
+                    code_hash TEXT PRIMARY KEY,
+                    issued_by_device_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT,
+                    consumed_device_id TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS notifications (
@@ -150,6 +178,8 @@ class Storage:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(devices)").fetchall()}
         additions = {
             "notifications_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "access_expires_at": "TEXT",
+            "refresh_expires_at": "TEXT",
         }
         for name, definition in additions.items():
             if name not in columns:
@@ -171,13 +201,16 @@ class Storage:
         device_id = new_id()
         refresh_token = new_token("sn_refresh")
         access_token = new_token("sn_access")
+        access_expires_at = created_at + self.access_ttl
+        refresh_expires_at = created_at + self.refresh_ttl
         with self._lock, self._conn:
             self._conn.execute(
                 """
                 INSERT INTO devices (
                     id, name, platform, refresh_token_hash, access_token_hash,
-                    created_at, last_seen_at, revoked_at, notifications_enabled
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1)
+                    created_at, last_seen_at, revoked_at, notifications_enabled,
+                    access_expires_at, refresh_expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
                 """,
                 (
                     device_id,
@@ -187,6 +220,8 @@ class Storage:
                     sha256_text(access_token),
                     _dt(created_at),
                     _dt(created_at),
+                    _dt(access_expires_at),
+                    _dt(refresh_expires_at),
                 ),
             )
         return DeviceBindResponse(
@@ -200,7 +235,66 @@ class Storage:
             ),
             refresh_token=refresh_token,
             access_token=access_token,
+            access_expires_at=access_expires_at,
         )
+
+    def rebind_device(self, refresh_token: str, name: str, platform: DevicePlatform) -> DeviceBindResponse | None:
+        """strict 模式下本机重新绑定:用旧 refresh_token 证明身份,换发全新 token(轮换 refresh)。
+        保留 device_id(同一台设备)、原 notifications_enabled 与 created_at,更新 name/platform/过期。
+        旧 token 无效/过期/已撤销返回 None(调用方回退到配对码/重置)。"""
+        token_hash = sha256_text(refresh_token)
+        now = utc_now()
+        new_refresh = new_token("sn_refresh")
+        new_access = new_token("sn_access")
+        access_expires_at = now + self.access_ttl
+        refresh_expires_at = now + self.refresh_ttl
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                """
+                SELECT id, created_at, notifications_enabled FROM devices
+                WHERE refresh_token_hash = ? AND revoked_at IS NULL
+                  AND (refresh_expires_at IS NULL OR refresh_expires_at > ?)
+                """,
+                (token_hash, _dt(now)),
+            ).fetchone()
+            if row is None:
+                return None
+            device_id = row["id"]
+            created_at = _parse_dt(row["created_at"]) or now
+            notifications_enabled = bool(row["notifications_enabled"])
+            self._conn.execute(
+                """
+                UPDATE devices
+                SET name = ?, platform = ?, refresh_token_hash = ?, access_token_hash = ?,
+                    access_expires_at = ?, refresh_expires_at = ?, last_seen_at = ?
+                WHERE id = ?
+                """,
+                (name, platform.value, sha256_text(new_refresh), sha256_text(new_access),
+                 _dt(access_expires_at), _dt(refresh_expires_at), _dt(now), device_id),
+            )
+        return DeviceBindResponse(
+            device=DevicePublic(
+                id=device_id,
+                name=name,
+                platform=platform,
+                created_at=created_at,
+                last_seen_at=now,
+                notifications_enabled=notifications_enabled,
+            ),
+            refresh_token=new_refresh,
+            access_token=new_access,
+            access_expires_at=access_expires_at,
+        )
+
+    def revoke_all_devices(self) -> int:
+        """撤销所有未撤销设备,回到 bootstrap 态。供 localhost-only 的 reset 端点用。返回撤销数。"""
+        now = utc_now()
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "UPDATE devices SET revoked_at = ? WHERE revoked_at IS NULL",
+                (_dt(now),),
+            )
+        return cursor.rowcount
 
     def list_devices(self) -> list[DevicePublic]:
         with self._lock:
@@ -286,6 +380,58 @@ class Storage:
             ).fetchone()
         return self._device_from_row(row)
 
+    def has_any_device(self) -> bool:
+        """是否存在未撤销的已绑设备。strict 模式下据此判断:已有设备时裸 bind 被拒。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM devices WHERE revoked_at IS NULL LIMIT 1"
+            ).fetchone()
+        return row is not None
+
+    def issue_pair_code(self, device: DevicePublic) -> tuple[str, datetime]:
+        """已绑设备签发一个一次性配对码(默认 5 分钟有效)。明文码不落库,只存哈希。"""
+        created_at = utc_now()
+        expires_at = created_at + self.pair_code_ttl
+        code = "{}-{}".format(
+            "".join(secrets.choice(_PAIR_ALPHABET) for _ in range(4)),
+            "".join(secrets.choice(_PAIR_ALPHABET) for _ in range(4)),
+        )
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO pair_codes (code_hash, issued_by_device_id, created_at, expires_at, consumed_at, consumed_device_id)
+                VALUES (?, ?, ?, ?, NULL, NULL)
+                """,
+                (sha256_text(code), device.id, _dt(created_at), _dt(expires_at)),
+            )
+        return code, expires_at
+
+    def consume_pair_code(self, code: str, name: str, platform: DevicePlatform) -> DeviceBindResponse | None:
+        """消费配对码 → 复用 bind_device 绑定新设备。无效/过期/已用返回 None(一次性)。"""
+        code_hash = sha256_text(code)
+        now = utc_now()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT code_hash, expires_at, consumed_at FROM pair_codes WHERE code_hash = ?",
+                (code_hash,),
+            ).fetchone()
+            if row is None or row["consumed_at"] is not None:
+                return None
+            if (_parse_dt(row["expires_at"]) or now) <= now:
+                return None
+            # 先标记消费防并发重复使用,再在锁外执行 bind_device(它自带锁)。
+            self._conn.execute(
+                "UPDATE pair_codes SET consumed_at = ? WHERE code_hash = ?",
+                (_dt(now), code_hash),
+            )
+        response = self.bind_device(name, platform)
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE pair_codes SET consumed_device_id = ? WHERE code_hash = ?",
+                (response.device.id, code_hash),
+            )
+        return response
+
     def device_notifications_enabled(self, device_id: str) -> bool:
         with self._lock:
             row = self._conn.execute(
@@ -317,8 +463,9 @@ class Storage:
                 SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled
                 FROM devices
                 WHERE access_token_hash = ? AND revoked_at IS NULL
+                  AND (access_expires_at IS NULL OR access_expires_at > ?)
                 """,
-                (token_hash,),
+                (token_hash, _dt(now)),
             ).fetchone()
             if row is None:
                 return None
@@ -332,28 +479,31 @@ class Storage:
         token_hash = sha256_text(refresh_token)
         now = utc_now()
         access_token = new_token("sn_access")
+        access_expires_at = now + self.access_ttl
         with self._lock, self._conn:
             row = self._conn.execute(
                 """
                 SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled
                 FROM devices
                 WHERE refresh_token_hash = ? AND revoked_at IS NULL
+                  AND (refresh_expires_at IS NULL OR refresh_expires_at > ?)
                 """,
-                (token_hash,),
+                (token_hash, _dt(now)),
             ).fetchone()
             if row is None:
                 return None
             self._conn.execute(
                 """
                 UPDATE devices
-                SET access_token_hash = ?, last_seen_at = ?
+                SET access_token_hash = ?, access_expires_at = ?, last_seen_at = ?
                 WHERE id = ?
                 """,
-                (sha256_text(access_token), _dt(now), row["id"]),
+                (sha256_text(access_token), _dt(access_expires_at), _dt(now), row["id"]),
             )
         return AccessTokenResponse(
             device=self._device_from_row(row, last_seen_at=now),
             access_token=access_token,
+            access_expires_at=access_expires_at,
         )
 
     def create_notification(
