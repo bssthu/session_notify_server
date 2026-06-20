@@ -56,6 +56,12 @@ class DevicePublic(BaseModel):
     created_at: datetime
     last_seen_at: datetime | None = None
     revoked_at: datetime | None = None
+    notifications_enabled: bool = True
+
+
+class DeviceUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    notifications_enabled: bool | None = None
 
 
 class DeviceBindResponse(BaseModel):

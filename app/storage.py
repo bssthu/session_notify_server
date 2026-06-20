@@ -101,7 +101,8 @@ class Storage:
                     access_token_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL,
                     last_seen_at TEXT,
-                    revoked_at TEXT
+                    revoked_at TEXT,
+                    notifications_enabled INTEGER NOT NULL DEFAULT 1
                 );
 
                 CREATE TABLE IF NOT EXISTS notifications (
@@ -142,7 +143,17 @@ class Storage:
                 );
                 """
             )
+            self._ensure_device_columns()
             self._ensure_notification_origin_columns()
+
+    def _ensure_device_columns(self) -> None:
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(devices)").fetchall()}
+        additions = {
+            "notifications_enabled": "INTEGER NOT NULL DEFAULT 1",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                self._conn.execute(f"ALTER TABLE devices ADD COLUMN {name} {definition}")
 
     def _ensure_notification_origin_columns(self) -> None:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(notifications)").fetchall()}
@@ -165,8 +176,8 @@ class Storage:
                 """
                 INSERT INTO devices (
                     id, name, platform, refresh_token_hash, access_token_hash,
-                    created_at, last_seen_at, revoked_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+                    created_at, last_seen_at, revoked_at, notifications_enabled
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1)
                 """,
                 (
                     device_id,
@@ -185,10 +196,117 @@ class Storage:
                 platform=platform,
                 created_at=created_at,
                 last_seen_at=created_at,
+                notifications_enabled=True,
             ),
             refresh_token=refresh_token,
             access_token=access_token,
         )
+
+    def list_devices(self) -> list[DevicePublic]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled
+                FROM devices
+                WHERE revoked_at IS NULL
+                ORDER BY created_at ASC
+                """
+            ).fetchall()
+        return [self._device_from_row(row) for row in rows]
+
+    def update_device(
+        self,
+        device_id: str,
+        *,
+        name: str | None = None,
+        notifications_enabled: bool | None = None,
+    ) -> DevicePublic:
+        values: list[Any] = []
+        assignments: list[str] = []
+        if name is not None:
+            cleaned = name.strip()
+            if not cleaned:
+                raise ValueError("Device name is required.")
+            assignments.append("name = ?")
+            values.append(cleaned)
+        if notifications_enabled is not None:
+            assignments.append("notifications_enabled = ?")
+            values.append(1 if notifications_enabled else 0)
+
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                """
+                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled
+                FROM devices
+                WHERE id = ? AND revoked_at IS NULL
+                """,
+                (device_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(device_id)
+            if assignments:
+                self._conn.execute(
+                    f"UPDATE devices SET {', '.join(assignments)} WHERE id = ?",
+                    (*values, device_id),
+                )
+                row = self._conn.execute(
+                    """
+                    SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled
+                    FROM devices
+                    WHERE id = ?
+                    """,
+                    (device_id,),
+                ).fetchone()
+        return self._device_from_row(row)
+
+    def revoke_device(self, device_id: str) -> DevicePublic:
+        revoked_at = utc_now()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                """
+                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled
+                FROM devices
+                WHERE id = ?
+                """,
+                (device_id,),
+            ).fetchone()
+            if row is None or row["revoked_at"] is not None:
+                raise KeyError(device_id)
+            self._conn.execute(
+                "UPDATE devices SET revoked_at = ? WHERE id = ?",
+                (_dt(revoked_at), device_id),
+            )
+            row = self._conn.execute(
+                """
+                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled
+                FROM devices
+                WHERE id = ?
+                """,
+                (device_id,),
+            ).fetchone()
+        return self._device_from_row(row)
+
+    def device_notifications_enabled(self, device_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT notifications_enabled
+                FROM devices
+                WHERE id = ? AND revoked_at IS NULL
+                """,
+                (device_id,),
+            ).fetchone()
+        return bool(row and row["notifications_enabled"])
+
+    def event_for_device(self, event: SyncEvent, device: DevicePublic) -> SyncEvent:
+        if event.event_type != EventType.notification_created or device.notifications_enabled:
+            return event
+        return event.model_copy(update={"notification": None})
+
+    def should_deliver_event_to_device(self, event: SyncEvent, device_id: str) -> bool:
+        if event.event_type != EventType.notification_created:
+            return True
+        return self.device_notifications_enabled(device_id)
 
     def authenticate(self, access_token: str) -> DevicePublic | None:
         token_hash = sha256_text(access_token)
@@ -196,7 +314,7 @@ class Storage:
         with self._lock, self._conn:
             row = self._conn.execute(
                 """
-                SELECT id, name, platform, created_at, last_seen_at, revoked_at
+                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled
                 FROM devices
                 WHERE access_token_hash = ? AND revoked_at IS NULL
                 """,
@@ -217,7 +335,7 @@ class Storage:
         with self._lock, self._conn:
             row = self._conn.execute(
                 """
-                SELECT id, name, platform, created_at, last_seen_at, revoked_at
+                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled
                 FROM devices
                 WHERE refresh_token_hash = ? AND revoked_at IS NULL
                 """,
@@ -405,7 +523,7 @@ class Storage:
                 )
         return None
 
-    def events_after(self, since_event_id: str | None) -> list[SyncEvent]:
+    def events_after(self, since_event_id: str | None, device: DevicePublic | None = None) -> list[SyncEvent]:
         values: tuple[Any, ...]
         where = ""
         if since_event_id:
@@ -427,7 +545,10 @@ class Storage:
                 f"SELECT payload FROM events {where} ORDER BY seq ASC",
                 values,
             ).fetchall()
-        return [SyncEvent.model_validate_json(row["payload"]) for row in rows]
+        events = [SyncEvent.model_validate_json(row["payload"]) for row in rows]
+        if device is None:
+            return events
+        return [self.event_for_device(event, device) for event in events]
 
     def expire_due_notifications(self) -> list[SyncEvent]:
         now = utc_now()
@@ -556,4 +677,5 @@ class Storage:
             created_at=_parse_dt(row["created_at"]) or utc_now(),
             last_seen_at=last_seen_at or _parse_dt(row["last_seen_at"]),
             revoked_at=_parse_dt(row["revoked_at"]),
+            notifications_enabled=bool(row["notifications_enabled"]),
         )

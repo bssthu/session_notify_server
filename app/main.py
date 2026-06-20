@@ -18,6 +18,7 @@ from .schemas import (
     DeviceBindRequest,
     DeviceBindResponse,
     DevicePublic,
+    DeviceUpdateRequest,
     EventsResponse,
     HookPayload,
     NotificationCreate,
@@ -101,7 +102,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         # 清理 TTL 上线前堆积的 active hook 通知(重启即生效)。
         storage.backfill_hook_expiry(HOOK_NOTIFICATION_TTL)
         for event in storage.expire_due_notifications():
-            await hub.broadcast(event)
+            await hub.broadcast(event, storage.should_deliver_event_to_device)
         expire_task = asyncio.create_task(_expire_due_loop(storage, hub))
         try:
             yield
@@ -145,13 +146,46 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
         return device
 
+    @app.get("/api/v1/devices", response_model=list[DevicePublic])
+    def list_devices(
+        device: DevicePublic = Depends(current_device),
+    ) -> list[DevicePublic]:
+        return storage.list_devices()
+
+    @app.patch("/api/v1/devices/{device_id}", response_model=DevicePublic)
+    def update_device(
+        device_id: str,
+        request: DeviceUpdateRequest,
+        device: DevicePublic = Depends(current_device),
+    ) -> DevicePublic:
+        try:
+            return storage.update_device(
+                device_id,
+                name=request.name,
+                notifications_enabled=request.notifications_enabled,
+            )
+        except KeyError:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found") from None
+        except ValueError as error:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error)) from None
+
+    @app.delete("/api/v1/devices/{device_id}", response_model=DevicePublic)
+    def revoke_device(
+        device_id: str,
+        device: DevicePublic = Depends(current_device),
+    ) -> DevicePublic:
+        try:
+            return storage.revoke_device(device_id)
+        except KeyError:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found") from None
+
     @app.post("/api/v1/notifications", response_model=NotificationPublic)
     async def create_notification(
         request: NotificationCreate,
         device: DevicePublic = Depends(current_device),
     ) -> NotificationPublic:
         notification, event = storage.create_notification(request, origin_device=device)
-        await hub.broadcast(event)
+        await hub.broadcast(event, storage.should_deliver_event_to_device)
         return notification
 
     @app.post("/api/v1/hooks/{source}", response_model=NotificationPublic)
@@ -173,7 +207,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             metadata=hook_meta,
         )
         notification, event = storage.create_notification(request, origin_device=device)
-        await hub.broadcast(event)
+        await hub.broadcast(event, storage.should_deliver_event_to_device)
         # 工具执行完成(PostToolUse)意味着对应的权限请求已被批准:按配对键自动 resolve
         # 匹配的活跃 permission request,避免它永远 active、被客户端重启时 reload 重显。
         if (payload.hook_event_name or "").lower() == "posttooluse":
@@ -185,7 +219,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 reason="auto_resolved",
             )
             if resolved is not None:
-                await hub.broadcast(resolved)
+                await hub.broadcast(resolved, storage.should_deliver_event_to_device)
         return notification
 
     @app.get("/api/v1/notifications", response_model=list[NotificationPublic])
@@ -193,6 +227,8 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         status_filter: list[NotificationStatus] | None = Query(default=None, alias="status"),
         device: DevicePublic = Depends(current_device),
     ) -> list[NotificationPublic]:
+        if not device.notifications_enabled:
+            return []
         return storage.list_notifications(status_filter or [NotificationStatus.active])
 
     @app.post("/api/v1/notifications/{notification_id}/ack", response_model=AckResponse)
@@ -206,7 +242,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         except KeyError:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Notification not found") from None
         if event is not None:
-            await hub.broadcast(event)
+            await hub.broadcast(event, storage.should_deliver_event_to_device)
         return response
 
     @app.get("/api/v1/events", response_model=EventsResponse)
@@ -214,7 +250,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         since_event_id: str | None = None,
         device: DevicePublic = Depends(current_device),
     ) -> EventsResponse:
-        return EventsResponse(events=storage.events_after(since_event_id))
+        return EventsResponse(events=storage.events_after(since_event_id, device))
 
     @app.websocket("/api/v1/ws")
     async def websocket_endpoint(websocket: WebSocket, token: str | None = None) -> None:
@@ -223,11 +259,10 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         if auth_header and auth_header.lower().startswith("bearer "):
             header_token = auth_header.split(" ", 1)[1].strip()
         device = storage.authenticate(header_token or token or "")
-        await hub.connect(websocket)
         if device is None:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            await hub.disconnect(websocket)
             return
+        await hub.connect(websocket, device.id)
         try:
             while True:
                 await websocket.receive_text()
@@ -245,7 +280,7 @@ async def _expire_due_loop(storage: Storage, hub: WebSocketHub) -> None:
         await asyncio.sleep(_EXPIRE_POLL_INTERVAL_SECONDS)
         try:
             for event in storage.expire_due_notifications():
-                await hub.broadcast(event)
+                await hub.broadcast(event, storage.should_deliver_event_to_device)
         except Exception:  # pragma: no cover
             pass
 

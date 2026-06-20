@@ -29,6 +29,52 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceBindResponse"
+  /api/v1/devices:
+    get:
+      responses:
+        "200":
+          description: Bound devices.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Device"
+  /api/v1/devices/{device_id}:
+    patch:
+      parameters:
+        - name: device_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceUpdateRequest"
+      responses:
+        "200":
+          description: Updated device.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Device"
+    delete:
+      parameters:
+        - name: device_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Revoked device.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Device"
   /api/v1/auth/refresh:
     post:
       security: []
@@ -177,6 +223,15 @@ components:
         token_type:
           type: string
           const: bearer
+    DeviceUpdateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 80
+        notifications_enabled:
+          type: boolean
     TokenRefreshRequest:
       type: object
       required: [refresh_token]
@@ -196,7 +251,7 @@ components:
           const: bearer
     Device:
       type: object
-      required: [id, name, platform, created_at]
+      required: [id, name, platform, created_at, notifications_enabled]
       properties:
         id:
           type: string
@@ -214,6 +269,8 @@ components:
         revoked_at:
           type: [string, "null"]
           format: date-time
+        notifications_enabled:
+          type: boolean
     NotificationLevel:
       type: string
       enum: [info, success, important, critical]

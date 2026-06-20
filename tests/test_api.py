@@ -201,6 +201,77 @@ def test_android_device_bind_can_sync_and_refresh(tmp_path):
     assert refreshed_list.status_code == 200, refreshed_list.text
 
 
+def test_device_management_updates_notification_delivery_and_revokes(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    desktop = bind_tokens(client, name="Desktop", platform="windows")
+    phone = bind_tokens(client, name="Pixel", platform="android")
+
+    devices = client.get("/api/v1/devices", headers=auth(desktop["access_token"]))
+    assert devices.status_code == 200, devices.text
+    assert [item["name"] for item in devices.json()] == ["Desktop", "Pixel"]
+    assert all(item["notifications_enabled"] is True for item in devices.json())
+
+    renamed = client.patch(
+        f"/api/v1/devices/{desktop['device']['id']}",
+        headers=auth(desktop["access_token"]),
+        json={"name": "Workstation"},
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["name"] == "Workstation"
+
+    disabled = client.patch(
+        f"/api/v1/devices/{phone['device']['id']}",
+        headers=auth(desktop["access_token"]),
+        json={"notifications_enabled": False},
+    )
+    assert disabled.status_code == 200, disabled.text
+    assert disabled.json()["notifications_enabled"] is False
+
+    created = client.post(
+        "/api/v1/notifications",
+        headers=auth(desktop["access_token"]),
+        json={
+            "source": "codex",
+            "session_id": "s-device-filter",
+            "title": "Filtered notification",
+            "body": "Disabled devices should not receive this.",
+            "level": "info",
+        },
+    )
+    assert created.status_code == 200, created.text
+
+    disabled_list = client.get("/api/v1/notifications", headers=auth(phone["access_token"]))
+    assert disabled_list.status_code == 200, disabled_list.text
+    assert disabled_list.json() == []
+
+    disabled_events = client.get("/api/v1/events", headers=auth(phone["access_token"]))
+    assert disabled_events.status_code == 200, disabled_events.text
+    assert disabled_events.json()["events"][0]["event_type"] == "notification.created"
+    assert disabled_events.json()["events"][0]["notification"] is None
+
+    enabled = client.patch(
+        f"/api/v1/devices/{phone['device']['id']}",
+        headers=auth(desktop["access_token"]),
+        json={"notifications_enabled": True},
+    )
+    assert enabled.status_code == 200, enabled.text
+    assert enabled.json()["notifications_enabled"] is True
+    enabled_list = client.get("/api/v1/notifications", headers=auth(phone["access_token"]))
+    assert [item["id"] for item in enabled_list.json()] == [created.json()["id"]]
+
+    revoked = client.delete(
+        f"/api/v1/devices/{phone['device']['id']}",
+        headers=auth(desktop["access_token"]),
+    )
+    assert revoked.status_code == 200, revoked.text
+    assert revoked.json()["revoked_at"] is not None
+
+    devices_after_revoke = client.get("/api/v1/devices", headers=auth(desktop["access_token"]))
+    assert [item["id"] for item in devices_after_revoke.json()] == [desktop["device"]["id"]]
+    assert client.get("/api/v1/notifications", headers=auth(phone["access_token"])).status_code == 401
+    assert client.post("/api/v1/auth/refresh", json={"refresh_token": phone["refresh_token"]}).status_code == 401
+
+
 def test_hook_mapping_and_expiry(tmp_path):
     app = create_app(tmp_path / "server.db")
     client = TestClient(app)
