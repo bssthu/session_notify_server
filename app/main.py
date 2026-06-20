@@ -150,7 +150,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         request: NotificationCreate,
         device: DevicePublic = Depends(current_device),
     ) -> NotificationPublic:
-        notification, event = storage.create_notification(request)
+        notification, event = storage.create_notification(request, origin_device=device)
         await hub.broadcast(event)
         return notification
 
@@ -172,7 +172,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             expires_at=utc_now() + HOOK_NOTIFICATION_TTL,
             metadata=hook_meta,
         )
-        notification, event = storage.create_notification(request)
+        notification, event = storage.create_notification(request, origin_device=device)
         await hub.broadcast(event)
         # 工具执行完成(PostToolUse)意味着对应的权限请求已被批准:按配对键自动 resolve
         # 匹配的活跃 permission request,避免它永远 active、被客户端重启时 reload 重显。

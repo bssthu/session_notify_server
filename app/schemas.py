@@ -99,6 +99,9 @@ class NotificationPublic(BaseModel):
     id: str
     source: str
     session_id: str
+    origin_device_id: str | None = None
+    origin_device_name: str | None = None
+    origin_device_platform: DevicePlatform | None = None
     title: str
     body: str
     level: NotificationLevel

@@ -14,7 +14,7 @@ def bind(client: TestClient, name: str = "desktop", platform: str = "windows") -
     return response.json()["access_token"]
 
 
-def bind_tokens(client: TestClient, name: str = "desktop", platform: str = "windows") -> dict[str, str]:
+def bind_tokens(client: TestClient, name: str = "desktop", platform: str = "windows") -> dict:
     response = client.post("/api/v1/devices/bind", json={"name": name, "platform": platform})
     assert response.status_code == 200, response.text
     return response.json()
@@ -26,7 +26,8 @@ def auth(token: str) -> dict[str, str]:
 
 def test_create_list_and_ack_notification(tmp_path):
     client = TestClient(create_app(tmp_path / "server.db"))
-    token = bind(client)
+    tokens = bind_tokens(client, name="WORKSTATION-01", platform="windows")
+    token = tokens["access_token"]
 
     created = client.post(
         "/api/v1/notifications",
@@ -45,9 +46,13 @@ def test_create_list_and_ack_notification(tmp_path):
     notification = created.json()
     assert notification["status"] == "active"
     assert notification["level"] == "critical"
+    assert notification["origin_device_id"] == tokens["device"]["id"]
+    assert notification["origin_device_name"] == "WORKSTATION-01"
+    assert notification["origin_device_platform"] == "windows"
 
     listed = client.get("/api/v1/notifications", headers=auth(token))
     assert [item["id"] for item in listed.json()] == [notification["id"]]
+    assert listed.json()[0]["origin_device_name"] == "WORKSTATION-01"
 
     acked = client.post(
         f"/api/v1/notifications/{notification['id']}/ack",
@@ -68,6 +73,32 @@ def test_create_list_and_ack_notification(tmp_path):
 
     active = client.get("/api/v1/notifications", headers=auth(token))
     assert active.json() == []
+
+
+def test_remote_clients_see_notification_origin_device(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    desktop = bind_tokens(client, name="Desktop", platform="windows")
+    phone = bind_tokens(client, name="Pixel", platform="android")
+
+    created = client.post(
+        "/api/v1/notifications",
+        headers=auth(desktop["access_token"]),
+        json={
+            "source": "codex",
+            "session_id": "s-origin",
+            "title": "Codex needs confirmation",
+            "body": "Allow npm test?",
+            "level": "critical",
+        },
+    )
+    assert created.status_code == 200, created.text
+
+    listed = client.get("/api/v1/notifications", headers=auth(phone["access_token"]))
+    assert listed.status_code == 200, listed.text
+    notification = listed.json()[0]
+    assert notification["origin_device_id"] == desktop["device"]["id"]
+    assert notification["origin_device_name"] == "Desktop"
+    assert notification["origin_device_platform"] == "windows"
 
 
 def test_event_pull_and_websocket_push(tmp_path):
@@ -173,7 +204,8 @@ def test_android_device_bind_can_sync_and_refresh(tmp_path):
 def test_hook_mapping_and_expiry(tmp_path):
     app = create_app(tmp_path / "server.db")
     client = TestClient(app)
-    token = bind(client)
+    tokens = bind_tokens(client, name="Hook Host", platform="windows")
+    token = tokens["access_token"]
 
     hook = client.post(
         "/api/v1/hooks/codex",
@@ -187,6 +219,8 @@ def test_hook_mapping_and_expiry(tmp_path):
     assert hook.status_code == 200, hook.text
     assert hook.json()["level"] == "critical"
     assert hook.json()["title"] == "codex needs confirmation"
+    assert hook.json()["origin_device_id"] == tokens["device"]["id"]
+    assert hook.json()["origin_device_name"] == "Hook Host"
 
     expired = client.post(
         "/api/v1/notifications",

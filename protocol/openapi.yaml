@@ -255,6 +255,16 @@ components:
           properties:
             id:
               type: string
+            origin_device_id:
+              type: [string, "null"]
+              description: Device id that created the notification.
+            origin_device_name:
+              type: [string, "null"]
+              description: Device display name that created the notification.
+            origin_device_platform:
+              type: [string, "null"]
+              enum: [windows, android, null]
+              description: Platform of the device that created the notification.
             status:
               $ref: "#/components/schemas/NotificationStatus"
             created_at:

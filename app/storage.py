@@ -108,6 +108,9 @@ class Storage:
                     id TEXT PRIMARY KEY,
                     source TEXT NOT NULL,
                     session_id TEXT NOT NULL,
+                    origin_device_id TEXT,
+                    origin_device_name TEXT,
+                    origin_device_platform TEXT,
                     title TEXT NOT NULL,
                     body TEXT NOT NULL,
                     level TEXT NOT NULL,
@@ -139,6 +142,18 @@ class Storage:
                 );
                 """
             )
+            self._ensure_notification_origin_columns()
+
+    def _ensure_notification_origin_columns(self) -> None:
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(notifications)").fetchall()}
+        additions = {
+            "origin_device_id": "TEXT",
+            "origin_device_name": "TEXT",
+            "origin_device_platform": "TEXT",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                self._conn.execute(f"ALTER TABLE notifications ADD COLUMN {name} {definition}")
 
     def bind_device(self, name: str, platform: DevicePlatform) -> DeviceBindResponse:
         created_at = utc_now()
@@ -223,12 +238,19 @@ class Storage:
             access_token=access_token,
         )
 
-    def create_notification(self, request: NotificationCreate) -> tuple[NotificationPublic, SyncEvent]:
+    def create_notification(
+        self,
+        request: NotificationCreate,
+        origin_device: DevicePublic | None = None,
+    ) -> tuple[NotificationPublic, SyncEvent]:
         now = utc_now()
         notification = NotificationPublic(
             id=new_id(),
             source=request.source,
             session_id=request.session_id,
+            origin_device_id=origin_device.id if origin_device else None,
+            origin_device_name=origin_device.name if origin_device else None,
+            origin_device_platform=origin_device.platform if origin_device else None,
             title=request.title,
             body=request.body,
             level=request.level,
@@ -467,14 +489,18 @@ class Storage:
         self._conn.execute(
             """
             INSERT INTO notifications (
-                id, source, session_id, title, body, level, status,
+                id, source, session_id, origin_device_id, origin_device_name,
+                origin_device_platform, title, body, level, status,
                 created_at, updated_at, expires_at, requires_ack, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 notification.id,
                 notification.source,
                 notification.session_id,
+                notification.origin_device_id,
+                notification.origin_device_name,
+                notification.origin_device_platform.value if notification.origin_device_platform else None,
                 notification.title,
                 notification.body,
                 notification.level.value,
@@ -508,6 +534,9 @@ class Storage:
             id=row["id"],
             source=row["source"],
             session_id=row["session_id"],
+            origin_device_id=row["origin_device_id"],
+            origin_device_name=row["origin_device_name"],
+            origin_device_platform=DevicePlatform(row["origin_device_platform"]) if row["origin_device_platform"] else None,
             title=row["title"],
             body=row["body"],
             level=NotificationLevel(row["level"]),

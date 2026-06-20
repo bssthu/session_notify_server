@@ -43,6 +43,12 @@
         "id": { "type": "string" },
         "source": { "type": "string" },
         "session_id": { "type": "string" },
+        "origin_device_id": { "type": ["string", "null"] },
+        "origin_device_name": { "type": ["string", "null"] },
+        "origin_device_platform": {
+          "type": ["string", "null"],
+          "enum": ["windows", "android", null]
+        },
         "title": { "type": "string" },
         "body": { "type": "string" },
         "level": {
