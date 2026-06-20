@@ -10,6 +10,8 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 
 from .hub import WebSocketHub
+from .certs import server_certificate_fingerprint
+from .network import list_local_ipv4_addresses
 from .logging_setup import configure_server_logging
 from .schemas import (
     AckRequest,
@@ -196,10 +198,19 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
 
     @app.post("/api/v1/devices/pair/issue", response_model=PairIssueResponse)
     def issue_pair_code(
+        request: Request,
         device: DevicePublic = Depends(current_device),
     ) -> PairIssueResponse:
         code, expires_at = storage.issue_pair_code(device)
-        return PairIssueResponse(code=code, expires_at=expires_at)
+        scheme = request.url.scheme or "https"
+        port = request.url.port or int(os.getenv("SESSION_NOTIFY_PORT", "8765"))
+        candidate_base_urls = [f"{scheme}://{ip}:{port}" for ip in list_local_ipv4_addresses()]
+        return PairIssueResponse(
+            code=code,
+            expires_at=expires_at,
+            candidate_base_urls=candidate_base_urls,
+            server_fingerprint=server_certificate_fingerprint(),
+        )
 
     @app.post("/api/v1/devices/pair/consume", response_model=DeviceBindResponse)
     def consume_pair_code(request: PairConsumeRequest) -> DeviceBindResponse:

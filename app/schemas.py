@@ -88,6 +88,10 @@ class AccessTokenResponse(BaseModel):
 class PairIssueResponse(BaseModel):
     code: str
     expires_at: datetime
+    # 本机网卡候选地址(供「绑定新设备」二维码选用真实可达地址,避免 localhost 回环)。
+    candidate_base_urls: list[str] = Field(default_factory=list)
+    # 服务端证书 SHA-256 指纹(整个 DER 证书)。编入二维码后新设备一扫即绑,无需手填指纹。
+    server_fingerprint: str | None = None
 
 
 class PairConsumeRequest(BaseModel):

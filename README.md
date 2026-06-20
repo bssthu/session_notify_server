@@ -4,17 +4,21 @@
 
 ## 本地运行
 
+仅本机调试（HTTP，**不支持**多设备扫码绑定——移动端证书 pinning 只走 TLS）：
+
 ```powershell
 uv sync
 uv run uvicorn app.main:app --reload --port 8765 --log-config logging.json
 ```
 
-HTTPS/WSS 开发运行：
+HTTPS/WSS 开发运行（**多设备扫码绑定必须用此方式**）：
 
 ```powershell
-.\scripts\generate_self_signed_cert.ps1
-.\scripts\run_dev_server.ps1
+.\scripts\generate_self_signed_cert.ps1   # 首次运行需要,生成自签证书到 runtime/secrets/
+.\scripts\run_dev_server.ps1 -HostAddress 0.0.0.0   # 监听所有网卡;默认 127.0.0.1 只回环,移动端/局域网设备连不上
 ```
+
+> 多设备绑定(桌面端「绑定新设备」生成二维码、移动端扫码)要求服务端以 HTTPS 启动:二维码里的服务端地址取自服务端实际协议,HTTP 启动会编出 `http://` 地址,而 Android 强制 HTTPS,会报 `baseUrl must use HTTPS`。HTTPS 下,Windows 桌面端首次连接会自动固定证书指纹(TOFU)、二维码也会带上服务端自报的指纹,移动端一扫即绑,无需手动配置指纹。**移动端要连上,服务端必须 `-HostAddress 0.0.0.0` 监听所有网卡**(默认 127.0.0.1 只回环,局域网设备连不上),并在 Windows 防火墙放行 8765 入站。
 
 ## 测试
 

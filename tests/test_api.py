@@ -741,6 +741,13 @@ def test_pair_issue_and_consume_binds_new_device(tmp_path):
     code = issued.json()["code"]
     assert code.count("-") == 1 and len(code.replace("-", "")) == 8  # XXXX-XXXX
     assert issued.json()["expires_at"] is not None
+    candidates = issued.json()["candidate_base_urls"]
+    assert isinstance(candidates, list)
+    for url in candidates:  # 形如 https://192.168.1.20:8765
+        assert url.startswith(("http://", "https://"))
+        assert url.split("://", 1)[1].count(":") == 1
+    fingerprint = issued.json()["server_fingerprint"]
+    assert fingerprint is None or len(fingerprint) == 64  # 证书读不到时为 None
 
     consumed = client.post("/api/v1/devices/pair/consume", json={
         "code": code, "name": "Pixel", "platform": "android"
