@@ -25,6 +25,7 @@ from .schemas import (
     new_id,
     utc_now,
 )
+from .hook_policy import is_noise_hook_event
 from .security import new_token, sha256_text
 
 # 配对码字符集:去掉易混淆的 I/L/O/U/0/1,生成形如 7Q4K-9XKM 的人类可读码。
@@ -888,6 +889,67 @@ class Storage:
                 except (TypeError, ValueError):
                     metadata = {}
                 if not metadata.get("hook_event_name"):
+                    continue
+                self._conn.execute(
+                    """
+                    UPDATE notifications
+                    SET status = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (NotificationStatus.acknowledged.value, _dt(now), row["id"]),
+                )
+                events.append(
+                    self._append_event(
+                        SyncEvent(
+                            event_id=new_id(),
+                            event_type=EventType.notification_acknowledged,
+                            created_at=now,
+                            notification_id=row["id"],
+                            ack_by_device_id=None,
+                            ack_at=now,
+                            reason=reason,
+                        )
+                    )
+                )
+        return events
+
+    def acknowledge_legacy_noise_notifications(self, reason: str = "migration_cleanup") -> list[SyncEvent]:
+        """一次性迁移:把 active 的噪声类 hook 通知(PostToolUse/idle/paused/无内容 completed)
+        置为 acknowledged,清空"服务端创建层过滤"上线前堆积的历史(实测 PostToolUse 占 active
+        的 95%)。幂等——只动 status=active。排除 needs-confirmation(保留未处理权限请求);判定
+        委托 hook_policy.is_noise_hook_event,与创建过滤同策略,故 failure/有内容的通知保留。
+        不写 acks 表(外键约束,迁移无真实设备),仅 UPDATE status + 追加
+        notification.acknowledged 事件(ack_by_device_id=None),返回供启动广播。
+        """
+        now = utc_now()
+        events: list[SyncEvent] = []
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                "SELECT id, title, metadata FROM notifications WHERE status = ?",
+                (NotificationStatus.active.value,),
+            ).fetchall()
+            for row in rows:
+                title_lower = (row["title"] or "").lower()
+                if "needs confirmation" in title_lower:
+                    continue
+                try:
+                    metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+                except (TypeError, ValueError):
+                    metadata = {}
+                event_name = str(
+                    metadata.get("hook_event_name") or metadata.get("hook_event_type") or ""
+                ).lower()
+                if not event_name:
+                    continue
+                raw = metadata.get("raw")
+                if not is_noise_hook_event(
+                    event_name=event_name,
+                    notification_type=str(metadata.get("notification_type") or "").lower(),
+                    hook_status=str(metadata.get("hook_status") or "").lower(),
+                    title=title_lower,
+                    body_generated=str(metadata.get("body_generated") or "").lower() == "true",
+                    raw=raw if isinstance(raw, dict) else None,
+                ):
                     continue
                 self._conn.execute(
                     """

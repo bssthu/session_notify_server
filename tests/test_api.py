@@ -343,10 +343,8 @@ def test_official_hook_event_mapping(tmp_path):
         },
     )
     assert generic_completed.status_code == 200, generic_completed.text
-    assert generic_completed.json()["level"] == "success"
-    assert generic_completed.json()["title"] == "claude completed"
-    assert generic_completed.json()["body"] == "Session event received."
-    assert generic_completed.json()["metadata"]["body_generated"] is True
+    # 无内容 TaskCompleted(body_generated、无真实正文)是噪声,服务端创建层 suppress 不创建通知
+    assert generic_completed.json() is None
 
     permission = client.post(
         "/api/v1/hooks/claude",
@@ -402,8 +400,10 @@ def test_posttooluse_resolves_matching_permission_request(tmp_path):
     active = client.get("/api/v1/notifications", headers=auth(token)).json()
     assert perm_id not in [item["id"] for item in active]
     assert "claude needs confirmation" not in [item["title"] for item in active]
-    # PostToolUse 自身的 completed 通知仍是 active(服务端不 suppress)
-    assert "claude completed" in [item["title"] for item in active]
+    # PostToolUse 是传输信号(用于 resolve 权限),服务端创建层 suppress:自身不创建通知,
+    # 故 active 为空(perm 已被 resolve,PostToolUse 未创建)。
+    assert active == []
+    assert post.json() is None
 
     events = client.get("/api/v1/events", headers=auth(token)).json()["events"]
     ack_events = [e for e in events if e["event_type"] == "notification.acknowledged"]
@@ -419,10 +419,12 @@ def test_posttooluse_without_match_is_noop(tmp_path):
     post = client.post("/api/v1/hooks/claude", headers=auth(token),
                        json=_hook_payload("PostToolUse", "s-alone", "npm test"))
     assert post.status_code == 200, post.text
+    assert post.json() is None  # PostToolUse 被 suppress,不创建通知
 
     events = client.get("/api/v1/events", headers=auth(token)).json()["events"]
     assert all(e["event_type"] != "notification.acknowledged" for e in events)
-    assert len([item for item in client.get("/api/v1/notifications", headers=auth(token)).json()]) == 1
+    # PostToolUse 不创建通知 → active 为空(无匹配 permission 也无事可 resolve)
+    assert client.get("/api/v1/notifications", headers=auth(token)).json() == []
 
 
 def test_unrelated_permission_request_not_resolved(tmp_path):
@@ -653,6 +655,132 @@ def test_lifespan_cleans_legacy_permission_requests(tmp_path):
         and e.reason == "migration_cleanup"
     ]
     assert len(cleanup_events2) == 1
+    storage.close()
+
+
+def test_receive_hook_suppresses_noise_but_keeps_value(tmp_path):
+    # PostToolUse/idle/无内容 completed 是噪声,服务端创建层不创建通知(返回 null);
+    # needs-confirmation/failure/有内容的通知正常创建。
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    # PostToolUse:被 suppress(传输信号,用于 resolve 权限)
+    post = client.post("/api/v1/hooks/claude", headers=auth(token),
+                       json=_hook_payload("PostToolUse", "s-ptu", "npm test"))
+    assert post.status_code == 200
+    assert post.json() is None
+
+    # 无内容 Stop(contentless completed):被 suppress
+    stop = client.post("/api/v1/hooks/claude", headers=auth(token),
+                       json=_hook_payload("Stop", "s-stop", ""))
+    assert stop.status_code == 200
+    assert stop.json() is None
+
+    # idle:被 suppress
+    idle = client.post("/api/v1/hooks/claude", headers=auth(token), json={
+        "hook_event_name": "Notification",
+        "notification_type": "idle_prompt",
+        "session_id": "s-idle",
+    })
+    assert idle.status_code == 200
+    assert idle.json() is None
+
+    # needs-confirmation:保留(critical)
+    perm = client.post("/api/v1/hooks/claude", headers=auth(token),
+                       json=_hook_payload("PermissionRequest", "s-perm", "npm test"))
+    assert perm.status_code == 200
+    assert perm.json()["title"] == "claude needs confirmation"
+    assert perm.json()["level"] == "critical"
+
+    # failure:保留(important)——非 contentless completed
+    fail = client.post("/api/v1/hooks/claude", headers=auth(token), json={
+        "hook_event_name": "StopFailure",
+        "event_type": "failure",
+        "hook_status": "failed",
+        "message": "boom",
+        "session_id": "s-fail",
+    })
+    assert fail.status_code == 200
+    assert fail.json()["title"] == "claude needs attention"
+
+    # 有内容 completed(带 last_assistant_message):保留(success)
+    done = client.post("/api/v1/hooks/claude", headers=auth(token), json={
+        "hook_event_name": "Stop",
+        "last_assistant_message": "Refactor finished.",
+        "session_id": "s-done",
+    })
+    assert done.status_code == 200
+    assert done.json()["title"] == "claude completed"
+    assert done.json()["body"] == "Refactor finished."
+
+    # 只有 3 条有价值通知进入 active(perm/fail/done),噪声全部未创建
+    titles = sorted(item["title"] for item in client.get("/api/v1/notifications", headers=auth(token)).json())
+    assert titles == ["claude completed", "claude needs attention", "claude needs confirmation"]
+
+
+def test_lifespan_cleans_legacy_noise_notifications(tmp_path):
+    from app.storage import Storage
+    from app.schemas import EventType, NotificationCreate, NotificationLevel, NotificationStatus
+
+    db_path = tmp_path / "s.db"
+    storage = Storage(db_path)
+    # 模拟"创建层类型过滤"上线前的历史堆积:active 的噪声类(PostToolUse/无内容 completed/idle)
+    posttooluse, _ = storage.create_notification(NotificationCreate(
+        source="claude", session_id="s-ptu", title="claude update",
+        body="Session event received.", level=NotificationLevel.info,
+        expires_at=utc_now() + timedelta(hours=24),
+        metadata={"hook_event_name": "PostToolUse", "body_generated": True},
+    ))
+    completed, _ = storage.create_notification(NotificationCreate(
+        source="claude", session_id="s-done", title="claude completed",
+        body="Session event received.", level=NotificationLevel.success,
+        expires_at=utc_now() + timedelta(hours=24),
+        metadata={"hook_event_name": "TaskCompleted", "body_generated": True},
+    ))
+    idle, _ = storage.create_notification(NotificationCreate(
+        source="claude", session_id="s-idle", title="claude idle",
+        body="Session event received.", level=NotificationLevel.important,
+        expires_at=utc_now() + timedelta(hours=24),
+        metadata={"hook_event_name": "Notification", "notification_type": "idle_prompt", "body_generated": True},
+    ))
+    # failure 类 hook 通知:有价值,两个迁移都不应动它
+    fail, _ = storage.create_notification(NotificationCreate(
+        source="claude", session_id="s-fail", title="claude needs attention",
+        body="boom", level=NotificationLevel.important,
+        expires_at=utc_now() + timedelta(hours=24),
+        metadata={"hook_event_name": "StopFailure", "hook_status": "failed", "body_generated": False},
+    ))
+    # 非 hook 来源的用户通知:不受 hook 噪声迁移影响
+    user_notif, _ = storage.create_notification(NotificationCreate(
+        source="session", session_id="s-user", title="Standup",
+        body="meeting", level=NotificationLevel.important,
+        expires_at=utc_now() + timedelta(hours=24),
+        metadata={},
+    ))
+    storage.close()
+
+    client = TestClient(create_app(db_path))
+    with client:
+        token = bind(client)
+        active_ids = {item["id"] for item in client.get("/api/v1/notifications", headers=auth(token)).json()}
+
+    # 噪声类被清理;有价值通知(failure/用户通知)保留
+    assert posttooluse.id not in active_ids
+    assert completed.id not in active_ids
+    assert idle.id not in active_ids
+    assert fail.id in active_ids
+    assert user_notif.id in active_ids
+
+    storage = Storage(db_path)
+    acked_ids = {n.id for n in storage.list_notifications([NotificationStatus.acknowledged])}
+    assert {posttooluse.id, completed.id, idle.id} <= acked_ids
+    cleanup_events = [
+        e for e in storage.events_after(None)
+        if e.event_type == EventType.notification_acknowledged
+        and e.notification_id in {posttooluse.id, completed.id, idle.id}
+        and e.reason == "migration_cleanup"
+    ]
+    assert len(cleanup_events) == 3
     storage.close()
 
 

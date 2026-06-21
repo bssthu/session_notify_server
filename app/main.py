@@ -5,7 +5,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 
@@ -37,6 +37,7 @@ from .schemas import (
     new_id,
     utc_now,
 )
+from .hook_policy import is_noise_hook_event
 from .storage import Storage
 
 configure_server_logging()
@@ -113,6 +114,44 @@ def _resolve_hook_notification(source: str, payload: HookPayload) -> tuple[Notif
     return NotificationLevel.info, f"{source} update"
 
 
+def _hook_payload_raw(payload: HookPayload) -> dict[str, Any]:
+    extra = payload.model_extra or {}
+    raw = extra.get("raw")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _should_suppress_hook_notification(
+    source: str,
+    payload: HookPayload,
+    body_generated: bool,
+    title: str,
+) -> bool:
+    """信号/噪声类 hook 不创建可见通知。判定委托 hook_policy.is_noise_hook_event(与 PC
+    客户端 shouldSuppressClientNotification、storage 历史清理迁移共享同一策略)。
+
+    PostToolUse(idle/paused/无内容 completed)是传输信号或无行动价值的噪声;needs-confirmation
+    / failure / 有内容的通知保留。仅在 hook 来源生效,不影响直接 POST /api/v1/notifications。
+    """
+    source_lower = (source or "").lower()
+    is_hook_source = (
+        source_lower in ("claude", "codex")
+        or bool(payload.hook_event_name)
+        or bool(payload.event_type)
+        or bool(payload.hook_status)
+        or bool(payload.notification_type)
+    )
+    if not is_hook_source:
+        return False
+    return is_noise_hook_event(
+        event_name=(payload.hook_event_name or payload.event_type or "").lower(),
+        notification_type=(payload.notification_type or "").lower(),
+        hook_status=(payload.hook_status or "").lower(),
+        title=(title or "").lower(),
+        body_generated=body_generated,
+        raw=_hook_payload_raw(payload),
+    )
+
+
 def create_app(db_path: str | Path | None = None) -> FastAPI:
     storage = Storage(
         db_path or os.getenv("SESSION_NOTIFY_DB", "runtime/session_notify.db"),
@@ -134,6 +173,10 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         # 残留(幂等,只动 active):它们永不会被 PostToolUse resolve,会一直 active 到 TTL,期间
         # 客户端重启 reload 会重显。置 acknowledged 后不再重显。
         for event in storage.acknowledge_legacy_permission_requests():
+            await hub.broadcast(event, storage.should_deliver_event_to_device)
+        # 一次性清空"创建层类型过滤"上线前的噪声历史堆积(主要是 PostToolUse),让客户端
+        # reload/轮询立即干净,不必等 24h TTL。幂等:只动 active。
+        for event in storage.acknowledge_legacy_noise_notifications():
             await hub.broadcast(event, storage.should_deliver_event_to_device)
         for event in storage.expire_due_notifications():
             await hub.broadcast(event, storage.should_deliver_event_to_device)
@@ -292,30 +335,36 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         await hub.broadcast(event, storage.should_deliver_event_to_device)
         return notification
 
-    @app.post("/api/v1/hooks/{source}", response_model=NotificationPublic)
+    @app.post("/api/v1/hooks/{source}", response_model=Optional[NotificationPublic])
     async def receive_hook(
         source: str,
         payload: HookPayload,
         device: DevicePublic = Depends(current_device),
-    ) -> NotificationPublic:
+    ) -> Optional[NotificationPublic]:
         level, title = _resolve_hook_notification(source, payload)
         body, body_generated = _resolve_hook_body(payload)
         hook_meta = _hook_metadata(payload, body_generated)
-        # approval 类(needs confirmation)即时性强,用短 TTL;其它 hook 通知维持默认 24h。
-        permission_ttl = HOOK_PERMISSION_TTL if "needs confirmation" in title else HOOK_NOTIFICATION_TTL
-        request = NotificationCreate(
-            source=source,
-            session_id=payload.session_id or "local",
-            title=title,
-            body=body,
-            level=level,
-            expires_at=utc_now() + permission_ttl,
-            metadata=hook_meta,
-        )
-        notification, event = storage.create_notification(request, origin_device=device)
-        await hub.broadcast(event, storage.should_deliver_event_to_device)
+        # 信号/噪声类 hook(PostToolUse/idle/paused/无内容 completed)不创建可见通知,从源头
+        # 避免 active 堆积。resolve/ack 副作用与 suppress 无关,照常执行。
+        suppress = _should_suppress_hook_notification(source, payload, body_generated, title)
+        notification: Optional[NotificationPublic] = None
+        if not suppress:
+            # approval 类(needs confirmation)即时性强,用短 TTL;其它 hook 通知维持默认 24h。
+            permission_ttl = HOOK_PERMISSION_TTL if "needs confirmation" in title else HOOK_NOTIFICATION_TTL
+            request = NotificationCreate(
+                source=source,
+                session_id=payload.session_id or "local",
+                title=title,
+                body=body,
+                level=level,
+                expires_at=utc_now() + permission_ttl,
+                metadata=hook_meta,
+            )
+            notification, event = storage.create_notification(request, origin_device=device)
+            await hub.broadcast(event, storage.should_deliver_event_to_device)
         # 工具执行完成(PostToolUse)意味着对应的权限请求已被批准:按配对键自动 resolve
         # 匹配的活跃 permission request,避免它永远 active、被客户端重启时 reload 重显。
+        # 注意:PostToolUse 本身被 suppress(不创建通知),但此 resolve 副作用必须保留。
         if (payload.hook_event_name or "").lower() == "posttooluse":
             resolved = storage.resolve_pending_permission(
                 source=source,
