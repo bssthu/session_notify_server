@@ -406,19 +406,26 @@ class Storage:
             )
         return code, expires_at
 
-    def consume_pair_code(self, code: str, name: str, platform: DevicePlatform) -> DeviceBindResponse | None:
-        """消费配对码 → 复用 bind_device 绑定新设备。无效/过期/已用返回 None(一次性)。"""
+    def consume_pair_code(
+        self, code: str, name: str, platform: DevicePlatform
+    ) -> tuple[DeviceBindResponse, dict] | None:
+        """消费配对码 → 复用 bind_device 绑定新设备。无效/过期/已用返回 None(一次性)。
+
+        成功时额外返回配对码元信息(供调用方构造 pair.consumed 推送事件):
+        {code_hash, issued_by_device_id, consumed_device_name}。
+        """
         code_hash = sha256_text(code)
         now = utc_now()
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT code_hash, expires_at, consumed_at FROM pair_codes WHERE code_hash = ?",
+                "SELECT code_hash, expires_at, consumed_at, issued_by_device_id FROM pair_codes WHERE code_hash = ?",
                 (code_hash,),
             ).fetchone()
             if row is None or row["consumed_at"] is not None:
                 return None
             if (_parse_dt(row["expires_at"]) or now) <= now:
                 return None
+            issued_by_device_id = row["issued_by_device_id"]
             # 先标记消费防并发重复使用,再在锁外执行 bind_device(它自带锁)。
             self._conn.execute(
                 "UPDATE pair_codes SET consumed_at = ? WHERE code_hash = ?",
@@ -430,7 +437,39 @@ class Storage:
                 "UPDATE pair_codes SET consumed_device_id = ? WHERE code_hash = ?",
                 (response.device.id, code_hash),
             )
-        return response
+        meta = {
+            "code_hash": code_hash,
+            "issued_by_device_id": issued_by_device_id,
+            "consumed_device_name": response.device.name,
+        }
+        return response, meta
+
+    def pair_code_status(self, code: str) -> dict | None:
+        """按明文码查询配对状态(只读,不消费)。查不到返回 None;
+        否则返回 {consumed, expired, consumed_device_name}。
+        """
+        code_hash = sha256_text(code)
+        now = utc_now()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT expires_at, consumed_at, consumed_device_id FROM pair_codes WHERE code_hash = ?",
+                (code_hash,),
+            ).fetchone()
+            if row is None:
+                return None
+            expired = (_parse_dt(row["expires_at"]) or now) <= now
+            consumed = row["consumed_at"] is not None
+            consumed_device_name = None
+            if consumed and row["consumed_device_id"]:
+                device = self._conn.execute(
+                    "SELECT name FROM devices WHERE id = ?", (row["consumed_device_id"],)
+                ).fetchone()
+                consumed_device_name = device["name"] if device else None
+        return {
+            "consumed": consumed,
+            "expired": expired,
+            "consumed_device_name": consumed_device_name,
+        }
 
     def device_notifications_enabled(self, device_id: str) -> bool:
         with self._lock:

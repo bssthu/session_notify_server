@@ -793,6 +793,68 @@ def test_pair_code_expiry_rejects(tmp_path):
     assert expired.status_code == 401
 
 
+def test_pair_status_reports_consumed(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    host = bind_tokens(client, name="Host", platform="windows")
+    code = client.post("/api/v1/devices/pair/issue", headers=auth(host["access_token"])).json()["code"]
+
+    pending = client.post("/api/v1/devices/pair/status", headers=auth(host["access_token"]), json={"code": code})
+    assert pending.status_code == 200, pending.text
+    assert pending.json()["consumed"] is False
+    assert pending.json()["expired"] is False
+
+    client.post("/api/v1/devices/pair/consume", json={"code": code, "name": "Pixel", "platform": "android"})
+    consumed = client.post("/api/v1/devices/pair/status", headers=auth(host["access_token"]), json={"code": code})
+    assert consumed.json()["consumed"] is True
+    assert consumed.json()["consumed_device_name"] == "Pixel"
+
+
+def test_pair_status_requires_bearer(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    assert client.post("/api/v1/devices/pair/status", json={"code": "ABCD-EFGH"}).status_code == 401
+
+
+def test_pair_status_unknown_code_404(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    host = bind_tokens(client)
+    resp = client.post("/api/v1/devices/pair/status", headers=auth(host["access_token"]), json={"code": "NOPE-NOPE"})
+    assert resp.status_code == 404
+
+
+def test_pair_status_expired_not_consumed(tmp_path):
+    from app.storage import _dt
+
+    client = TestClient(create_app(tmp_path / "server.db"))
+    host = bind_tokens(client)
+    code = client.post("/api/v1/devices/pair/issue", headers=auth(host["access_token"])).json()["code"]
+    storage = client.app.state.storage
+    with storage._lock, storage._conn:
+        storage._conn.execute("UPDATE pair_codes SET expires_at = ?", (_dt(utc_now() - timedelta(seconds=1)),))
+    resp = client.post("/api/v1/devices/pair/status", headers=auth(host["access_token"]), json={"code": code})
+    assert resp.status_code == 200
+    assert resp.json()["consumed"] is False
+    assert resp.json()["expired"] is True
+
+
+def test_pair_consume_broadcasts_to_issuer(tmp_path):
+    import hashlib
+
+    client = TestClient(create_app(tmp_path / "server.db"))
+    host = bind_tokens(client, name="Host", platform="windows")
+    with client.websocket_connect("/api/v1/ws?token=" + host["access_token"]) as ws:
+        code = client.post("/api/v1/devices/pair/issue", headers=auth(host["access_token"])).json()["code"]
+        consumed = client.post(
+            "/api/v1/devices/pair/consume",
+            json={"code": code, "name": "Pixel", "platform": "android"},
+        )
+        assert consumed.status_code == 200, consumed.text
+        event = ws.receive_json()
+        assert event["event_type"] == "pair.consumed"
+        assert event["pair_code_hash"] == hashlib.sha256(code.encode("utf-8")).hexdigest()
+        assert event["pair_consumed_device_name"] == "Pixel"
+        assert event["notification"] is None
+
+
 def test_strict_mode_first_device_binds_then_bare_bind_blocked(tmp_path, monkeypatch):
     # conftest 默认 easy;此处显式切 strict 验证 bootstrap 门禁
     monkeypatch.setenv("SESSION_NOTIFY_PAIR_MODE", "strict")

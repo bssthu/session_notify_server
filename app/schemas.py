@@ -42,6 +42,8 @@ class EventType(StrEnum):
     notification_created = "notification.created"
     notification_acknowledged = "notification.acknowledged"
     notification_expired = "notification.expired"
+    # 配对码被消费(扫码绑定成功):瞬态控制事件,只推给签发方设备,不落 events 表。
+    pair_consumed = "pair.consumed"
 
 
 class DeviceBindRequest(BaseModel):
@@ -98,6 +100,16 @@ class PairConsumeRequest(BaseModel):
     code: str = Field(min_length=1, max_length=40)
     name: str = Field(min_length=1, max_length=80)
     platform: DevicePlatform
+
+
+class PairStatusRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=40)
+
+
+class PairStatusResponse(BaseModel):
+    consumed: bool
+    expired: bool
+    consumed_device_name: str | None = None
 
 
 class NotificationCreate(BaseModel):
@@ -157,6 +169,9 @@ class SyncEvent(BaseModel):
     ack_by_device_id: str | None = None
     ack_at: datetime | None = None
     reason: str | None = None
+    # pair.consumed 事件专用:被消费配对码的哈希(供签发端比对当前面板码)+ 新绑设备名。
+    pair_code_hash: str | None = None
+    pair_consumed_device_name: str | None = None
 
 
 class EventsResponse(BaseModel):

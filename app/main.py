@@ -21,6 +21,7 @@ from .schemas import (
     DeviceBindResponse,
     DevicePublic,
     DeviceUpdateRequest,
+    EventType,
     EventsResponse,
     HookPayload,
     NotificationCreate,
@@ -29,7 +30,11 @@ from .schemas import (
     NotificationStatus,
     PairConsumeRequest,
     PairIssueResponse,
+    PairStatusRequest,
+    PairStatusResponse,
+    SyncEvent,
     TokenRefreshRequest,
+    new_id,
     utc_now,
 )
 from .storage import Storage
@@ -213,14 +218,37 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         )
 
     @app.post("/api/v1/devices/pair/consume", response_model=DeviceBindResponse)
-    def consume_pair_code(request: PairConsumeRequest) -> DeviceBindResponse:
-        response = storage.consume_pair_code(request.code, request.name, request.platform)
-        if response is None:
+    async def consume_pair_code(request: PairConsumeRequest) -> DeviceBindResponse:
+        result = storage.consume_pair_code(request.code, request.name, request.platform)
+        if result is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid, expired, or already-used pairing code",
             )
+        response, meta = result
+        # 推送 pair.consumed 给签发方设备:隔离 Android(在线不推给它,且此事件不落 events 表,
+        # catch-up 也拿不到),让签发端面板即时隐藏二维码。WS 断线时由签发端轮询 /pair/status 兜底。
+        event = SyncEvent(
+            event_id=new_id(),
+            event_type=EventType.pair_consumed,
+            created_at=utc_now(),
+            pair_code_hash=meta["code_hash"],
+            pair_consumed_device_name=meta["consumed_device_name"],
+        )
+        issued_by_device_id = meta["issued_by_device_id"]
+        await hub.broadcast(event, lambda _event, device_id: device_id == issued_by_device_id)
         return response
+
+    @app.post("/api/v1/devices/pair/status", response_model=PairStatusResponse)
+    def pair_status(
+        request: PairStatusRequest,
+        device: DevicePublic = Depends(current_device),
+    ) -> PairStatusResponse:
+        # 供签发端面板轮询配对码是否已被消费(WS 断线兜底);要求已绑设备鉴权,与 issue 同源。
+        status_info = storage.pair_code_status(request.code)
+        if status_info is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pairing code not found")
+        return PairStatusResponse(**status_info)
 
     @app.get("/api/v1/devices", response_model=list[DevicePublic])
     def list_devices(
