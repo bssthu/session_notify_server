@@ -15,11 +15,17 @@
       "use_colors": null
     }
   },
+  "filters": {
+    "protocol_hints": {
+      "()": "app.logging_setup.UvicornProtocolHintFilter"
+    }
+  },
   "handlers": {
     "default": {
       "formatter": "default",
       "class": "logging.StreamHandler",
-      "stream": "ext://sys.stderr"
+      "stream": "ext://sys.stderr",
+      "filters": ["protocol_hints"]
     },
     "access": {
       "formatter": "access",
