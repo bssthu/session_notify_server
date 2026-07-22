@@ -101,6 +101,88 @@ def test_remote_clients_see_notification_origin_device(tmp_path):
     assert notification["origin_device_platform"] == "windows"
 
 
+def test_windows_presence_summary_and_android_realtime_invalidation(tmp_path):
+    app = create_app(tmp_path / "server.db")
+    client = TestClient(app)
+    desktop = bind_tokens(client, name="Desktop", platform="windows")
+    phone = bind_tokens(client, name="Pixel", platform="android")
+
+    initial = client.get(
+        "/api/v1/devices/presence",
+        headers=auth(phone["access_token"]),
+    )
+    assert initial.status_code == 200, initial.text
+    assert initial.json()["any_unlocked_windows"] is False
+    assert initial.json()["registered_windows"] == 1
+    assert initial.json()["fresh_windows"] == 0
+    assert initial.json()["windows_devices"][0]["effective_session_state"] == "unknown"
+
+    with client.websocket_connect(f"/api/v1/ws?token={phone['access_token']}") as websocket:
+        unlocked = client.post(
+            "/api/v1/devices/me/presence",
+            headers=auth(desktop["access_token"]),
+            json={"session_state": "unlocked"},
+        )
+        assert unlocked.status_code == 200, unlocked.text
+        assert unlocked.json()["any_unlocked_windows"] is True
+        assert unlocked.json()["fresh_windows"] == 1
+        event = websocket.receive_json()
+        assert event["event_type"] == "device.presence_changed"
+        assert event["device_id"] == desktop["device"]["id"]
+        assert event["device_session_state"] == "unlocked"
+        assert event["any_unlocked_windows"] is True
+
+        locked = client.post(
+            "/api/v1/devices/me/presence",
+            headers=auth(desktop["access_token"]),
+            json={"session_state": "locked"},
+        )
+        assert locked.status_code == 200, locked.text
+        assert locked.json()["any_unlocked_windows"] is False
+        event = websocket.receive_json()
+        assert event["event_type"] == "device.presence_changed"
+        assert event["device_session_state"] == "locked"
+
+
+def test_presence_expires_and_android_cannot_report_windows_state(tmp_path):
+    app = create_app(tmp_path / "server.db")
+    client = TestClient(app)
+    desktop = bind_tokens(client, name="Desktop", platform="windows")
+    phone = bind_tokens(client, name="Pixel", platform="android")
+
+    reported = client.post(
+        "/api/v1/devices/me/presence",
+        headers=auth(desktop["access_token"]),
+        json={"session_state": "unlocked"},
+    )
+    assert reported.status_code == 200, reported.text
+
+    stale_at = (utc_now() - timedelta(minutes=5)).isoformat()
+    storage = app.state.storage
+    with storage._lock, storage._conn:
+        storage._conn.execute(
+            "UPDATE devices SET session_state_updated_at = ? WHERE id = ?",
+            (stale_at, desktop["device"]["id"]),
+        )
+
+    summary = client.get(
+        "/api/v1/devices/presence",
+        headers=auth(phone["access_token"]),
+    )
+    assert summary.status_code == 200, summary.text
+    assert summary.json()["any_unlocked_windows"] is False
+    assert summary.json()["fresh_windows"] == 0
+    assert summary.json()["windows_devices"][0]["reported_session_state"] == "unlocked"
+    assert summary.json()["windows_devices"][0]["effective_session_state"] == "unknown"
+
+    rejected = client.post(
+        "/api/v1/devices/me/presence",
+        headers=auth(phone["access_token"]),
+        json={"session_state": "unlocked"},
+    )
+    assert rejected.status_code == 422
+
+
 def test_event_pull_and_websocket_push(tmp_path):
     app = create_app(tmp_path / "server.db")
     client = TestClient(app)
@@ -1014,6 +1096,12 @@ def test_strict_mode_rebind_with_old_refresh_token(tmp_path, monkeypatch):
     assert first.status_code == 200, first.text
     old_refresh = first.json()["refresh_token"]
     device_id = first.json()["device"]["id"]
+    presence = client.post(
+        "/api/v1/devices/me/presence",
+        headers=auth(first.json()["access_token"]),
+        json={"session_state": "unlocked"},
+    )
+    assert presence.status_code == 200, presence.text
 
     # 裸 bind(无 refresh)被拒
     assert client.post("/api/v1/devices/bind", json={"name": "Sneak", "platform": "windows"}).status_code == 401
@@ -1024,6 +1112,7 @@ def test_strict_mode_rebind_with_old_refresh_token(tmp_path, monkeypatch):
     })
     assert rebound.status_code == 200, rebound.text
     assert rebound.json()["device"]["id"] == device_id
+    assert rebound.json()["device"]["session_state"] == "unknown"
     assert rebound.json()["refresh_token"] != old_refresh
 
     # 旧 refresh 已轮换失效

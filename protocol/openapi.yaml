@@ -81,6 +81,32 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Device"
+  /api/v1/devices/presence:
+    get:
+      responses:
+        "200":
+          description: Effective Windows session presence after stale reports are downgraded to unknown.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DevicePresenceSummary"
+  /api/v1/devices/me/presence:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DevicePresenceUpdateRequest"
+      responses:
+        "200":
+          description: Updated effective Windows presence summary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DevicePresenceSummary"
+        "422":
+          description: Only a bound Windows device can report desktop session state.
   /api/v1/devices/{device_id}:
     patch:
       parameters:
@@ -279,6 +305,52 @@ components:
           maxLength: 80
         notifications_enabled:
           type: boolean
+    DevicePresenceUpdateRequest:
+      type: object
+      required: [session_state]
+      properties:
+        session_state:
+          type: string
+          enum: [unknown, locked, unlocked]
+    WindowsDevicePresence:
+      type: object
+      required: [device_id, device_name, reported_session_state, effective_session_state]
+      properties:
+        device_id:
+          type: string
+        device_name:
+          type: string
+        reported_session_state:
+          type: string
+          enum: [unknown, locked, unlocked]
+        effective_session_state:
+          type: string
+          enum: [unknown, locked, unlocked]
+        session_state_updated_at:
+          type: [string, "null"]
+          format: date-time
+    DevicePresenceSummary:
+      type: object
+      required: [any_unlocked_windows, registered_windows, fresh_windows, evaluated_at, stale_after_seconds, windows_devices]
+      properties:
+        any_unlocked_windows:
+          type: boolean
+        registered_windows:
+          type: integer
+          minimum: 0
+        fresh_windows:
+          type: integer
+          minimum: 0
+        evaluated_at:
+          type: string
+          format: date-time
+        stale_after_seconds:
+          type: integer
+          minimum: 1
+        windows_devices:
+          type: array
+          items:
+            $ref: "#/components/schemas/WindowsDevicePresence"
     TokenRefreshRequest:
       type: object
       required: [refresh_token]
@@ -324,7 +396,7 @@ components:
           enum: [windows, android]
     Device:
       type: object
-      required: [id, name, platform, created_at, notifications_enabled]
+      required: [id, name, platform, created_at, notifications_enabled, session_state]
       properties:
         id:
           type: string
@@ -344,6 +416,12 @@ components:
           format: date-time
         notifications_enabled:
           type: boolean
+        session_state:
+          type: string
+          enum: [unknown, locked, unlocked]
+        session_state_updated_at:
+          type: [string, "null"]
+          format: date-time
     NotificationLevel:
       type: string
       enum: [info, success, important, critical]

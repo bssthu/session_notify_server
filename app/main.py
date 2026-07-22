@@ -19,6 +19,8 @@ from .schemas import (
     AccessTokenResponse,
     DeviceBindRequest,
     DeviceBindResponse,
+    DevicePresenceSummary,
+    DevicePresenceUpdateRequest,
     DevicePublic,
     DeviceUpdateRequest,
     EventType,
@@ -58,6 +60,7 @@ ACCESS_TOKEN_TTL = timedelta(seconds=int(os.getenv("SESSION_NOTIFY_ACCESS_TTL_SE
 REFRESH_TOKEN_TTL = timedelta(days=int(os.getenv("SESSION_NOTIFY_REFRESH_TTL_DAYS", "90")))
 # 配对码有效期:已绑设备签发,新设备扫码/输码消费。一次性,默认 5 分钟。
 PAIR_CODE_TTL = timedelta(seconds=int(os.getenv("SESSION_NOTIFY_PAIR_CODE_TTL_SECONDS", "300")))
+DEVICE_PRESENCE_TTL = timedelta(seconds=int(os.getenv("SESSION_NOTIFY_DEVICE_PRESENCE_TTL_SECONDS", "90")))
 _EXPIRE_POLL_INTERVAL_SECONDS = int(os.getenv("SESSION_NOTIFY_EXPIRE_POLL_SECONDS", "60"))
 
 
@@ -298,6 +301,43 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         device: DevicePublic = Depends(current_device),
     ) -> list[DevicePublic]:
         return storage.list_devices()
+
+    @app.get("/api/v1/devices/presence", response_model=DevicePresenceSummary)
+    def get_device_presence(
+        device: DevicePublic = Depends(current_device),
+    ) -> DevicePresenceSummary:
+        return storage.device_presence_summary(DEVICE_PRESENCE_TTL)
+
+    @app.post("/api/v1/devices/me/presence", response_model=DevicePresenceSummary)
+    async def update_current_device_presence(
+        request: DevicePresenceUpdateRequest,
+        device: DevicePublic = Depends(current_device),
+    ) -> DevicePresenceSummary:
+        try:
+            updated, effective_changed = storage.update_device_session_state(
+                device.id,
+                request.session_state,
+                stale_after=DEVICE_PRESENCE_TTL,
+            )
+        except KeyError:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found") from None
+        except ValueError as error:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error)) from None
+
+        summary = storage.device_presence_summary(DEVICE_PRESENCE_TTL)
+        if effective_changed:
+            event = SyncEvent(
+                event_id=new_id(),
+                event_type=EventType.device_presence_changed,
+                created_at=utc_now(),
+                device_id=updated.id,
+                device_platform=updated.platform,
+                device_session_state=updated.session_state,
+                device_session_state_updated_at=updated.session_state_updated_at,
+                any_unlocked_windows=summary.any_unlocked_windows,
+            )
+            await hub.broadcast(event, lambda _event, device_id: storage.is_android_device(device_id))
+        return summary
 
     @app.patch("/api/v1/devices/{device_id}", response_model=DevicePublic)
     def update_device(

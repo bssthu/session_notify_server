@@ -24,6 +24,12 @@ class DevicePlatform(StrEnum):
     android = "android"
 
 
+class DeviceSessionState(StrEnum):
+    unknown = "unknown"
+    locked = "locked"
+    unlocked = "unlocked"
+
+
 class NotificationLevel(StrEnum):
     info = "info"
     success = "success"
@@ -44,6 +50,7 @@ class EventType(StrEnum):
     notification_expired = "notification.expired"
     # 配对码被消费(扫码绑定成功):瞬态控制事件,只推给签发方设备,不落 events 表。
     pair_consumed = "pair.consumed"
+    device_presence_changed = "device.presence_changed"
 
 
 class DeviceBindRequest(BaseModel):
@@ -61,11 +68,34 @@ class DevicePublic(BaseModel):
     last_seen_at: datetime | None = None
     revoked_at: datetime | None = None
     notifications_enabled: bool = True
+    session_state: DeviceSessionState = DeviceSessionState.unknown
+    session_state_updated_at: datetime | None = None
 
 
 class DeviceUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=80)
     notifications_enabled: bool | None = None
+
+
+class DevicePresenceUpdateRequest(BaseModel):
+    session_state: DeviceSessionState
+
+
+class WindowsDevicePresence(BaseModel):
+    device_id: str
+    device_name: str
+    reported_session_state: DeviceSessionState
+    effective_session_state: DeviceSessionState
+    session_state_updated_at: datetime | None = None
+
+
+class DevicePresenceSummary(BaseModel):
+    any_unlocked_windows: bool
+    registered_windows: int
+    fresh_windows: int
+    evaluated_at: datetime
+    stale_after_seconds: int
+    windows_devices: list[WindowsDevicePresence] = Field(default_factory=list)
 
 
 class DeviceBindResponse(BaseModel):
@@ -172,6 +202,11 @@ class SyncEvent(BaseModel):
     # pair.consumed 事件专用:被消费配对码的哈希(供签发端比对当前面板码)+ 新绑设备名。
     pair_code_hash: str | None = None
     pair_consumed_device_name: str | None = None
+    device_id: str | None = None
+    device_platform: DevicePlatform | None = None
+    device_session_state: DeviceSessionState | None = None
+    device_session_state_updated_at: datetime | None = None
+    any_unlocked_windows: bool | None = None
 
 
 class EventsResponse(BaseModel):

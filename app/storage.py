@@ -14,7 +14,9 @@ from .schemas import (
     AccessTokenResponse,
     DeviceBindResponse,
     DevicePlatform,
+    DevicePresenceSummary,
     DevicePublic,
+    DeviceSessionState,
     EventType,
     NotificationCreate,
     NotificationLevel,
@@ -22,6 +24,7 @@ from .schemas import (
     NotificationStatus,
     SCHEMA_VERSION,
     SyncEvent,
+    WindowsDevicePresence,
     new_id,
     utc_now,
 )
@@ -121,6 +124,8 @@ class Storage:
                     last_seen_at TEXT,
                     revoked_at TEXT,
                     notifications_enabled INTEGER NOT NULL DEFAULT 1,
+                    session_state TEXT NOT NULL DEFAULT 'unknown',
+                    session_state_updated_at TEXT,
                     access_expires_at TEXT,
                     refresh_expires_at TEXT
                 );
@@ -179,6 +184,8 @@ class Storage:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(devices)").fetchall()}
         additions = {
             "notifications_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "session_state": "TEXT NOT NULL DEFAULT 'unknown'",
+            "session_state_updated_at": "TEXT",
             "access_expires_at": "TEXT",
             "refresh_expires_at": "TEXT",
         }
@@ -267,7 +274,8 @@ class Storage:
                 """
                 UPDATE devices
                 SET name = ?, platform = ?, refresh_token_hash = ?, access_token_hash = ?,
-                    access_expires_at = ?, refresh_expires_at = ?, last_seen_at = ?
+                    access_expires_at = ?, refresh_expires_at = ?, last_seen_at = ?,
+                    session_state = 'unknown', session_state_updated_at = NULL
                 WHERE id = ?
                 """,
                 (name, platform.value, sha256_text(new_refresh), sha256_text(new_access),
@@ -301,7 +309,8 @@ class Storage:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled
+                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                       session_state, session_state_updated_at
                 FROM devices
                 WHERE revoked_at IS NULL
                 ORDER BY created_at ASC
@@ -331,7 +340,8 @@ class Storage:
         with self._lock, self._conn:
             row = self._conn.execute(
                 """
-                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled
+                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                       session_state, session_state_updated_at
                 FROM devices
                 WHERE id = ? AND revoked_at IS NULL
                 """,
@@ -346,7 +356,8 @@ class Storage:
                 )
                 row = self._conn.execute(
                     """
-                    SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled
+                    SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                           session_state, session_state_updated_at
                     FROM devices
                     WHERE id = ?
                     """,
@@ -359,7 +370,8 @@ class Storage:
         with self._lock, self._conn:
             row = self._conn.execute(
                 """
-                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled
+                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                       session_state, session_state_updated_at
                 FROM devices
                 WHERE id = ?
                 """,
@@ -373,7 +385,8 @@ class Storage:
             )
             row = self._conn.execute(
                 """
-                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled
+                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                       session_state, session_state_updated_at
                 FROM devices
                 WHERE id = ?
                 """,
@@ -388,6 +401,114 @@ class Storage:
                 "SELECT 1 FROM devices WHERE revoked_at IS NULL LIMIT 1"
             ).fetchone()
         return row is not None
+
+    def update_device_session_state(
+        self,
+        device_id: str,
+        session_state: DeviceSessionState,
+        *,
+        stale_after: timedelta,
+    ) -> tuple[DevicePublic, bool]:
+        """Store a Windows heartbeat and indicate whether effective presence changed."""
+        now = utc_now()
+        stale_before = now - stale_after
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                """
+                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                       session_state, session_state_updated_at
+                FROM devices
+                WHERE id = ? AND revoked_at IS NULL
+                """,
+                (device_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(device_id)
+            if DevicePlatform(row["platform"]) is not DevicePlatform.windows:
+                raise ValueError("Only Windows devices can report a desktop session state")
+
+            previous_updated_at = _parse_dt(row["session_state_updated_at"])
+            previous_state = DeviceSessionState(row["session_state"] or DeviceSessionState.unknown.value)
+            previous_effective = (
+                previous_state
+                if previous_updated_at is not None and previous_updated_at >= stale_before
+                else DeviceSessionState.unknown
+            )
+            self._conn.execute(
+                """
+                UPDATE devices
+                SET session_state = ?, session_state_updated_at = ?
+                WHERE id = ?
+                """,
+                (session_state.value, _dt(now), device_id),
+            )
+            row = self._conn.execute(
+                """
+                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                       session_state, session_state_updated_at
+                FROM devices
+                WHERE id = ?
+                """,
+                (device_id,),
+            ).fetchone()
+        return self._device_from_row(row), previous_effective is not session_state
+
+    def device_presence_summary(
+        self,
+        stale_after: timedelta,
+        *,
+        now: datetime | None = None,
+    ) -> DevicePresenceSummary:
+        evaluated_at = now or utc_now()
+        stale_before = evaluated_at - stale_after
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, name, session_state, session_state_updated_at
+                FROM devices
+                WHERE platform = ? AND revoked_at IS NULL
+                ORDER BY created_at ASC
+                """,
+                (DevicePlatform.windows.value,),
+            ).fetchall()
+
+        windows_devices: list[WindowsDevicePresence] = []
+        fresh_windows = 0
+        any_unlocked = False
+        for row in rows:
+            reported = DeviceSessionState(row["session_state"] or DeviceSessionState.unknown.value)
+            updated_at = _parse_dt(row["session_state_updated_at"])
+            fresh = updated_at is not None and updated_at >= stale_before
+            effective = reported if fresh else DeviceSessionState.unknown
+            if fresh:
+                fresh_windows += 1
+            if effective is DeviceSessionState.unlocked:
+                any_unlocked = True
+            windows_devices.append(
+                WindowsDevicePresence(
+                    device_id=row["id"],
+                    device_name=row["name"],
+                    reported_session_state=reported,
+                    effective_session_state=effective,
+                    session_state_updated_at=updated_at,
+                )
+            )
+        return DevicePresenceSummary(
+            any_unlocked_windows=any_unlocked,
+            registered_windows=len(windows_devices),
+            fresh_windows=fresh_windows,
+            evaluated_at=evaluated_at,
+            stale_after_seconds=max(1, int(stale_after.total_seconds())),
+            windows_devices=windows_devices,
+        )
+
+    def is_android_device(self, device_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT platform FROM devices WHERE id = ? AND revoked_at IS NULL",
+                (device_id,),
+            ).fetchone()
+        return bool(row and row["platform"] == DevicePlatform.android.value)
 
     def issue_pair_code(self, device: DevicePublic) -> tuple[str, datetime]:
         """已绑设备签发一个一次性配对码(默认 5 分钟有效)。明文码不落库,只存哈希。"""
@@ -500,7 +621,8 @@ class Storage:
         with self._lock, self._conn:
             row = self._conn.execute(
                 """
-                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled
+                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                       session_state, session_state_updated_at
                 FROM devices
                 WHERE access_token_hash = ? AND revoked_at IS NULL
                   AND (access_expires_at IS NULL OR access_expires_at > ?)
@@ -523,7 +645,8 @@ class Storage:
         with self._lock, self._conn:
             row = self._conn.execute(
                 """
-                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled
+                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                       session_state, session_state_updated_at
                 FROM devices
                 WHERE refresh_token_hash = ? AND revoked_at IS NULL
                   AND (refresh_expires_at IS NULL OR refresh_expires_at > ?)
@@ -1046,4 +1169,6 @@ class Storage:
             last_seen_at=last_seen_at or _parse_dt(row["last_seen_at"]),
             revoked_at=_parse_dt(row["revoked_at"]),
             notifications_enabled=bool(row["notifications_enabled"]),
+            session_state=DeviceSessionState(row["session_state"] or DeviceSessionState.unknown.value),
+            session_state_updated_at=_parse_dt(row["session_state_updated_at"]),
         )

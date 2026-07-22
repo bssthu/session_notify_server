@@ -17,7 +17,9 @@
       "enum": [
         "notification.created",
         "notification.acknowledged",
-        "notification.expired"
+        "notification.expired",
+        "pair.consumed",
+        "device.presence_changed"
       ]
     },
     "created_at": {
@@ -88,6 +90,30 @@
     },
     "reason": {
       "type": ["string", "null"]
+    },
+    "pair_code_hash": {
+      "type": ["string", "null"]
+    },
+    "pair_consumed_device_name": {
+      "type": ["string", "null"]
+    },
+    "device_id": {
+      "type": ["string", "null"]
+    },
+    "device_platform": {
+      "type": ["string", "null"],
+      "enum": ["windows", "android", null]
+    },
+    "device_session_state": {
+      "type": ["string", "null"],
+      "enum": ["unknown", "locked", "unlocked", null]
+    },
+    "device_session_state_updated_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "any_unlocked_windows": {
+      "type": ["boolean", "null"]
     }
   },
   "additionalProperties": false,
@@ -106,6 +132,14 @@
       },
       "then": {
         "required": ["notification_id", "ack_by_device_id", "ack_at", "reason"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "event_type": { "const": "device.presence_changed" } }
+      },
+      "then": {
+        "required": ["device_id", "device_platform", "device_session_state", "device_session_state_updated_at", "any_unlocked_windows"]
       }
     }
   ]
