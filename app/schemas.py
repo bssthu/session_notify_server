@@ -230,5 +230,6 @@ class HookPayload(BaseModel):
     cwd: str | None = None
     transcript_path: str | None = None
     tool_name: str | None = None
+    permission_mode: str | None = None
     tool_input: dict[str, Any] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)

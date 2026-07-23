@@ -633,6 +633,46 @@ def test_session_stop_acknowledges_pending_permission(tmp_path):
     assert any(e["notification_id"] == perm_id for e in finalize_events)
 
 
+def test_plan_mode_stop_keeps_implementation_confirmation(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+    session_id = "s-plan-ready"
+
+    old_permission = client.post(
+        "/api/v1/hooks/codex",
+        headers=auth(token),
+        json=_hook_payload("PermissionRequest", session_id, "read plan inputs"),
+    )
+    assert old_permission.status_code == 200, old_permission.text
+    old_permission_id = old_permission.json()["id"]
+
+    plan_ready = client.post(
+        "/api/v1/hooks/codex",
+        headers=auth(token),
+        json={
+            "hook_event_name": "Stop",
+            "event_type": "approval_requested",
+            "hook_status": "approval_requested",
+            "permission_mode": "plan",
+            "session_id": session_id,
+            "metadata": {"raw": {"permission_mode": "plan"}},
+        },
+    )
+    assert plan_ready.status_code == 200, plan_ready.text
+    assert plan_ready.json()["title"] == "codex needs confirmation"
+    assert plan_ready.json()["level"] == "critical"
+    assert plan_ready.json()["body"] == "Plan is ready. Choose whether to implement it."
+    assert plan_ready.json()["metadata"]["permission_mode"] == "plan"
+    assert plan_ready.json()["metadata"]["body_generated"] is False
+
+    active_ids = {
+        item["id"]
+        for item in client.get("/api/v1/notifications", headers=auth(token)).json()
+    }
+    assert old_permission_id not in active_ids
+    assert plan_ready.json()["id"] in active_ids
+
+
 def test_session_stop_acknowledges_notification_permission_prompt(tmp_path):
     # claude 权限请求的另一形态:Notification hook + notification_type=permission_prompt,
     # hook_event_name=Notification(非 permissionrequest)。清理按 title(needs confirmation)

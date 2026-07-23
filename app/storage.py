@@ -843,6 +843,7 @@ class Storage:
         session_id: str | None,
         device_id: str,
         reason: str,
+        exclude_notification_id: str | None = None,
     ) -> list[SyncEvent]:
         """会话级兜底清理:把同一 (source, session_id) 下所有 active 的 permission
         request 置为 acknowledged。不依赖 command 配对键,覆盖 PostToolUse 不会到达的
@@ -866,6 +867,8 @@ class Storage:
             ).fetchall()
             for row in rows:
                 notification = self._notification_from_row(row)
+                if notification.id == exclude_notification_id:
+                    continue
                 if notification.session_id != target_session:
                     continue
                 # approval 类(needs confirmation)都清理:claude 一次权限请求会产生

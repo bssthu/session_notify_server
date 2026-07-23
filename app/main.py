@@ -78,7 +78,11 @@ def _resolve_hook_body(payload: HookPayload) -> tuple[str, bool]:
         or payload.summary
         or payload.last_assistant_message
     )
-    return (body, False) if body else ("Session event received.", True)
+    if body:
+        return body, False
+    if _is_plan_mode_stop(payload):
+        return "Plan is ready. Choose whether to implement it.", False
+    return "Session event received.", True
 
 
 def _hook_metadata(payload: HookPayload, body_generated: bool) -> dict[str, object]:
@@ -91,6 +95,7 @@ def _hook_metadata(payload: HookPayload, body_generated: bool) -> dict[str, obje
         "cwd": payload.cwd,
         "transcript_path": payload.transcript_path,
         "tool_name": payload.tool_name,
+        "permission_mode": payload.permission_mode,
         **extra,
         **payload.metadata,
     }
@@ -120,7 +125,29 @@ def _resolve_hook_notification(source: str, payload: HookPayload) -> tuple[Notif
 def _hook_payload_raw(payload: HookPayload) -> dict[str, Any]:
     extra = payload.model_extra or {}
     raw = extra.get("raw")
+    if not isinstance(raw, dict):
+        raw = payload.metadata.get("raw")
     return raw if isinstance(raw, dict) else {}
+
+
+def _hook_permission_mode(payload: HookPayload) -> str:
+    extra = payload.model_extra or {}
+    raw = _hook_payload_raw(payload)
+    value = (
+        payload.permission_mode
+        or extra.get("permission_mode")
+        or extra.get("permissionMode")
+        or payload.metadata.get("permission_mode")
+        or payload.metadata.get("permissionMode")
+        or raw.get("permission_mode")
+        or raw.get("permissionMode")
+    )
+    return str(value or "").lower()
+
+
+def _is_plan_mode_stop(payload: HookPayload) -> bool:
+    event_name = (payload.hook_event_name or payload.event_type or "").lower()
+    return event_name == "stop" and _hook_permission_mode(payload) == "plan"
 
 
 def _should_suppress_hook_notification(
@@ -420,11 +447,17 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         # resolve_pending_permission(只处理 PostToolUse)漏掉的拒绝/中断场景,避免短 TTL
         # 窗口内客户端重启 reload 重显。
         if (payload.hook_event_name or "").lower() in _HOOK_EVENTS_THAT_FINALIZE_SESSION:
+            preserved_notification_id = (
+                notification.id
+                if notification is not None and _is_plan_mode_stop(payload)
+                else None
+            )
             for ev in storage.acknowledge_pending_permissions_for_session(
                 source=source,
                 session_id=payload.session_id or "local",
                 device_id=device.id,
                 reason="session_finalized",
+                exclude_notification_id=preserved_notification_id,
             ):
                 await hub.broadcast(ev, storage.should_deliver_event_to_device)
         return notification
