@@ -175,6 +175,12 @@ class Storage:
                     FOREIGN KEY(notification_id) REFERENCES notifications(id),
                     FOREIGN KEY(device_id) REFERENCES devices(id)
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_notifications_created_id
+                ON notifications(created_at DESC, id DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_notifications_status_created_id
+                ON notifications(status, created_at DESC, id DESC);
                 """
             )
             self._ensure_device_columns()
@@ -707,18 +713,56 @@ class Storage:
     def list_notifications(
         self,
         statuses: Iterable[NotificationStatus] | None = None,
+        created_since: datetime | None = None,
     ) -> list[NotificationPublic]:
         self.expire_due_notifications()
         query = "SELECT * FROM notifications"
         values: list[Any] = []
+        conditions: list[str] = []
         if statuses:
             status_values = [status.value for status in statuses]
-            query += f" WHERE status IN ({','.join('?' for _ in status_values)})"
+            conditions.append(f"status IN ({','.join('?' for _ in status_values)})")
             values.extend(status_values)
+        if created_since is not None:
+            conditions.append("created_at >= ?")
+            values.append(_dt(created_since))
+        if conditions:
+            query += f" WHERE {' AND '.join(conditions)}"
         query += " ORDER BY created_at ASC"
         with self._lock:
             rows = self._conn.execute(query, values).fetchall()
         return [self._notification_from_row(row) for row in rows]
+
+    def list_recent_notifications(
+        self,
+        *,
+        statuses: Iterable[NotificationStatus] | None,
+        created_since: datetime,
+        limit: int,
+        before_created_at: datetime | None = None,
+        before_id: str | None = None,
+    ) -> tuple[list[NotificationPublic], bool]:
+        """Return one newest-first history page using a stable (created_at, id) cursor."""
+        self.expire_due_notifications()
+        query = "SELECT * FROM notifications"
+        conditions = ["created_at >= ?"]
+        values: list[Any] = [_dt(created_since)]
+        if statuses:
+            status_values = [status.value for status in statuses]
+            conditions.append(f"status IN ({','.join('?' for _ in status_values)})")
+            values.extend(status_values)
+        if before_created_at is not None and before_id:
+            before_value = _dt(before_created_at)
+            conditions.append("(created_at < ? OR (created_at = ? AND id < ?))")
+            values.extend([before_value, before_value, before_id])
+        query += f" WHERE {' AND '.join(conditions)}"
+        query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        values.append(limit + 1)
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        return [self._notification_from_row(row) for row in page_rows], has_more
 
     def acknowledge(
         self,

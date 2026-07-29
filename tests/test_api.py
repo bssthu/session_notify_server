@@ -75,6 +75,149 @@ def test_create_list_and_ack_notification(tmp_path):
     assert active.json() == []
 
 
+def test_recent_notifications_are_paginated_and_limited_to_requested_days(tmp_path):
+    app = create_app(tmp_path / "server.db")
+    client = TestClient(app)
+    token = bind(client)
+    now = utc_now()
+    created: list[tuple[str, str, int]] = []
+
+    for index, age_days in enumerate((1, 2, 3, 4, 31), start=1):
+        response = client.post(
+            "/api/v1/notifications",
+            headers=auth(token),
+            json={
+                "source": "codex",
+                "session_id": "history",
+                "title": f"History {index}",
+                "body": f"Created {age_days} days ago",
+            },
+        )
+        assert response.status_code == 200, response.text
+        created.append((response.json()["id"], f"History {index}", age_days))
+
+    storage = app.state.storage
+    with storage._lock, storage._conn:
+        for notification_id, _title, age_days in created:
+            created_at = (now - timedelta(days=age_days)).isoformat()
+            storage._conn.execute(
+                "UPDATE notifications SET created_at = ?, updated_at = ? WHERE id = ?",
+                (created_at, created_at, notification_id),
+            )
+
+    first = client.get(
+        "/api/v1/notifications/recent",
+        headers=auth(token),
+        params={"days": 7, "limit": 2},
+    )
+    assert first.status_code == 200, first.text
+    first_page = first.json()
+    assert [item["title"] for item in first_page["items"]] == ["History 1", "History 2"]
+    assert first_page["has_more"] is True
+    assert first_page["next_cursor"]
+    assert first_page["requested_days"] == 7
+    assert first_page["effective_days"] == 7
+
+    second = client.get(
+        "/api/v1/notifications/recent",
+        headers=auth(token),
+        params={"days": 7, "limit": 2, "cursor": first_page["next_cursor"]},
+    )
+    assert second.status_code == 200, second.text
+    second_page = second.json()
+    assert [item["title"] for item in second_page["items"]] == ["History 3", "History 4"]
+    assert second_page["has_more"] is False
+    assert second_page["next_cursor"] is None
+
+
+def test_notification_history_has_a_server_side_30_day_hard_limit(tmp_path):
+    app = create_app(tmp_path / "server.db")
+    client = TestClient(app)
+    token = bind(client)
+    now = utc_now()
+    notification_ids: dict[str, str] = {}
+
+    for title in ("Within limit", "Outside limit"):
+        response = client.post(
+            "/api/v1/notifications",
+            headers=auth(token),
+            json={
+                "source": "codex",
+                "session_id": "history-limit",
+                "title": title,
+                "body": title,
+            },
+        )
+        assert response.status_code == 200, response.text
+        notification_ids[title] = response.json()["id"]
+
+    storage = app.state.storage
+    with storage._lock, storage._conn:
+        for title, age_days in (("Within limit", 29), ("Outside limit", 31)):
+            created_at = (now - timedelta(days=age_days)).isoformat()
+            storage._conn.execute(
+                "UPDATE notifications SET created_at = ?, updated_at = ? WHERE id = ?",
+                (created_at, created_at, notification_ids[title]),
+            )
+
+    recent = client.get(
+        "/api/v1/notifications/recent",
+        headers=auth(token),
+        params={"days": 60, "limit": 100},
+    )
+    assert recent.status_code == 200, recent.text
+    page = recent.json()
+    assert page["requested_days"] == 60
+    assert page["effective_days"] == 30
+    assert [item["title"] for item in page["items"]] == ["Within limit"]
+
+    legacy = client.get("/api/v1/notifications", headers=auth(token))
+    assert [item["title"] for item in legacy.json()] == ["Within limit"]
+
+
+def test_recent_notifications_validate_cursor_limit_and_status(tmp_path):
+    app = create_app(tmp_path / "server.db")
+    client = TestClient(app)
+    token = bind(client)
+    created = client.post(
+        "/api/v1/notifications",
+        headers=auth(token),
+        json={
+            "source": "codex",
+            "session_id": "history-status",
+            "title": "Acknowledged history",
+            "body": "Done",
+        },
+    ).json()
+    client.post(
+        f"/api/v1/notifications/{created['id']}/ack",
+        headers=auth(token),
+        json={"reason": "user_confirmed"},
+    )
+
+    filtered = client.get(
+        "/api/v1/notifications/recent",
+        headers=auth(token),
+        params=[("status", "acknowledged"), ("days", "7"), ("limit", "20")],
+    )
+    assert filtered.status_code == 200, filtered.text
+    assert [item["id"] for item in filtered.json()["items"]] == [created["id"]]
+
+    invalid_cursor = client.get(
+        "/api/v1/notifications/recent",
+        headers=auth(token),
+        params={"cursor": "not-a-valid-cursor"},
+    )
+    assert invalid_cursor.status_code == 400
+
+    too_large = client.get(
+        "/api/v1/notifications/recent",
+        headers=auth(token),
+        params={"limit": 101},
+    )
+    assert too_large.status_code == 422
+
+
 def test_remote_clients_see_notification_origin_device(tmp_path):
     client = TestClient(create_app(tmp_path / "server.db"))
     desktop = bind_tokens(client, name="Desktop", platform="windows")

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import json
 import os
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
@@ -28,6 +31,7 @@ from .schemas import (
     HookPayload,
     NotificationCreate,
     NotificationLevel,
+    NotificationPage,
     NotificationPublic,
     NotificationStatus,
     PairConsumeRequest,
@@ -62,6 +66,37 @@ REFRESH_TOKEN_TTL = timedelta(days=int(os.getenv("SESSION_NOTIFY_REFRESH_TTL_DAY
 PAIR_CODE_TTL = timedelta(seconds=int(os.getenv("SESSION_NOTIFY_PAIR_CODE_TTL_SECONDS", "300")))
 DEVICE_PRESENCE_TTL = timedelta(seconds=int(os.getenv("SESSION_NOTIFY_DEVICE_PRESENCE_TTL_SECONDS", "90")))
 _EXPIRE_POLL_INTERVAL_SECONDS = int(os.getenv("SESSION_NOTIFY_EXPIRE_POLL_SECONDS", "60"))
+NOTIFICATION_HISTORY_MAX_DAYS = 30
+NOTIFICATION_HISTORY_DEFAULT_PAGE_SIZE = 50
+NOTIFICATION_HISTORY_MAX_PAGE_SIZE = 100
+
+
+def _encode_notification_cursor(notification: NotificationPublic) -> str:
+    payload = json.dumps(
+        {"created_at": notification.created_at.isoformat(), "id": notification.id},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_notification_cursor(cursor: str) -> tuple[datetime, str]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+        created_at = datetime.fromisoformat(str(payload["created_at"]))
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        else:
+            created_at = created_at.astimezone(timezone.utc)
+        notification_id = str(payload["id"]).strip()
+        if not notification_id:
+            raise ValueError("empty notification id")
+        return created_at, notification_id
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError, binascii.Error) as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid notification cursor",
+        ) from error
 
 
 def _resolve_hook_body(payload: HookPayload) -> tuple[str, bool]:
@@ -469,7 +504,52 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     ) -> list[NotificationPublic]:
         if not device.notifications_enabled:
             return []
-        return storage.list_notifications(status_filter or [NotificationStatus.active])
+        return storage.list_notifications(
+            status_filter or [NotificationStatus.active],
+            created_since=utc_now() - timedelta(days=NOTIFICATION_HISTORY_MAX_DAYS),
+        )
+
+    @app.get("/api/v1/notifications/recent", response_model=NotificationPage)
+    def list_recent_notifications(
+        status_filter: list[NotificationStatus] | None = Query(default=None, alias="status"),
+        days: int = Query(default=7, ge=1),
+        limit: int = Query(
+            default=NOTIFICATION_HISTORY_DEFAULT_PAGE_SIZE,
+            ge=1,
+            le=NOTIFICATION_HISTORY_MAX_PAGE_SIZE,
+        ),
+        cursor: str | None = Query(default=None, min_length=1, max_length=1024),
+        device: DevicePublic = Depends(current_device),
+    ) -> NotificationPage:
+        effective_days = min(days, NOTIFICATION_HISTORY_MAX_DAYS)
+        if not device.notifications_enabled:
+            return NotificationPage(
+                items=[],
+                has_more=False,
+                requested_days=days,
+                effective_days=effective_days,
+                limit=limit,
+            )
+        before_created_at: datetime | None = None
+        before_id: str | None = None
+        if cursor:
+            before_created_at, before_id = _decode_notification_cursor(cursor)
+        items, has_more = storage.list_recent_notifications(
+            statuses=status_filter,
+            created_since=utc_now() - timedelta(days=effective_days),
+            limit=limit,
+            before_created_at=before_created_at,
+            before_id=before_id,
+        )
+        next_cursor = _encode_notification_cursor(items[-1]) if has_more and items else None
+        return NotificationPage(
+            items=items,
+            next_cursor=next_cursor,
+            has_more=has_more,
+            requested_days=days,
+            effective_days=effective_days,
+            limit=limit,
+        )
 
     @app.post("/api/v1/notifications/{notification_id}/ack", response_model=AckResponse)
     async def acknowledge_notification(

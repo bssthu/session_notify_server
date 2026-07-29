@@ -180,6 +180,15 @@ class NotificationPublic(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class NotificationPage(BaseModel):
+    items: list[NotificationPublic]
+    next_cursor: str | None = None
+    has_more: bool = False
+    requested_days: int
+    effective_days: int
+    limit: int
+
+
 class AckRequest(BaseModel):
     reason: str = Field(default="user_confirmed", min_length=1, max_length=80)
 

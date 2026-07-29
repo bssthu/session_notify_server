@@ -30,7 +30,7 @@ uv run pytest
 
 - 设备绑定和 bearer token 认证。
 - refresh token 换取/轮换 access token。
-- 通知创建、拉取、确认和过期。
+- 通知创建、拉取、确认和过期；历史查询支持状态过滤与游标分页，查询范围在服务端硬限制为最近 30 天。
 - WebSocket 推送 `notification.created` / `notification.acknowledged`，支持 query token 和 `Authorization` header。
 - 幂等 ack：任一设备确认后，通知状态以服务端为准。
 - Codex / Claude Code hook payload 到统一通知的基础映射。
