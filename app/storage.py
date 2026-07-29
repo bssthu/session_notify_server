@@ -28,7 +28,7 @@ from .schemas import (
     new_id,
     utc_now,
 )
-from .hook_policy import is_noise_hook_event
+from .hook_policy import is_codex_permission_request, is_noise_hook_event
 from .security import new_token, sha256_text
 
 # 配对码字符集:去掉易混淆的 I/L/O/U/0/1,生成形如 7Q4K-9XKM 的人类可读码。
@@ -43,6 +43,78 @@ def _parse_dt(value: str | None) -> datetime | None:
     if value is None:
         return None
     return datetime.fromisoformat(value).astimezone(timezone.utc)
+
+
+def _metadata_bool(metadata: dict[str, Any], *keys: str) -> bool:
+    for key in keys:
+        if key not in metadata:
+            continue
+        value = metadata[key]
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() == "true"
+    return False
+
+
+def _notification_visible_for_history(
+    source: object,
+    title: object,
+    metadata_json: object,
+    suppress_codex_permission_requests: object,
+) -> int:
+    """SQLite UDF matching Windows notification visibility without returning hidden rows."""
+    try:
+        metadata = json.loads(str(metadata_json or "{}"))
+        if not isinstance(metadata, dict):
+            metadata = {}
+    except (TypeError, ValueError):
+        metadata = {}
+    source_lower = str(source or "").lower()
+    title_lower = str(title or "").lower()
+    event_name = str(
+        metadata.get("hook_event_name")
+        or metadata.get("hookEventName")
+        or metadata.get("hook_event_type")
+        or metadata.get("hookEventType")
+        or ""
+    ).lower()
+    notification_type = str(
+        metadata.get("notification_type") or metadata.get("notificationType") or ""
+    ).lower()
+    hook_status = str(metadata.get("hook_status") or metadata.get("hookStatus") or "").lower()
+    raw_event_type = str(
+        metadata.get("raw_event_type") or metadata.get("rawEventType") or ""
+    ).lower()
+    is_hook = (
+        source_lower in ("claude", "codex")
+        or bool(event_name)
+        or bool(notification_type)
+        or bool(hook_status)
+        or bool(raw_event_type)
+        or bool(metadata.get("source_tool") or metadata.get("sourceTool"))
+    )
+    if not is_hook:
+        return 1
+    raw = metadata.get("raw")
+    if is_noise_hook_event(
+        event_name=event_name or raw_event_type,
+        notification_type=" ".join((notification_type, raw_event_type)),
+        hook_status=hook_status,
+        title=title_lower,
+        body_generated=_metadata_bool(metadata, "body_generated", "bodyGenerated"),
+        raw=raw if isinstance(raw, dict) else None,
+    ):
+        return 0
+    if bool(suppress_codex_permission_requests) and is_codex_permission_request(
+        source=source_lower,
+        event_name=event_name,
+        notification_type=notification_type,
+        hook_status=hook_status,
+        title=title_lower,
+        raw_event_type=raw_event_type,
+    ):
+        return 0
+    return 1
 
 
 # 与客户端 hookResolutionKey(notification-logic.js)/rawToolCommand 等价的配对键。
@@ -103,6 +175,12 @@ class Storage:
             detect_types=sqlite3.PARSE_DECLTYPES,
         )
         self._conn.row_factory = sqlite3.Row
+        self._conn.create_function(
+            "notification_visible_for_history",
+            4,
+            _notification_visible_for_history,
+            deterministic=True,
+        )
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._init_schema()
@@ -741,28 +819,44 @@ class Storage:
         limit: int,
         before_created_at: datetime | None = None,
         before_id: str | None = None,
-    ) -> tuple[list[NotificationPublic], bool]:
+        visible_only: bool = True,
+        suppress_codex_permission_requests: bool = False,
+    ) -> tuple[list[NotificationPublic], bool, int]:
         """Return one newest-first history page using a stable (created_at, id) cursor."""
         self.expire_due_notifications()
-        query = "SELECT * FROM notifications"
         conditions = ["created_at >= ?"]
         values: list[Any] = [_dt(created_since)]
         if statuses:
             status_values = [status.value for status in statuses]
             conditions.append(f"status IN ({','.join('?' for _ in status_values)})")
             values.extend(status_values)
+        if visible_only:
+            conditions.append("notification_visible_for_history(source, title, metadata, ?) = 1")
+            values.append(1 if suppress_codex_permission_requests else 0)
+
+        where = f" WHERE {' AND '.join(conditions)}"
+        with self._lock:
+            total_count = int(
+                self._conn.execute(
+                    f"SELECT COUNT(*) AS count FROM notifications{where}",
+                    values,
+                ).fetchone()["count"]
+            )
+
+        page_conditions = list(conditions)
+        page_values = list(values)
         if before_created_at is not None and before_id:
             before_value = _dt(before_created_at)
-            conditions.append("(created_at < ? OR (created_at = ? AND id < ?))")
-            values.extend([before_value, before_value, before_id])
-        query += f" WHERE {' AND '.join(conditions)}"
+            page_conditions.append("(created_at < ? OR (created_at = ? AND id < ?))")
+            page_values.extend([before_value, before_value, before_id])
+        query = f"SELECT * FROM notifications WHERE {' AND '.join(page_conditions)}"
         query += " ORDER BY created_at DESC, id DESC LIMIT ?"
-        values.append(limit + 1)
+        page_values.append(limit + 1)
         with self._lock:
-            rows = self._conn.execute(query, values).fetchall()
+            rows = self._conn.execute(query, page_values).fetchall()
         has_more = len(rows) > limit
         page_rows = rows[:limit]
-        return [self._notification_from_row(row) for row in page_rows], has_more
+        return [self._notification_from_row(row) for row in page_rows], has_more, total_count
 
     def acknowledge(
         self,

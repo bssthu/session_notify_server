@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging.config
+import re
 import sys
 from pathlib import Path
 
@@ -14,13 +15,40 @@ _PROTOCOL_MISMATCH_HINT = (
     "http://<host>:<port>, or start the server with TLS via "
     "scripts/run_dev_server.ps1 or scripts/run_dev_server.sh."
 )
+_SENSITIVE_QUERY_RE = re.compile(
+    r"([?&](?:token|access_token)=)[^&\s\"']+",
+    flags=re.IGNORECASE,
+)
 
 
 class UvicornProtocolHintFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.name.startswith("uvicorn") and record.getMessage() == _INVALID_HTTP_REQUEST:
+        if not record.name.startswith("uvicorn"):
+            return True
+        message = record.getMessage()
+        if message == _INVALID_HTTP_REQUEST:
             record.msg = _PROTOCOL_MISMATCH_HINT
             record.args = ()
+            return True
+
+        if isinstance(record.msg, str):
+            record.msg = _SENSITIVE_QUERY_RE.sub(r"\1[REDACTED]", record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                _SENSITIVE_QUERY_RE.sub(r"\1[REDACTED]", value)
+                if isinstance(value, str)
+                else value
+                for value in record.args
+            )
+        elif isinstance(record.args, dict):
+            record.args = {
+                key: (
+                    _SENSITIVE_QUERY_RE.sub(r"\1[REDACTED]", value)
+                    if isinstance(value, str)
+                    else value
+                )
+                for key, value in record.args.items()
+            }
         return True
 
 
@@ -46,7 +74,7 @@ def configure_server_logging(config_path: str | Path | None = None) -> None:
 
 
 def _install_protocol_hint_filter() -> None:
-    for logger_name in ("uvicorn", "uvicorn.error", ""):
+    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access", ""):
         logger = logging.getLogger(logger_name)
         for handler in logger.handlers:
             if not any(isinstance(item, UvicornProtocolHintFilter) for item in handler.filters):

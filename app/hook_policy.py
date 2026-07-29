@@ -19,6 +19,9 @@ _COMPLETED_HOOK_RE = re.compile(
     r"\btaskcompleted\b|\bcompleted\b|\bcomplete\b|\bdone\b|\bsuccess\b|\bfinished?\b|\bstop\b"
 )
 _FAILURE_HOOK_RE = re.compile(r"\bstopfailure\b|\bfailure\b|\bfailed\b|\berror\b")
+_APPROVAL_HOOK_RE = re.compile(
+    r"\bapproval_requested\b|permission|approval|confirm|auth|elicitation|input|needs confirmation"
+)
 
 
 def _nonempty_list(value: object) -> bool:
@@ -64,3 +67,21 @@ def is_noise_hook_event(
         return True
 
     return False
+
+
+def is_codex_permission_request(
+    *,
+    source: str,
+    event_name: str,
+    notification_type: str,
+    hook_status: str,
+    title: str,
+    raw_event_type: str = "",
+) -> bool:
+    """Match the Windows client's auto-approved Codex permission suppression rule."""
+    if source.lower() != "codex" or event_name.lower() != "permissionrequest":
+        return False
+    text = " ".join(
+        (title, hook_status, notification_type, event_name, raw_event_type)
+    ).lower()
+    return _APPROVAL_HOOK_RE.search(text) is not None

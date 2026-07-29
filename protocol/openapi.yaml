@@ -209,7 +209,7 @@ paths:
           schema:
             type: integer
             minimum: 1
-            default: 7
+            default: 1
         - name: limit
           in: query
           required: false
@@ -223,6 +223,18 @@ paths:
           required: false
           schema:
             type: string
+        - name: visible_only
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: true
+        - name: suppress_codex_permission_requests
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
       responses:
         "200":
           description: A page of recent notifications.
@@ -522,7 +534,7 @@ components:
               format: date-time
     NotificationPage:
       type: object
-      required: [items, has_more, requested_days, effective_days, limit]
+      required: [items, has_more, requested_days, effective_days, limit, total_count, total_pages]
       properties:
         items:
           type: array
@@ -540,6 +552,12 @@ components:
         limit:
           type: integer
           maximum: 100
+        total_count:
+          type: integer
+          minimum: 0
+        total_pages:
+          type: integer
+          minimum: 0
     AckRequest:
       type: object
       properties:

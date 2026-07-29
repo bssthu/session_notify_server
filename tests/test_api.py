@@ -117,6 +117,8 @@ def test_recent_notifications_are_paginated_and_limited_to_requested_days(tmp_pa
     assert first_page["next_cursor"]
     assert first_page["requested_days"] == 7
     assert first_page["effective_days"] == 7
+    assert first_page["total_count"] == 4
+    assert first_page["total_pages"] == 2
 
     second = client.get(
         "/api/v1/notifications/recent",
@@ -128,6 +130,8 @@ def test_recent_notifications_are_paginated_and_limited_to_requested_days(tmp_pa
     assert [item["title"] for item in second_page["items"]] == ["History 3", "History 4"]
     assert second_page["has_more"] is False
     assert second_page["next_cursor"] is None
+    assert second_page["total_count"] == 4
+    assert second_page["total_pages"] == 2
 
 
 def test_notification_history_has_a_server_side_30_day_hard_limit(tmp_path):
@@ -170,6 +174,8 @@ def test_notification_history_has_a_server_side_30_day_hard_limit(tmp_path):
     assert page["requested_days"] == 60
     assert page["effective_days"] == 30
     assert [item["title"] for item in page["items"]] == ["Within limit"]
+    assert page["total_count"] == 1
+    assert page["total_pages"] == 1
 
     legacy = client.get("/api/v1/notifications", headers=auth(token))
     assert [item["title"] for item in legacy.json()] == ["Within limit"]
@@ -216,6 +222,86 @@ def test_recent_notifications_validate_cursor_limit_and_status(tmp_path):
         params={"limit": 101},
     )
     assert too_large.status_code == 422
+
+
+def test_recent_notifications_filter_client_hidden_events_before_counting(tmp_path):
+    app = create_app(tmp_path / "server.db")
+    client = TestClient(app)
+    token = bind(client)
+
+    notifications = [
+        {
+            "title": "Visible failure",
+            "body": "Command failed",
+            "metadata": {
+                "hook_event_name": "StopFailure",
+                "hook_status": "failed",
+            },
+        },
+        {
+            "title": "Codex idle",
+            "body": "Session event received.",
+            "metadata": {
+                "hook_event_name": "Notification",
+                "hook_status": "idle",
+            },
+        },
+        {
+            "title": "Codex needs confirmation",
+            "body": "Run command?",
+            "metadata": {
+                "hook_event_name": "PermissionRequest",
+                "notification_type": "approval_requested",
+            },
+        },
+    ]
+    for notification in notifications:
+        response = client.post(
+            "/api/v1/notifications",
+            headers=auth(token),
+            json={
+                "source": "codex",
+                "session_id": "history-visibility",
+                **notification,
+            },
+        )
+        assert response.status_code == 200, response.text
+
+    normal = client.get(
+        "/api/v1/notifications/recent",
+        headers=auth(token),
+        params={"days": 1, "limit": 20},
+    )
+    assert normal.status_code == 200, normal.text
+    assert [item["title"] for item in normal.json()["items"]] == [
+        "Codex needs confirmation",
+        "Visible failure",
+    ]
+    assert normal.json()["total_count"] == 2
+    assert normal.json()["total_pages"] == 1
+
+    auto_approval = client.get(
+        "/api/v1/notifications/recent",
+        headers=auth(token),
+        params={
+            "days": 1,
+            "limit": 20,
+            "suppress_codex_permission_requests": True,
+        },
+    )
+    assert auto_approval.status_code == 200, auto_approval.text
+    assert [item["title"] for item in auto_approval.json()["items"]] == ["Visible failure"]
+    assert auto_approval.json()["total_count"] == 1
+    assert auto_approval.json()["total_pages"] == 1
+
+    unfiltered = client.get(
+        "/api/v1/notifications/recent",
+        headers=auth(token),
+        params={"days": 1, "limit": 2, "visible_only": False},
+    )
+    assert unfiltered.status_code == 200, unfiltered.text
+    assert unfiltered.json()["total_count"] == 3
+    assert unfiltered.json()["total_pages"] == 2
 
 
 def test_remote_clients_see_notification_origin_device(tmp_path):

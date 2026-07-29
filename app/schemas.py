@@ -187,6 +187,8 @@ class NotificationPage(BaseModel):
     requested_days: int
     effective_days: int
     limit: int
+    total_count: int
+    total_pages: int
 
 
 class AckRequest(BaseModel):

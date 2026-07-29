@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import json
+import math
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -512,13 +513,15 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     @app.get("/api/v1/notifications/recent", response_model=NotificationPage)
     def list_recent_notifications(
         status_filter: list[NotificationStatus] | None = Query(default=None, alias="status"),
-        days: int = Query(default=7, ge=1),
+        days: int = Query(default=1, ge=1),
         limit: int = Query(
             default=NOTIFICATION_HISTORY_DEFAULT_PAGE_SIZE,
             ge=1,
             le=NOTIFICATION_HISTORY_MAX_PAGE_SIZE,
         ),
         cursor: str | None = Query(default=None, min_length=1, max_length=1024),
+        visible_only: bool = Query(default=True),
+        suppress_codex_permission_requests: bool = Query(default=False),
         device: DevicePublic = Depends(current_device),
     ) -> NotificationPage:
         effective_days = min(days, NOTIFICATION_HISTORY_MAX_DAYS)
@@ -529,17 +532,21 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 requested_days=days,
                 effective_days=effective_days,
                 limit=limit,
+                total_count=0,
+                total_pages=0,
             )
         before_created_at: datetime | None = None
         before_id: str | None = None
         if cursor:
             before_created_at, before_id = _decode_notification_cursor(cursor)
-        items, has_more = storage.list_recent_notifications(
+        items, has_more, total_count = storage.list_recent_notifications(
             statuses=status_filter,
             created_since=utc_now() - timedelta(days=effective_days),
             limit=limit,
             before_created_at=before_created_at,
             before_id=before_id,
+            visible_only=visible_only,
+            suppress_codex_permission_requests=suppress_codex_permission_requests,
         )
         next_cursor = _encode_notification_cursor(items[-1]) if has_more and items else None
         return NotificationPage(
@@ -549,6 +556,8 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             requested_days=days,
             effective_days=effective_days,
             limit=limit,
+            total_count=total_count,
+            total_pages=math.ceil(total_count / limit),
         )
 
     @app.post("/api/v1/notifications/{notification_id}/ack", response_model=AckResponse)
