@@ -678,34 +678,58 @@ def test_requires_authorization(tmp_path):
     assert response.status_code == 401
 
 
-def _hook_payload(event_name, session_id, command, *, event_type=None, cwd="I:/Projects/x", tool_name="Bash"):
+def _hook_payload(
+    event_name,
+    session_id,
+    command,
+    *,
+    event_type=None,
+    cwd="I:/Projects/x",
+    tool_name="Bash",
+    turn_id=None,
+):
     if event_name == "PermissionRequest":
         event_type = event_type or "approval_requested"
     else:
         event_type = event_type or "completed"
-    return {
+    raw = {"command": command, "cwd": cwd, "tool_name": tool_name}
+    payload = {
         "hook_event_name": event_name,
         "event_type": event_type,
         "hook_status": event_type,
         "session_id": session_id,
         "cwd": cwd,
         "tool_name": tool_name,
-        "metadata": {"raw": {"command": command, "cwd": cwd, "tool_name": tool_name}},
+        "metadata": {"raw": raw},
     }
+    if turn_id is not None:
+        payload["turn_id"] = turn_id
+        raw["turn_id"] = turn_id
+    return payload
 
 
 def test_posttooluse_resolves_matching_permission_request(tmp_path):
     client = TestClient(create_app(tmp_path / "server.db"))
     token = bind(client)
 
+    permission_payload = _hook_payload(
+        "PermissionRequest", "s-perm", "npm test", turn_id="turn-perm"
+    )
+    # 旧 Bridge 只在 metadata.raw 中保留 turn_id；服务端仍应提升并参与匹配。
+    permission_payload.pop("turn_id")
     perm = client.post("/api/v1/hooks/claude", headers=auth(token),
-                       json=_hook_payload("PermissionRequest", "s-perm", "npm test"))
+                       json=permission_payload)
     assert perm.status_code == 200, perm.text
     assert perm.json()["title"] == "claude needs confirmation"
+    assert perm.json()["metadata"]["turn_id"] == "turn-perm"
     perm_id = perm.json()["id"]
 
+    post_payload = _hook_payload(
+        "PostToolUse", "s-perm", "npm test", turn_id="turn-perm"
+    )
+    post_payload.pop("turn_id")
     post = client.post("/api/v1/hooks/claude", headers=auth(token),
-                       json=_hook_payload("PostToolUse", "s-perm", "npm test"))
+                       json=post_payload)
     assert post.status_code == 200, post.text
 
     active = client.get("/api/v1/notifications", headers=auth(token)).json()
@@ -721,6 +745,143 @@ def test_posttooluse_resolves_matching_permission_request(tmp_path):
     assert len(ack_events) == 1
     assert ack_events[0]["notification_id"] == perm_id
     assert ack_events[0]["reason"] == "auto_resolved"
+
+
+def test_posttooluse_does_not_resolve_same_command_from_another_turn(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    earlier = client.post(
+        "/api/v1/hooks/codex",
+        headers=auth(token),
+        json=_hook_payload("PermissionRequest", "s-turns", "npm test", turn_id="turn-a"),
+    )
+    later = client.post(
+        "/api/v1/hooks/codex",
+        headers=auth(token),
+        json=_hook_payload("PermissionRequest", "s-turns", "npm test", turn_id="turn-b"),
+    )
+    assert earlier.status_code == 200 and later.status_code == 200
+
+    post = client.post(
+        "/api/v1/hooks/codex",
+        headers=auth(token),
+        json=_hook_payload("PostToolUse", "s-turns", "npm test", turn_id="turn-a"),
+    )
+    assert post.status_code == 200, post.text
+
+    active_ids = {
+        item["id"]
+        for item in client.get("/api/v1/notifications", headers=auth(token)).json()
+    }
+    assert earlier.json()["id"] not in active_ids
+    assert later.json()["id"] in active_ids
+
+
+def test_posttooluse_with_different_turn_is_noop(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    permission = client.post(
+        "/api/v1/hooks/codex",
+        headers=auth(token),
+        json=_hook_payload("PermissionRequest", "s-turn-mismatch", "npm test",
+                           turn_id="turn-a"),
+    )
+    post = client.post(
+        "/api/v1/hooks/codex",
+        headers=auth(token),
+        json=_hook_payload("PostToolUse", "s-turn-mismatch", "npm test",
+                           turn_id="turn-b"),
+    )
+    assert permission.status_code == 200 and post.status_code == 200
+
+    active_ids = {
+        item["id"]
+        for item in client.get("/api/v1/notifications", headers=auth(token)).json()
+    }
+    assert permission.json()["id"] in active_ids
+
+
+def test_posttooluse_turn_id_falls_back_to_one_legacy_permission(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    permission = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json=_hook_payload("PermissionRequest", "s-legacy-turn", "npm test"),
+    )
+    post = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json=_hook_payload("PostToolUse", "s-legacy-turn", "npm test",
+                           turn_id="turn-new"),
+    )
+    assert permission.status_code == 200 and post.status_code == 200
+
+    active_ids = {
+        item["id"]
+        for item in client.get("/api/v1/notifications", headers=auth(token)).json()
+    }
+    assert permission.json()["id"] not in active_ids
+
+
+def test_posttooluse_does_not_guess_between_ambiguous_permissions(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    legacy_a = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json=_hook_payload("PermissionRequest", "s-ambiguous", "npm test"),
+    )
+    legacy_b = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json=_hook_payload("PermissionRequest", "s-ambiguous", "npm test"),
+    )
+    post = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json=_hook_payload("PostToolUse", "s-ambiguous", "npm test",
+                           turn_id="turn-new"),
+    )
+    assert legacy_a.status_code == 200 and legacy_b.status_code == 200
+    assert post.status_code == 200
+
+    active_ids = {
+        item["id"]
+        for item in client.get("/api/v1/notifications", headers=auth(token)).json()
+    }
+    assert {legacy_a.json()["id"], legacy_b.json()["id"]} <= active_ids
+
+    same_turn_a = client.post(
+        "/api/v1/hooks/codex",
+        headers=auth(token),
+        json=_hook_payload("PermissionRequest", "s-same-turn", "npm test",
+                           turn_id="turn-shared"),
+    )
+    same_turn_b = client.post(
+        "/api/v1/hooks/codex",
+        headers=auth(token),
+        json=_hook_payload("PermissionRequest", "s-same-turn", "npm test",
+                           turn_id="turn-shared"),
+    )
+    same_turn_post = client.post(
+        "/api/v1/hooks/codex",
+        headers=auth(token),
+        json=_hook_payload("PostToolUse", "s-same-turn", "npm test",
+                           turn_id="turn-shared"),
+    )
+    assert same_turn_a.status_code == 200 and same_turn_b.status_code == 200
+    assert same_turn_post.status_code == 200
+
+    active_ids = {
+        item["id"]
+        for item in client.get("/api/v1/notifications", headers=auth(token)).json()
+    }
+    assert {same_turn_a.json()["id"], same_turn_b.json()["id"]} <= active_ids
 
 
 def test_posttooluse_without_match_is_noop(tmp_path):

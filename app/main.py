@@ -123,6 +123,15 @@ def _resolve_hook_body(payload: HookPayload) -> tuple[str, bool]:
 
 def _hook_metadata(payload: HookPayload, body_generated: bool) -> dict[str, object]:
     extra = payload.model_extra or {}
+    raw = payload.metadata.get("raw") if isinstance(payload.metadata.get("raw"), dict) else {}
+    turn_id = (
+        payload.turn_id
+        or extra.get("turnId")
+        or payload.metadata.get("turn_id")
+        or payload.metadata.get("turnId")
+        or raw.get("turn_id")
+        or raw.get("turnId")
+    )
     metadata: dict[str, object] = {
         "hook_event_type": payload.event_type,
         "hook_event_name": payload.hook_event_name,
@@ -135,6 +144,8 @@ def _hook_metadata(payload: HookPayload, body_generated: bool) -> dict[str, obje
         **extra,
         **payload.metadata,
     }
+    if turn_id:
+        metadata["turn_id"] = turn_id
     if payload.tool_input is not None:
         metadata["tool_input"] = payload.tool_input
     metadata["body_generated"] = body_generated
@@ -465,9 +476,9 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             )
             notification, event = storage.create_notification(request, origin_device=device)
             await hub.broadcast(event, storage.should_deliver_event_to_device)
-        # 工具执行完成(PostToolUse)意味着对应的权限请求已被批准:按配对键自动 resolve
-        # 匹配的活跃 permission request,避免它永远 active、被客户端重启时 reload 重显。
-        # 注意:PostToolUse 本身被 suppress(不创建通知),但此 resolve 副作用必须保留。
+        # 工具执行完成(PostToolUse)可作为审批已通过的尽力清理信号:按基础键 + turn_id
+        # 仅 resolve 唯一匹配的活跃 permission request；歧义时保持 active，交给会话结束
+        # 或 TTL 兜底。PostToolUse 本身被 suppress(不创建通知),但此副作用必须保留。
         if (payload.hook_event_name or "").lower() == "posttooluse":
             resolved = storage.resolve_pending_permission(
                 source=source,

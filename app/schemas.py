@@ -238,6 +238,7 @@ class HookPayload(BaseModel):
     summary: str | None = None
     last_assistant_message: str | None = None
     session_id: str | None = None
+    turn_id: str | None = None
     cwd: str | None = None
     transcript_path: str | None = None
     tool_name: str | None = None

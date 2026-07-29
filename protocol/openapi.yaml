@@ -595,6 +595,8 @@ components:
           type: [string, "null"]
         session_id:
           type: [string, "null"]
+        turn_id:
+          type: [string, "null"]
         permission_mode:
           type: [string, "null"]
         metadata:

@@ -117,11 +117,13 @@ def _notification_visible_for_history(
     return 1
 
 
-# 与客户端 hookResolutionKey(notification-logic.js)/rawToolCommand 等价的配对键。
-# 关键:command 必须从 metadata.raw 取 —— incoming(payload 经 _hook_metadata)与
+# 与客户端 hookResolutionIdentity(notification-logic.js)/rawToolCommand 等价的基础
+# 配对键。turn_id 单独返回给 resolve_pending_permission 做兼容与歧义判断，不能简单
+# 拼接后继续“取最新一条”，否则旧 Bridge/历史通知缺少 turn_id 时无法安全回退。
+#
+# 关键:command 必须优先从 metadata.raw 取 —— incoming(payload 经 _hook_metadata)与
 # stored(notification.metadata)的 raw 同源(同一份 bridge metadata.raw),保证两端
-# 一致;若改用顶层 payload.command(bridge 已 FormatSummary 50+50 截断)会与 raw
-# (TrimLongStrings 截断)不一致,长命令配对失败。
+# 一致;顶层 payload.command 已被 Bridge FormatSummary 截断，仅作旧数据兜底。
 def _hook_resolution_key(*, source: str, session_id: str | None, metadata: Any) -> str:
     meta = metadata if isinstance(metadata, dict) else {}
     raw = meta.get("raw") if isinstance(meta.get("raw"), dict) else {}
@@ -134,12 +136,14 @@ def _hook_resolution_key(*, source: str, session_id: str | None, metadata: Any) 
         norm(meta.get("tool_name")) or norm(meta.get("toolName"))
         or norm(raw.get("tool_name")) or norm(raw.get("toolName"))
     )
-    # rawToolCommand 顺序:metadata.command → raw.command → tool_input.command
+    # rawToolCommand 顺序:raw.command → raw.tool_input.command → metadata 兜底。
     command = (
-        norm(meta.get("command"))
-        or norm(raw.get("command"))
+        norm(raw.get("command"))
         or norm((raw.get("tool_input") or {}).get("command"))
+        or norm((raw.get("toolInput") or {}).get("command"))
+        or norm(meta.get("command"))
         or norm((meta.get("tool_input") or {}).get("command"))
+        or norm((meta.get("toolInput") or {}).get("command"))
     )
     return "".join([
         norm(source) or "session",
@@ -148,6 +152,19 @@ def _hook_resolution_key(*, source: str, session_id: str | None, metadata: Any) 
         tool_name,
         command,
     ])
+
+
+def _hook_turn_id(metadata: Any) -> str:
+    meta = metadata if isinstance(metadata, dict) else {}
+    raw = meta.get("raw") if isinstance(meta.get("raw"), dict) else {}
+    value = (
+        meta.get("turn_id")
+        or meta.get("turnId")
+        or raw.get("turn_id")
+        or raw.get("turnId")
+    )
+    # turn_id 是不透明标识符，只去除边缘空白，不做大小写归一化。
+    return str(value or "").strip()
 
 
 class Storage:
@@ -920,20 +937,22 @@ class Storage:
         device_id: str,
         reason: str,
     ) -> SyncEvent | None:
-        """PostToolUse 到达时,按配对键 resolve 最近一条匹配的活跃 permission request。
+        """PostToolUse 到达时,按基础键与 turn_id resolve 唯一匹配的活跃 permission。
 
-        与客户端 hookResolutionKey 等价(见 _hook_resolution_key):command 从 metadata.raw
-        取,incoming 与 stored 同源。无匹配返回 None(静默 no-op)。命中最近一条
-        (ORDER BY created_at DESC 首条):写 acks、置 acknowledged、追加
-        notification.acknowledged 事件并返回,供调用方广播。
+        双方都有 turn_id 时必须相等；同一 turn 命中多条视为歧义并保持 no-op。为兼容
+        旧 Bridge/历史通知，仅在没有带其它 turn_id 的候选且恰好只有一条 legacy 候选
+        时回退。incoming 缺少 turn_id 时也只接受唯一基础键候选。宁可交给会话结束或
+        TTL 兜底，也不错误清除仍在等待用户的审批。
         """
         incoming_key = _hook_resolution_key(source=source, session_id=session_id, metadata=metadata)
+        incoming_turn_id = _hook_turn_id(metadata)
         now = utc_now()
         with self._lock, self._conn:
             rows = self._conn.execute(
                 "SELECT * FROM notifications WHERE status = ? ORDER BY created_at DESC",
                 (NotificationStatus.active.value,),
             ).fetchall()
+            candidates: list[tuple[NotificationPublic, str]] = []
             for row in rows:
                 notification = self._notification_from_row(row)
                 meta = notification.metadata or {}
@@ -946,33 +965,53 @@ class Storage:
                 )
                 if stored_key != incoming_key:
                     continue
-                self._conn.execute(
-                    """
-                    INSERT OR IGNORE INTO acks(notification_id, device_id, ack_at, reason)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (notification.id, device_id, _dt(now), reason),
+                candidates.append((notification, _hook_turn_id(meta)))
+
+            matched: NotificationPublic | None = None
+            if incoming_turn_id:
+                exact = [
+                    notification
+                    for notification, stored_turn_id in candidates
+                    if stored_turn_id == incoming_turn_id
+                ]
+                if len(exact) == 1:
+                    matched = exact[0]
+                elif not exact and all(not stored_turn_id for _, stored_turn_id in candidates):
+                    legacy = [notification for notification, _ in candidates]
+                    if len(legacy) == 1:
+                        matched = legacy[0]
+            elif len(candidates) == 1:
+                matched = candidates[0][0]
+
+            if matched is None:
+                return None
+
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO acks(notification_id, device_id, ack_at, reason)
+                VALUES (?, ?, ?, ?)
+                """,
+                (matched.id, device_id, _dt(now), reason),
+            )
+            self._conn.execute(
+                """
+                UPDATE notifications
+                SET status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (NotificationStatus.acknowledged.value, _dt(now), matched.id),
+            )
+            return self._append_event(
+                SyncEvent(
+                    event_id=new_id(),
+                    event_type=EventType.notification_acknowledged,
+                    created_at=now,
+                    notification_id=matched.id,
+                    ack_by_device_id=device_id,
+                    ack_at=now,
+                    reason=reason,
                 )
-                self._conn.execute(
-                    """
-                    UPDATE notifications
-                    SET status = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (NotificationStatus.acknowledged.value, _dt(now), notification.id),
-                )
-                return self._append_event(
-                    SyncEvent(
-                        event_id=new_id(),
-                        event_type=EventType.notification_acknowledged,
-                        created_at=now,
-                        notification_id=notification.id,
-                        ack_by_device_id=device_id,
-                        ack_at=now,
-                        reason=reason,
-                    )
-                )
-        return None
+            )
 
     def acknowledge_pending_permissions_for_session(
         self,
