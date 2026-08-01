@@ -342,6 +342,7 @@ def test_windows_presence_summary_and_android_realtime_invalidation(tmp_path):
     )
     assert initial.status_code == 200, initial.text
     assert initial.json()["any_unlocked_windows"] is False
+    assert initial.json()["any_unlocked_unpaused_windows"] is False
     assert initial.json()["registered_windows"] == 1
     assert initial.json()["fresh_windows"] == 0
     assert initial.json()["windows_devices"][0]["effective_session_state"] == "unknown"
@@ -358,12 +359,14 @@ def test_windows_presence_summary_and_android_realtime_invalidation(tmp_path):
         )
         assert unlocked.status_code == 200, unlocked.text
         assert unlocked.json()["any_unlocked_windows"] is True
+        assert unlocked.json()["any_unlocked_unpaused_windows"] is False
         assert unlocked.json()["fresh_windows"] == 1
         event = websocket.receive_json()
         assert event["event_type"] == "device.presence_changed"
         assert event["device_id"] == desktop["device"]["id"]
         assert event["device_session_state"] == "unlocked"
         assert event["any_unlocked_windows"] is True
+        assert event["any_unlocked_unpaused_windows"] is False
 
         devices = client.get(
             "/api/v1/devices",
@@ -374,6 +377,33 @@ def test_windows_presence_summary_and_android_realtime_invalidation(tmp_path):
         )
         assert datetime.fromisoformat(desktop_state["notification_pause_until"]) == pause_until
 
+        resumed = client.post(
+            "/api/v1/devices/me/presence",
+            headers=auth(desktop["access_token"]),
+            json={"session_state": "unlocked", "notification_pause_until": None},
+        )
+        assert resumed.status_code == 200, resumed.text
+        assert resumed.json()["any_unlocked_windows"] is True
+        assert resumed.json()["any_unlocked_unpaused_windows"] is True
+        event = websocket.receive_json()
+        assert event["device_session_state"] == "unlocked"
+        assert event["any_unlocked_unpaused_windows"] is True
+
+        paused_again = client.post(
+            "/api/v1/devices/me/presence",
+            headers=auth(desktop["access_token"]),
+            json={
+                "session_state": "unlocked",
+                "notification_pause_until": pause_until.isoformat(),
+            },
+        )
+        assert paused_again.status_code == 200, paused_again.text
+        assert paused_again.json()["any_unlocked_windows"] is True
+        assert paused_again.json()["any_unlocked_unpaused_windows"] is False
+        event = websocket.receive_json()
+        assert event["device_session_state"] == "unlocked"
+        assert event["any_unlocked_unpaused_windows"] is False
+
         locked = client.post(
             "/api/v1/devices/me/presence",
             headers=auth(desktop["access_token"]),
@@ -381,6 +411,7 @@ def test_windows_presence_summary_and_android_realtime_invalidation(tmp_path):
         )
         assert locked.status_code == 200, locked.text
         assert locked.json()["any_unlocked_windows"] is False
+        assert locked.json()["any_unlocked_unpaused_windows"] is False
         event = websocket.receive_json()
         assert event["event_type"] == "device.presence_changed"
         assert event["device_session_state"] == "locked"

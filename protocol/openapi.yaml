@@ -385,10 +385,13 @@ components:
           format: date-time
     DevicePresenceSummary:
       type: object
-      required: [any_unlocked_windows, registered_windows, fresh_windows, evaluated_at, stale_after_seconds, windows_devices]
+      required: [any_unlocked_windows, any_unlocked_unpaused_windows, registered_windows, fresh_windows, evaluated_at, stale_after_seconds, windows_devices]
       properties:
         any_unlocked_windows:
           type: boolean
+        any_unlocked_unpaused_windows:
+          type: boolean
+          description: True when at least one fresh Windows device is unlocked and has not paused notifications.
         registered_windows:
           type: integer
           minimum: 0

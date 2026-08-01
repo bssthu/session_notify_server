@@ -114,6 +114,9 @@
     },
     "any_unlocked_windows": {
       "type": ["boolean", "null"]
+    },
+    "any_unlocked_unpaused_windows": {
+      "type": ["boolean", "null"]
     }
   },
   "additionalProperties": false,

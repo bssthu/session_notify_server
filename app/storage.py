@@ -514,7 +514,7 @@ class Storage:
         notification_pause_until: datetime | None,
         stale_after: timedelta,
     ) -> tuple[DevicePublic, bool]:
-        """Store a Windows heartbeat and indicate whether effective presence changed."""
+        """Store a Windows heartbeat and indicate whether effective availability changed."""
         now = utc_now()
         stale_before = now - stale_after
         with self._lock, self._conn:
@@ -538,6 +538,13 @@ class Storage:
                 previous_state
                 if previous_updated_at is not None and previous_updated_at >= stale_before
                 else DeviceSessionState.unknown
+            )
+            previous_pause_until = _parse_dt(row["notification_pause_until"])
+            previous_pause_active = (
+                previous_pause_until is not None and previous_pause_until > now
+            )
+            next_pause_active = (
+                notification_pause_until is not None and notification_pause_until > now
             )
             self._conn.execute(
                 """
@@ -563,7 +570,16 @@ class Storage:
                 """,
                 (device_id,),
             ).fetchone()
-        return self._device_from_row(row), previous_effective is not session_state
+        pause_availability_changed = (
+            previous_pause_active != next_pause_active
+            # Expired deadlines no longer count as active in the summary, but clearing
+            # the stored value is still the first opportunity to wake Android clients
+            # after the deadline passed (there is no server-side expiry timer).
+            or (previous_pause_until is not None and not next_pause_active)
+        )
+        return self._device_from_row(row), (
+            previous_effective is not session_state or pause_availability_changed
+        )
 
     def device_presence_summary(
         self,
@@ -576,7 +592,7 @@ class Storage:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, name, session_state, session_state_updated_at
+                SELECT id, name, notification_pause_until, session_state, session_state_updated_at
                 FROM devices
                 WHERE platform = ? AND revoked_at IS NULL
                 ORDER BY created_at ASC
@@ -587,6 +603,7 @@ class Storage:
         windows_devices: list[WindowsDevicePresence] = []
         fresh_windows = 0
         any_unlocked = False
+        any_unlocked_unpaused = False
         for row in rows:
             reported = DeviceSessionState(row["session_state"] or DeviceSessionState.unknown.value)
             updated_at = _parse_dt(row["session_state_updated_at"])
@@ -596,6 +613,9 @@ class Storage:
                 fresh_windows += 1
             if effective is DeviceSessionState.unlocked:
                 any_unlocked = True
+                pause_until = _parse_dt(row["notification_pause_until"])
+                if pause_until is None or pause_until <= evaluated_at:
+                    any_unlocked_unpaused = True
             windows_devices.append(
                 WindowsDevicePresence(
                     device_id=row["id"],
@@ -607,6 +627,7 @@ class Storage:
             )
         return DevicePresenceSummary(
             any_unlocked_windows=any_unlocked,
+            any_unlocked_unpaused_windows=any_unlocked_unpaused,
             registered_windows=len(windows_devices),
             fresh_windows=fresh_windows,
             evaluated_at=evaluated_at,

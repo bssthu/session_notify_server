@@ -32,6 +32,7 @@ uv run pytest
 - refresh token 换取/轮换 access token。
 - 通知创建、拉取、确认和过期；历史查询支持可见性/状态过滤、总数统计与游标分页，查询范围在服务端硬限制为最近 30 天。
 - WebSocket 推送 `notification.created` / `notification.acknowledged`，支持 query token 和 `Authorization` header。
+- 汇总 Windows 锁屏与通知暂停状态；Android 可按“未锁屏且未暂停”的电脑可用性决定是否展示提醒。
 - 幂等 ack：任一设备确认后，通知状态以服务端为准。
 - Codex / Claude Code hook payload 到统一通知的基础映射。
 - SQLite + WAL 本地存储。

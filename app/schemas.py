@@ -100,6 +100,7 @@ class WindowsDevicePresence(BaseModel):
 
 class DevicePresenceSummary(BaseModel):
     any_unlocked_windows: bool
+    any_unlocked_unpaused_windows: bool
     registered_windows: int
     fresh_windows: int
     evaluated_at: datetime
@@ -227,6 +228,7 @@ class SyncEvent(BaseModel):
     device_session_state: DeviceSessionState | None = None
     device_session_state_updated_at: datetime | None = None
     any_unlocked_windows: bool | None = None
+    any_unlocked_unpaused_windows: bool | None = None
 
 
 class EventsResponse(BaseModel):

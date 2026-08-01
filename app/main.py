@@ -388,7 +388,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         device: DevicePublic = Depends(current_device),
     ) -> DevicePresenceSummary:
         try:
-            updated, effective_changed = storage.update_device_session_state(
+            updated, availability_changed = storage.update_device_session_state(
                 device.id,
                 request.session_state,
                 notification_pause_until=request.notification_pause_until,
@@ -400,7 +400,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error)) from None
 
         summary = storage.device_presence_summary(DEVICE_PRESENCE_TTL)
-        if effective_changed:
+        if availability_changed:
             event = SyncEvent(
                 event_id=new_id(),
                 event_type=EventType.device_presence_changed,
@@ -410,6 +410,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 device_session_state=updated.session_state,
                 device_session_state_updated_at=updated.session_state_updated_at,
                 any_unlocked_windows=summary.any_unlocked_windows,
+                any_unlocked_unpaused_windows=summary.any_unlocked_unpaused_windows,
             )
             await hub.broadcast(event, lambda _event, device_id: storage.is_android_device(device_id))
         return summary
