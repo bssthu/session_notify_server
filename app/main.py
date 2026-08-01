@@ -391,6 +391,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             updated, effective_changed = storage.update_device_session_state(
                 device.id,
                 request.session_state,
+                notification_pause_until=request.notification_pause_until,
                 stale_after=DEVICE_PRESENCE_TTL,
             )
         except KeyError:

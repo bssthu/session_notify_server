@@ -68,6 +68,7 @@ class DevicePublic(BaseModel):
     last_seen_at: datetime | None = None
     revoked_at: datetime | None = None
     notifications_enabled: bool = True
+    notification_pause_until: datetime | None = None
     session_state: DeviceSessionState = DeviceSessionState.unknown
     session_state_updated_at: datetime | None = None
 
@@ -79,6 +80,14 @@ class DeviceUpdateRequest(BaseModel):
 
 class DevicePresenceUpdateRequest(BaseModel):
     session_state: DeviceSessionState
+    notification_pause_until: datetime | None = None
+
+    @field_validator("notification_pause_until")
+    @classmethod
+    def validate_notification_pause_until(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("notification_pause_until must include a timezone")
+        return value.astimezone(timezone.utc) if value is not None else None
 
 
 class WindowsDevicePresence(BaseModel):

@@ -363,6 +363,9 @@ components:
         session_state:
           type: string
           enum: [unknown, locked, unlocked]
+        notification_pause_until:
+          type: [string, "null"]
+          format: date-time
     WindowsDevicePresence:
       type: object
       required: [device_id, device_name, reported_session_state, effective_session_state]
@@ -447,7 +450,7 @@ components:
           enum: [windows, android]
     Device:
       type: object
-      required: [id, name, platform, created_at, notifications_enabled, session_state]
+      required: [id, name, platform, created_at, notifications_enabled, notification_pause_until, session_state]
       properties:
         id:
           type: string
@@ -467,6 +470,9 @@ components:
           format: date-time
         notifications_enabled:
           type: boolean
+        notification_pause_until:
+          type: [string, "null"]
+          format: date-time
         session_state:
           type: string
           enum: [unknown, locked, unlocked]

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from fastapi.testclient import TestClient
 
@@ -346,11 +346,15 @@ def test_windows_presence_summary_and_android_realtime_invalidation(tmp_path):
     assert initial.json()["fresh_windows"] == 0
     assert initial.json()["windows_devices"][0]["effective_session_state"] == "unknown"
 
+    pause_until = utc_now() + timedelta(hours=1)
     with client.websocket_connect(f"/api/v1/ws?token={phone['access_token']}") as websocket:
         unlocked = client.post(
             "/api/v1/devices/me/presence",
             headers=auth(desktop["access_token"]),
-            json={"session_state": "unlocked"},
+            json={
+                "session_state": "unlocked",
+                "notification_pause_until": pause_until.isoformat(),
+            },
         )
         assert unlocked.status_code == 200, unlocked.text
         assert unlocked.json()["any_unlocked_windows"] is True
@@ -361,16 +365,34 @@ def test_windows_presence_summary_and_android_realtime_invalidation(tmp_path):
         assert event["device_session_state"] == "unlocked"
         assert event["any_unlocked_windows"] is True
 
+        devices = client.get(
+            "/api/v1/devices",
+            headers=auth(phone["access_token"]),
+        )
+        desktop_state = next(
+            item for item in devices.json() if item["id"] == desktop["device"]["id"]
+        )
+        assert datetime.fromisoformat(desktop_state["notification_pause_until"]) == pause_until
+
         locked = client.post(
             "/api/v1/devices/me/presence",
             headers=auth(desktop["access_token"]),
-            json={"session_state": "locked"},
+            json={"session_state": "locked", "notification_pause_until": None},
         )
         assert locked.status_code == 200, locked.text
         assert locked.json()["any_unlocked_windows"] is False
         event = websocket.receive_json()
         assert event["event_type"] == "device.presence_changed"
         assert event["device_session_state"] == "locked"
+
+        devices = client.get(
+            "/api/v1/devices",
+            headers=auth(phone["access_token"]),
+        )
+        desktop_state = next(
+            item for item in devices.json() if item["id"] == desktop["device"]["id"]
+        )
+        assert desktop_state["notification_pause_until"] is None
 
 
 def test_presence_expires_and_android_cannot_report_windows_state(tmp_path):

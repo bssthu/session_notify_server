@@ -219,6 +219,7 @@ class Storage:
                     last_seen_at TEXT,
                     revoked_at TEXT,
                     notifications_enabled INTEGER NOT NULL DEFAULT 1,
+                    notification_pause_until TEXT,
                     session_state TEXT NOT NULL DEFAULT 'unknown',
                     session_state_updated_at TEXT,
                     access_expires_at TEXT,
@@ -285,6 +286,7 @@ class Storage:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(devices)").fetchall()}
         additions = {
             "notifications_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "notification_pause_until": "TEXT",
             "session_state": "TEXT NOT NULL DEFAULT 'unknown'",
             "session_state_updated_at": "TEXT",
             "access_expires_at": "TEXT",
@@ -376,7 +378,8 @@ class Storage:
                 UPDATE devices
                 SET name = ?, platform = ?, refresh_token_hash = ?, access_token_hash = ?,
                     access_expires_at = ?, refresh_expires_at = ?, last_seen_at = ?,
-                    session_state = 'unknown', session_state_updated_at = NULL
+                    session_state = 'unknown', session_state_updated_at = NULL,
+                    notification_pause_until = NULL
                 WHERE id = ?
                 """,
                 (name, platform.value, sha256_text(new_refresh), sha256_text(new_access),
@@ -411,7 +414,7 @@ class Storage:
             rows = self._conn.execute(
                 """
                 SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
-                       session_state, session_state_updated_at
+                       notification_pause_until, session_state, session_state_updated_at
                 FROM devices
                 WHERE revoked_at IS NULL
                 ORDER BY created_at ASC
@@ -442,7 +445,7 @@ class Storage:
             row = self._conn.execute(
                 """
                 SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
-                       session_state, session_state_updated_at
+                       notification_pause_until, session_state, session_state_updated_at
                 FROM devices
                 WHERE id = ? AND revoked_at IS NULL
                 """,
@@ -458,7 +461,7 @@ class Storage:
                 row = self._conn.execute(
                     """
                     SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
-                           session_state, session_state_updated_at
+                           notification_pause_until, session_state, session_state_updated_at
                     FROM devices
                     WHERE id = ?
                     """,
@@ -472,7 +475,7 @@ class Storage:
             row = self._conn.execute(
                 """
                 SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
-                       session_state, session_state_updated_at
+                       notification_pause_until, session_state, session_state_updated_at
                 FROM devices
                 WHERE id = ?
                 """,
@@ -487,7 +490,7 @@ class Storage:
             row = self._conn.execute(
                 """
                 SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
-                       session_state, session_state_updated_at
+                       notification_pause_until, session_state, session_state_updated_at
                 FROM devices
                 WHERE id = ?
                 """,
@@ -508,6 +511,7 @@ class Storage:
         device_id: str,
         session_state: DeviceSessionState,
         *,
+        notification_pause_until: datetime | None,
         stale_after: timedelta,
     ) -> tuple[DevicePublic, bool]:
         """Store a Windows heartbeat and indicate whether effective presence changed."""
@@ -517,7 +521,7 @@ class Storage:
             row = self._conn.execute(
                 """
                 SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
-                       session_state, session_state_updated_at
+                       notification_pause_until, session_state, session_state_updated_at
                 FROM devices
                 WHERE id = ? AND revoked_at IS NULL
                 """,
@@ -538,15 +542,22 @@ class Storage:
             self._conn.execute(
                 """
                 UPDATE devices
-                SET session_state = ?, session_state_updated_at = ?
+                SET session_state = ?, session_state_updated_at = ?, notification_pause_until = ?
                 WHERE id = ?
                 """,
-                (session_state.value, _dt(now), device_id),
+                (
+                    session_state.value,
+                    _dt(now),
+                    _dt(notification_pause_until)
+                    if notification_pause_until is not None and notification_pause_until > now
+                    else None,
+                    device_id,
+                ),
             )
             row = self._conn.execute(
                 """
                 SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
-                       session_state, session_state_updated_at
+                       notification_pause_until, session_state, session_state_updated_at
                 FROM devices
                 WHERE id = ?
                 """,
@@ -723,7 +734,7 @@ class Storage:
             row = self._conn.execute(
                 """
                 SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
-                       session_state, session_state_updated_at
+                       notification_pause_until, session_state, session_state_updated_at
                 FROM devices
                 WHERE access_token_hash = ? AND revoked_at IS NULL
                   AND (access_expires_at IS NULL OR access_expires_at > ?)
@@ -747,7 +758,7 @@ class Storage:
             row = self._conn.execute(
                 """
                 SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
-                       session_state, session_state_updated_at
+                       notification_pause_until, session_state, session_state_updated_at
                 FROM devices
                 WHERE refresh_token_hash = ? AND revoked_at IS NULL
                   AND (refresh_expires_at IS NULL OR refresh_expires_at > ?)
@@ -1349,6 +1360,7 @@ class Storage:
             last_seen_at=last_seen_at or _parse_dt(row["last_seen_at"]),
             revoked_at=_parse_dt(row["revoked_at"]),
             notifications_enabled=bool(row["notifications_enabled"]),
+            notification_pause_until=_parse_dt(row["notification_pause_until"]),
             session_state=DeviceSessionState(row["session_state"] or DeviceSessionState.unknown.value),
             session_state_updated_at=_parse_dt(row["session_state_updated_at"]),
         )
