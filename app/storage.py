@@ -97,11 +97,15 @@ def _notification_visible_for_history(
         return 1
     raw = metadata.get("raw")
     if is_noise_hook_event(
+        source=source_lower,
         event_name=event_name or raw_event_type,
         notification_type=" ".join((notification_type, raw_event_type)),
         hook_status=hook_status,
         title=title_lower,
         body_generated=_metadata_bool(metadata, "body_generated", "bodyGenerated"),
+        cwd=str(metadata.get("cwd") or ""),
+        transcript_path=str(metadata.get("transcript_path") or metadata.get("transcriptPath") or ""),
+        permission_mode=str(metadata.get("permission_mode") or metadata.get("permissionMode") or ""),
         raw=raw if isinstance(raw, dict) else None,
     ):
         return 0
@@ -1260,7 +1264,7 @@ class Storage:
         events: list[SyncEvent] = []
         with self._lock, self._conn:
             rows = self._conn.execute(
-                "SELECT id, title, metadata FROM notifications WHERE status = ?",
+                "SELECT id, source, title, metadata FROM notifications WHERE status = ?",
                 (NotificationStatus.active.value,),
             ).fetchall()
             for row in rows:
@@ -1278,11 +1282,15 @@ class Storage:
                     continue
                 raw = metadata.get("raw")
                 if not is_noise_hook_event(
+                    source=str(row["source"] or "").lower(),
                     event_name=event_name,
                     notification_type=str(metadata.get("notification_type") or "").lower(),
                     hook_status=str(metadata.get("hook_status") or "").lower(),
                     title=title_lower,
                     body_generated=str(metadata.get("body_generated") or "").lower() == "true",
+                    cwd=str(metadata.get("cwd") or ""),
+                    transcript_path=str(metadata.get("transcript_path") or metadata.get("transcriptPath") or ""),
+                    permission_mode=str(metadata.get("permission_mode") or metadata.get("permissionMode") or ""),
                     raw=raw if isinstance(raw, dict) else None,
                 ):
                     continue

@@ -28,13 +28,55 @@ def _nonempty_list(value: object) -> bool:
     return isinstance(value, list) and len(value) > 0
 
 
+def _raw_text(raw: dict[str, Any] | None, *keys: str) -> str:
+    if not raw:
+        return ""
+    for key in keys:
+        value = raw.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _is_internal_codex_memory_consolidation(
+    *,
+    source: str,
+    event_name: str,
+    hook_status: str,
+    cwd: str,
+    transcript_path: str,
+    permission_mode: str,
+    raw: dict[str, Any] | None,
+) -> bool:
+    """Match Codex's transcript-less background memory consolidation session."""
+    if source.lower() != "codex" or event_name != "stop" or hook_status != "completed":
+        return False
+
+    resolved_cwd = cwd or _raw_text(raw, "cwd", "working_directory", "workingDirectory")
+    normalized_cwd = resolved_cwd.replace("\\", "/").rstrip("/").lower()
+    if not normalized_cwd.endswith("/.codex/memories"):
+        return False
+
+    resolved_transcript = transcript_path or _raw_text(raw, "transcript_path", "transcriptPath")
+    if resolved_transcript.strip():
+        return False
+
+    resolved_mode = permission_mode or _raw_text(raw, "permission_mode", "permissionMode")
+    normalized_mode = re.sub(r"[^a-z]", "", resolved_mode.lower())
+    return normalized_mode == "bypasspermissions"
+
+
 def is_noise_hook_event(
     *,
+    source: str = "",
     event_name: str,
     notification_type: str,
     hook_status: str,
     title: str,
     body_generated: bool,
+    cwd: str = "",
+    transcript_path: str = "",
+    permission_mode: str = "",
     raw: dict[str, Any] | None = None,
 ) -> bool:
     """这组 hook 字段是否属于噪声(不该创建/保留为可见通知)。
@@ -44,6 +86,17 @@ def is_noise_hook_event(
     """
     # 1. PostToolUse:纯传输信号(用于 resolve 权限请求),不弹给用户。
     if event_name == "posttooluse":
+        return True
+
+    if _is_internal_codex_memory_consolidation(
+        source=source,
+        event_name=event_name,
+        hook_status=hook_status,
+        cwd=cwd,
+        transcript_path=transcript_path,
+        permission_mode=permission_mode,
+        raw=raw,
+    ):
         return True
 
     text = " ".join((event_name, notification_type, hook_status, title))

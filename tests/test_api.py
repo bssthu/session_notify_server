@@ -1283,6 +1283,43 @@ def test_receive_hook_suppresses_noise_but_keeps_value(tmp_path):
     assert titles == ["claude completed", "claude needs attention", "claude needs confirmation"]
 
 
+def test_receive_hook_suppresses_internal_codex_memory_consolidation_only(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+    consolidation = {
+        "hook_event_name": "Stop",
+        "event_type": "completed",
+        "hook_status": "completed",
+        "message": "Consolidation complete.",
+        "session_id": "s-memory-consolidation",
+        "cwd": r"C:\Users\tester\.codex\memories",
+        "permission_mode": "bypassPermissions",
+        "metadata": {
+            "raw": {
+                "cwd": r"C:\Users\tester\.codex\memories",
+                "permission_mode": "bypassPermissions",
+                "transcript_path": None,
+            }
+        },
+    }
+
+    hidden = client.post("/api/v1/hooks/codex", headers=auth(token), json=consolidation)
+    assert hidden.status_code == 200, hidden.text
+    assert hidden.json() is None
+
+    interactive = {
+        **consolidation,
+        "session_id": "s-interactive-memory-work",
+        "transcript_path": r"C:\Users\tester\.codex\sessions\interactive.jsonl",
+    }
+    kept = client.post("/api/v1/hooks/codex", headers=auth(token), json=interactive)
+    assert kept.status_code == 200, kept.text
+    assert kept.json()["title"] == "codex completed"
+
+    active = client.get("/api/v1/notifications", headers=auth(token)).json()
+    assert [item["session_id"] for item in active] == ["s-interactive-memory-work"]
+
+
 def test_lifespan_cleans_legacy_noise_notifications(tmp_path):
     from app.storage import Storage
     from app.schemas import EventType, NotificationCreate, NotificationLevel, NotificationStatus
@@ -1307,6 +1344,18 @@ def test_lifespan_cleans_legacy_noise_notifications(tmp_path):
         body="Session event received.", level=NotificationLevel.important,
         expires_at=utc_now() + timedelta(hours=24),
         metadata={"hook_event_name": "Notification", "notification_type": "idle_prompt", "body_generated": True},
+    ))
+    consolidation, _ = storage.create_notification(NotificationCreate(
+        source="codex", session_id="s-memory-consolidation", title="codex completed",
+        body="Consolidation complete.", level=NotificationLevel.success,
+        expires_at=utc_now() + timedelta(hours=24),
+        metadata={
+            "hook_event_name": "Stop",
+            "hook_status": "completed",
+            "body_generated": False,
+            "cwd": r"C:\Users\tester\.codex\memories",
+            "permission_mode": "bypassPermissions",
+        },
     ))
     # failure 类 hook 通知:有价值,两个迁移都不应动它
     fail, _ = storage.create_notification(NotificationCreate(
@@ -1333,19 +1382,20 @@ def test_lifespan_cleans_legacy_noise_notifications(tmp_path):
     assert posttooluse.id not in active_ids
     assert completed.id not in active_ids
     assert idle.id not in active_ids
+    assert consolidation.id not in active_ids
     assert fail.id in active_ids
     assert user_notif.id in active_ids
 
     storage = Storage(db_path)
     acked_ids = {n.id for n in storage.list_notifications([NotificationStatus.acknowledged])}
-    assert {posttooluse.id, completed.id, idle.id} <= acked_ids
+    assert {posttooluse.id, completed.id, idle.id, consolidation.id} <= acked_ids
     cleanup_events = [
         e for e in storage.events_after(None)
         if e.event_type == EventType.notification_acknowledged
-        and e.notification_id in {posttooluse.id, completed.id, idle.id}
+        and e.notification_id in {posttooluse.id, completed.id, idle.id, consolidation.id}
         and e.reason == "migration_cleanup"
     ]
-    assert len(cleanup_events) == 3
+    assert len(cleanup_events) == 4
     storage.close()
 
 

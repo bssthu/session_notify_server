@@ -220,11 +220,15 @@ def _should_suppress_hook_notification(
     if not is_hook_source:
         return False
     return is_noise_hook_event(
+        source=source_lower,
         event_name=(payload.hook_event_name or payload.event_type or "").lower(),
         notification_type=(payload.notification_type or "").lower(),
         hook_status=(payload.hook_status or "").lower(),
         title=(title or "").lower(),
         body_generated=body_generated,
+        cwd=str(payload.cwd or ""),
+        transcript_path=str(payload.transcript_path or ""),
+        permission_mode=_hook_permission_mode(payload),
         raw=_hook_payload_raw(payload),
     )
 
