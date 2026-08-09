@@ -241,6 +241,7 @@ class Storage:
 
                 CREATE TABLE IF NOT EXISTS notifications (
                     id TEXT PRIMARY KEY,
+                    dedupe_key TEXT,
                     source TEXT NOT NULL,
                     session_id TEXT NOT NULL,
                     origin_device_id TEXT,
@@ -285,6 +286,7 @@ class Storage:
             )
             self._ensure_device_columns()
             self._ensure_notification_origin_columns()
+            self._ensure_notification_dedupe_column()
 
     def _ensure_device_columns(self) -> None:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(devices)").fetchall()}
@@ -310,6 +312,17 @@ class Storage:
         for name, definition in additions.items():
             if name not in columns:
                 self._conn.execute(f"ALTER TABLE notifications ADD COLUMN {name} {definition}")
+
+    def _ensure_notification_dedupe_column(self) -> None:
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(notifications)").fetchall()}
+        if "dedupe_key" not in columns:
+            self._conn.execute("ALTER TABLE notifications ADD COLUMN dedupe_key TEXT")
+        # SQLite UNIQUE indexes allow multiple NULL values. Only notifications with an
+        # explicit cross-ingest identity participate in de-duplication.
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe_key "
+            "ON notifications(dedupe_key)"
+        )
 
     def bind_device(self, name: str, platform: DevicePlatform) -> DeviceBindResponse:
         created_at = utc_now()
@@ -810,7 +823,9 @@ class Storage:
         self,
         request: NotificationCreate,
         origin_device: DevicePublic | None = None,
-    ) -> tuple[NotificationPublic, SyncEvent]:
+        *,
+        dedupe_key: str | None = None,
+    ) -> tuple[NotificationPublic, SyncEvent | None]:
         now = utc_now()
         notification = NotificationPublic(
             id=new_id(),
@@ -830,7 +845,27 @@ class Storage:
             metadata=request.metadata,
         )
         with self._lock, self._conn:
-            self._insert_notification(notification)
+            if dedupe_key:
+                existing = self._conn.execute(
+                    "SELECT * FROM notifications WHERE dedupe_key = ?",
+                    (dedupe_key,),
+                ).fetchone()
+                if existing is not None:
+                    return self._merge_duplicate_notification(existing, notification), None
+            try:
+                self._insert_notification(notification, dedupe_key=dedupe_key)
+            except sqlite3.IntegrityError:
+                # A second server process can win the unique-key race after the lookup.
+                # Only recover when this exact de-duplication key now exists.
+                if not dedupe_key:
+                    raise
+                existing = self._conn.execute(
+                    "SELECT * FROM notifications WHERE dedupe_key = ?",
+                    (dedupe_key,),
+                ).fetchone()
+                if existing is None:
+                    raise
+                return self._merge_duplicate_notification(existing, notification), None
             event = self._append_event(
                 SyncEvent(
                     event_id=new_id(),
@@ -840,6 +875,41 @@ class Storage:
                 )
             )
         return notification, event
+
+    def _merge_duplicate_notification(
+        self,
+        existing_row: sqlite3.Row,
+        incoming: NotificationPublic,
+    ) -> NotificationPublic:
+        """Persist diagnostic evidence from both transports without creating a second alert."""
+        existing = self._notification_from_row(existing_row)
+        merged = dict(existing.metadata)
+        incoming_meta = incoming.metadata if isinstance(incoming.metadata, dict) else {}
+        sources = {
+            str(value)
+            for value in (
+                merged.get("ingest_source"),
+                incoming_meta.get("ingest_source"),
+                *(merged.get("ingest_sources") or []),
+                *(incoming_meta.get("ingest_sources") or []),
+            )
+            if value
+        }
+        for key, value in incoming_meta.items():
+            if key not in merged and value is not None:
+                merged[key] = value
+        if sources:
+            merged["ingest_sources"] = sorted(sources)
+        if "app_server" in sources and "hook_bridge" in sources:
+            merged["event_correlation"] = "remote_correlated"
+        if merged != existing.metadata:
+            now = utc_now()
+            self._conn.execute(
+                "UPDATE notifications SET metadata = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(merged, ensure_ascii=False, sort_keys=True), _dt(now), existing.id),
+            )
+            existing = existing.model_copy(update={"metadata": merged, "updated_at": now})
+        return existing
 
     def list_notifications(
         self,
@@ -1317,17 +1387,23 @@ class Storage:
                 )
         return events
 
-    def _insert_notification(self, notification: NotificationPublic) -> None:
+    def _insert_notification(
+        self,
+        notification: NotificationPublic,
+        *,
+        dedupe_key: str | None = None,
+    ) -> None:
         self._conn.execute(
             """
             INSERT INTO notifications (
-                id, source, session_id, origin_device_id, origin_device_name,
+                id, dedupe_key, source, session_id, origin_device_id, origin_device_name,
                 origin_device_platform, title, body, level, status,
                 created_at, updated_at, expires_at, requires_ack, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 notification.id,
+                dedupe_key,
                 notification.source,
                 notification.session_id,
                 notification.origin_device_id,

@@ -761,6 +761,95 @@ def _hook_payload(
     return payload
 
 
+def _codex_terminal_failure_payload(
+    *,
+    session_id: str,
+    turn_id: str,
+    ingest_source: str,
+):
+    is_app_server = ingest_source == "app_server"
+    return {
+        "event_type": "terminal_failure" if is_app_server else "failed",
+        "hook_event_name": "turn/completed" if is_app_server else "Stop",
+        "hook_status": "failed",
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "message": "stream disconnected before completion",
+        "metadata": {
+            "ingest_source": ingest_source,
+            "event_correlation": "remote_correlated" if is_app_server else "hook_only",
+            "app_server_port": 4500 if is_app_server else None,
+        },
+    }
+
+
+def test_codex_terminal_failure_is_deduplicated_across_app_server_and_hook(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    app_server = client.post(
+        "/api/v1/hooks/codex",
+        headers=auth(token),
+        json=_codex_terminal_failure_payload(
+            session_id="thread-dedupe",
+            turn_id="turn-dedupe",
+            ingest_source="app_server",
+        ),
+    )
+    hook = client.post(
+        "/api/v1/hooks/codex",
+        headers=auth(token),
+        json=_codex_terminal_failure_payload(
+            session_id="thread-dedupe",
+            turn_id="turn-dedupe",
+            ingest_source="hook_bridge",
+        ),
+    )
+
+    assert app_server.status_code == 200, app_server.text
+    assert hook.status_code == 200, hook.text
+    assert hook.json()["id"] == app_server.json()["id"]
+    assert hook.json()["metadata"]["ingest_sources"] == ["app_server", "hook_bridge"]
+    assert hook.json()["metadata"]["event_correlation"] == "remote_correlated"
+
+    created = [
+        event
+        for event in client.get("/api/v1/events", headers=auth(token)).json()["events"]
+        if event["event_type"] == "notification.created"
+    ]
+    assert len(created) == 1
+
+
+def test_codex_terminal_failure_dedupe_survives_server_restart(tmp_path):
+    db_path = tmp_path / "server.db"
+    first_client = TestClient(create_app(db_path))
+    token = bind(first_client)
+    first = first_client.post(
+        "/api/v1/hooks/codex",
+        headers=auth(token),
+        json=_codex_terminal_failure_payload(
+            session_id="thread-restart",
+            turn_id="turn-restart",
+            ingest_source="hook_bridge",
+        ),
+    )
+    assert first.status_code == 200, first.text
+
+    second_client = TestClient(create_app(db_path))
+    duplicate = second_client.post(
+        "/api/v1/hooks/codex",
+        headers=auth(token),
+        json=_codex_terminal_failure_payload(
+            session_id="thread-restart",
+            turn_id="turn-restart",
+            ingest_source="app_server",
+        ),
+    )
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["id"] == first.json()["id"]
+    assert duplicate.json()["metadata"]["ingest_sources"] == ["app_server", "hook_bridge"]
+
+
 def test_posttooluse_resolves_matching_permission_request(tmp_path):
     client = TestClient(create_app(tmp_path / "server.db"))
     token = bind(client)

@@ -152,6 +152,27 @@ def _hook_metadata(payload: HookPayload, body_generated: bool) -> dict[str, obje
     return {key: value for key, value in metadata.items() if value is not None}
 
 
+def _terminal_failure_dedupe_key(
+    source: str,
+    payload: HookPayload,
+    metadata: dict[str, object],
+    title: str,
+) -> str | None:
+    if source.lower() != "codex" or title.lower() != "codex needs attention":
+        return None
+    session_id = str(payload.session_id or "").strip()
+    turn_id = str(metadata.get("turn_id") or "").strip()
+    if not session_id or not turn_id:
+        return None
+    metadata["event_family"] = "terminal_failure"
+    metadata.setdefault("event_correlation", "hook_only")
+    return json.dumps(
+        ["codex", session_id, turn_id, "terminal_failure"],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 def _resolve_hook_notification(source: str, payload: HookPayload) -> tuple[NotificationLevel, str]:
     event_type = (payload.event_type or payload.hook_event_name or "").lower()
     notification_type = (payload.notification_type or "").lower()
@@ -464,6 +485,8 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         level, title = _resolve_hook_notification(source, payload)
         body, body_generated = _resolve_hook_body(payload)
         hook_meta = _hook_metadata(payload, body_generated)
+        hook_meta.setdefault("ingest_source", "hook_bridge")
+        dedupe_key = _terminal_failure_dedupe_key(source, payload, hook_meta, title)
         # 信号/噪声类 hook(PostToolUse/idle/paused/无内容 completed)不创建可见通知,从源头
         # 避免 active 堆积。resolve/ack 副作用与 suppress 无关,照常执行。
         suppress = _should_suppress_hook_notification(source, payload, body_generated, title)
@@ -480,8 +503,13 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 expires_at=utc_now() + permission_ttl,
                 metadata=hook_meta,
             )
-            notification, event = storage.create_notification(request, origin_device=device)
-            await hub.broadcast(event, storage.should_deliver_event_to_device)
+            notification, event = storage.create_notification(
+                request,
+                origin_device=device,
+                dedupe_key=dedupe_key,
+            )
+            if event is not None:
+                await hub.broadcast(event, storage.should_deliver_event_to_device)
         # 工具执行完成(PostToolUse)可作为审批已通过的尽力清理信号:按基础键 + turn_id
         # 仅 resolve 唯一匹配的活跃 permission request；歧义时保持 active，交给会话结束
         # 或 TTL 兜底。PostToolUse 本身被 suppress(不创建通知),但此副作用必须保留。
