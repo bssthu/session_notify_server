@@ -688,6 +688,7 @@ def test_official_hook_event_mapping(tmp_path):
             "last_assistant_message": "Refactor finished.",
             "session_id": "s-stop",
             "cwd": "I:/Projects/session_notify",
+            "metadata": {"tag": "auto"},
         },
     )
     assert completed.status_code == 200, completed.text
@@ -696,6 +697,7 @@ def test_official_hook_event_mapping(tmp_path):
     assert completed.json()["body"] == "Refactor finished."
     assert completed.json()["metadata"]["hook_event_name"] == "Stop"
     assert completed.json()["metadata"]["cwd"] == "I:/Projects/session_notify"
+    assert completed.json()["metadata"]["tag"] == "auto"
     assert completed.json()["metadata"]["body_generated"] is False
 
     generic_completed = client.post(
