@@ -235,6 +235,34 @@ paths:
           schema:
             type: boolean
             default: false
+        - name: machine
+          in: query
+          required: false
+          description: Case-insensitive literal substring matched against origin device name or ID.
+          schema:
+            type: string
+            maxLength: 120
+        - name: agent
+          in: query
+          required: false
+          description: Case-insensitive literal substring matched against notification source.
+          schema:
+            type: string
+            maxLength: 40
+        - name: tag
+          in: query
+          required: false
+          description: Case-insensitive literal substring matched against the notification tag metadata.
+          schema:
+            type: string
+            maxLength: 120
+        - name: q
+          in: query
+          required: false
+          description: Case-insensitive literal substring matched across title, body, session, source, machine, and tag.
+          schema:
+            type: string
+            maxLength: 160
       responses:
         "200":
           description: A page of recent notifications.
@@ -541,9 +569,43 @@ components:
             updated_at:
               type: string
               format: date-time
+    NotificationHistoryMachineOption:
+      type: object
+      required: [name]
+      properties:
+        id:
+          type: [string, "null"]
+          maxLength: 120
+        name:
+          type: string
+          maxLength: 120
+    NotificationHistoryFilterOptions:
+      type: object
+      required: [machines, agents, tags, truncated]
+      properties:
+        machines:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/NotificationHistoryMachineOption"
+        agents:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+            maxLength: 40
+        tags:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+            maxLength: 120
+        truncated:
+          type: boolean
+          description: True when at least one candidate list exceeded its server-side limit; free-text filtering remains available.
     NotificationPage:
       type: object
-      required: [items, has_more, requested_days, effective_days, limit, total_count, total_pages]
+      required: [items, has_more, requested_days, effective_days, limit, total_count, total_pages, filter_options]
       properties:
         items:
           type: array
@@ -567,6 +629,9 @@ components:
         total_pages:
           type: integer
           minimum: 0
+        filter_options:
+          description: Candidate values from the current days, status, and visibility scope; independent of machine, agent, tag, and q filters.
+          $ref: "#/components/schemas/NotificationHistoryFilterOptions"
     AckRequest:
       type: object
       properties:

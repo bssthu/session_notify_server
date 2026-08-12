@@ -567,6 +567,10 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         cursor: str | None = Query(default=None, min_length=1, max_length=1024),
         visible_only: bool = Query(default=True),
         suppress_codex_permission_requests: bool = Query(default=False),
+        machine: str | None = Query(default=None, max_length=120),
+        agent: str | None = Query(default=None, max_length=40),
+        tag: str | None = Query(default=None, max_length=120),
+        q: str | None = Query(default=None, max_length=160),
         device: DevicePublic = Depends(current_device),
     ) -> NotificationPage:
         effective_days = min(days, NOTIFICATION_HISTORY_MAX_DAYS)
@@ -584,7 +588,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         before_id: str | None = None
         if cursor:
             before_created_at, before_id = _decode_notification_cursor(cursor)
-        items, has_more, total_count = storage.list_recent_notifications(
+        items, has_more, total_count, filter_options = storage.list_recent_notifications(
             statuses=status_filter,
             created_since=utc_now() - timedelta(days=effective_days),
             limit=limit,
@@ -592,6 +596,10 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             before_id=before_id,
             visible_only=visible_only,
             suppress_codex_permission_requests=suppress_codex_permission_requests,
+            machine=machine,
+            agent=agent,
+            tag=tag,
+            query_text=q,
         )
         next_cursor = _encode_notification_cursor(items[-1]) if has_more and items else None
         return NotificationPage(
@@ -603,6 +611,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             limit=limit,
             total_count=total_count,
             total_pages=math.ceil(total_count / limit),
+            filter_options=filter_options,
         )
 
     @app.post("/api/v1/notifications/{notification_id}/ack", response_model=AckResponse)

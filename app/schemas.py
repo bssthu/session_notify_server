@@ -190,6 +190,18 @@ class NotificationPublic(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class NotificationHistoryMachineOption(BaseModel):
+    id: str | None = None
+    name: str
+
+
+class NotificationHistoryFilterOptions(BaseModel):
+    machines: list[NotificationHistoryMachineOption] = Field(default_factory=list)
+    agents: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    truncated: bool = False
+
+
 class NotificationPage(BaseModel):
     items: list[NotificationPublic]
     next_cursor: str | None = None
@@ -199,6 +211,9 @@ class NotificationPage(BaseModel):
     limit: int
     total_count: int
     total_pages: int
+    filter_options: NotificationHistoryFilterOptions = Field(
+        default_factory=NotificationHistoryFilterOptions
+    )
 
 
 class AckRequest(BaseModel):

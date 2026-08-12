@@ -19,6 +19,8 @@ from .schemas import (
     DeviceSessionState,
     EventType,
     NotificationCreate,
+    NotificationHistoryFilterOptions,
+    NotificationHistoryMachineOption,
     NotificationLevel,
     NotificationPublic,
     NotificationStatus,
@@ -33,6 +35,9 @@ from .security import new_token, sha256_text
 
 # 配对码字符集:去掉易混淆的 I/L/O/U/0/1,生成形如 7Q4K-9XKM 的人类可读码。
 _PAIR_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+_HISTORY_MACHINE_OPTION_LIMIT = 100
+_HISTORY_AGENT_OPTION_LIMIT = 50
+_HISTORY_TAG_OPTION_LIMIT = 100
 
 
 def _dt(value: datetime) -> str:
@@ -121,6 +126,66 @@ def _notification_visible_for_history(
     return 1
 
 
+def _history_option_text(value: object, max_length: int) -> str:
+    raw = ("" if value is None else str(value))[:4096]
+    normalized: list[str] = []
+    pending_space = False
+    for character in raw:
+        code_point = ord(character)
+        unsafe_format = (
+            code_point in (0x00AD, 0x061C, 0x180E, 0xFEFF)
+            or 0x200B <= code_point <= 0x200F
+            or 0x202A <= code_point <= 0x202E
+            or 0x2060 <= code_point <= 0x206F
+        )
+        control = (
+            code_point <= 0x1F
+            or 0x7F <= code_point <= 0x9F
+            or code_point in (0x2028, 0x2029)
+        )
+        if unsafe_format:
+            continue
+        if control or character.isspace():
+            pending_space = bool(normalized)
+            continue
+        if pending_space:
+            normalized.append(" ")
+            pending_space = False
+        normalized.append(character)
+    text = "".join(normalized)
+    if len(text) <= max_length:
+        return text
+    return f"{text[: max_length - 1]}…"
+
+
+def _notification_tag_for_filter(metadata_json: object) -> str:
+    """Return the scalar notification tag used by history text filters."""
+    try:
+        metadata = json.loads(str(metadata_json or "{}"))
+        if not isinstance(metadata, dict):
+            return ""
+    except (TypeError, ValueError):
+        return ""
+    for key in ("tag", "session_notify_tag", "sessionNotifyTag"):
+        value = metadata.get(key)
+        if isinstance(value, str):
+            return _history_option_text(value, 120)
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return _history_option_text(value, 120)
+    return ""
+
+
+def _history_contains_pattern(value: str | None) -> str | None:
+    """Build a literal SQLite LIKE contains-pattern with wildcard escaping."""
+    normalized = str(value or "").strip()
+    if not normalized:
+        return None
+    escaped = normalized.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 # 与客户端 hookResolutionIdentity(notification-logic.js)/rawToolCommand 等价的基础
 # 配对键。turn_id 单独返回给 resolve_pending_permission 做兼容与歧义判断，不能简单
 # 拼接后继续“取最新一条”，否则旧 Bridge/历史通知缺少 turn_id 时无法安全回退。
@@ -200,6 +265,12 @@ class Storage:
             "notification_visible_for_history",
             4,
             _notification_visible_for_history,
+            deterministic=True,
+        )
+        self._conn.create_function(
+            "notification_tag_for_filter",
+            1,
+            _notification_tag_for_filter,
             deterministic=True,
         )
         self._conn.execute("PRAGMA foreign_keys = ON")
@@ -944,7 +1015,11 @@ class Storage:
         before_id: str | None = None,
         visible_only: bool = True,
         suppress_codex_permission_requests: bool = False,
-    ) -> tuple[list[NotificationPublic], bool, int]:
+        machine: str | None = None,
+        agent: str | None = None,
+        tag: str | None = None,
+        query_text: str | None = None,
+    ) -> tuple[list[NotificationPublic], bool, int, NotificationHistoryFilterOptions]:
         """Return one newest-first history page using a stable (created_at, id) cursor."""
         self.expire_due_notifications()
         conditions = ["created_at >= ?"]
@@ -956,6 +1031,44 @@ class Storage:
         if visible_only:
             conditions.append("notification_visible_for_history(source, title, metadata, ?) = 1")
             values.append(1 if suppress_codex_permission_requests else 0)
+        base_conditions = list(conditions)
+        base_values = list(values)
+        machine_pattern = _history_contains_pattern(machine)
+        if machine_pattern is not None:
+            conditions.append(
+                "(COALESCE(origin_device_name, '') LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR COALESCE(origin_device_id, '') LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR origin_device_id IN ("
+                "SELECT id FROM devices WHERE name LIKE ? ESCAPE '\\' COLLATE NOCASE))"
+            )
+            values.extend([machine_pattern, machine_pattern, machine_pattern])
+        agent_pattern = _history_contains_pattern(agent)
+        if agent_pattern is not None:
+            conditions.append("source LIKE ? ESCAPE '\\' COLLATE NOCASE")
+            values.append(agent_pattern)
+        tag_pattern = _history_contains_pattern(tag)
+        if tag_pattern is not None:
+            conditions.append("notification_tag_for_filter(metadata) LIKE ? ESCAPE '\\' COLLATE NOCASE")
+            values.append(tag_pattern)
+        query_pattern = _history_contains_pattern(query_text)
+        if query_pattern is not None:
+            conditions.append(
+                "(title LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR body LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR session_id LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR source LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR COALESCE(origin_device_name, '') LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR COALESCE(origin_device_id, '') LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR origin_device_id IN ("
+                "SELECT id FROM devices WHERE name LIKE ? ESCAPE '\\' COLLATE NOCASE) "
+                "OR notification_tag_for_filter(metadata) LIKE ? ESCAPE '\\' COLLATE NOCASE)"
+            )
+            values.extend([query_pattern] * 8)
+
+        filter_options = self._recent_notification_filter_options(
+            base_conditions,
+            base_values,
+        )
 
         where = f" WHERE {' AND '.join(conditions)}"
         with self._lock:
@@ -979,7 +1092,103 @@ class Storage:
             rows = self._conn.execute(query, page_values).fetchall()
         has_more = len(rows) > limit
         page_rows = rows[:limit]
-        return [self._notification_from_row(row) for row in page_rows], has_more, total_count
+        return (
+            [self._notification_from_row(row) for row in page_rows],
+            has_more,
+            total_count,
+            filter_options,
+        )
+
+    def _recent_notification_filter_options(
+        self,
+        conditions: list[str],
+        values: list[Any],
+    ) -> NotificationHistoryFilterOptions:
+        """Return stable suggestions for the current time/status/visibility scope."""
+        where = f" WHERE {' AND '.join(conditions)}"
+        machine_limit = _HISTORY_MACHINE_OPTION_LIMIT
+        agent_limit = _HISTORY_AGENT_OPTION_LIMIT
+        tag_limit = _HISTORY_TAG_OPTION_LIMIT
+        with self._lock:
+            machine_rows = self._conn.execute(
+                f"""
+                WITH scoped AS (
+                    SELECT origin_device_id, origin_device_name
+                    FROM notifications{where}
+                )
+                SELECT
+                    NULLIF(TRIM(scoped.origin_device_id), '') AS id,
+                    COALESCE(
+                        MAX(NULLIF(TRIM(devices.name), '')),
+                        MAX(NULLIF(TRIM(scoped.origin_device_name), '')),
+                        MAX(NULLIF(TRIM(scoped.origin_device_id), ''))
+                    ) AS name
+                FROM scoped
+                LEFT JOIN devices ON devices.id = scoped.origin_device_id
+                WHERE COALESCE(TRIM(scoped.origin_device_id), '') <> ''
+                   OR COALESCE(TRIM(scoped.origin_device_name), '') <> ''
+                GROUP BY COALESCE(
+                    NULLIF(TRIM(scoped.origin_device_id), ''),
+                    'name:' || LOWER(TRIM(scoped.origin_device_name))
+                )
+                ORDER BY name COLLATE NOCASE, id
+                LIMIT ?
+                """,
+                [*values, machine_limit + 1],
+            ).fetchall()
+            agent_rows = self._conn.execute(
+                f"""
+                SELECT DISTINCT source AS value
+                FROM notifications{where}
+                  AND TRIM(source) <> ''
+                ORDER BY source COLLATE NOCASE
+                LIMIT ?
+                """,
+                [*values, agent_limit + 1],
+            ).fetchall()
+            tag_rows = self._conn.execute(
+                f"""
+                SELECT DISTINCT notification_tag_for_filter(metadata) AS value
+                FROM notifications{where}
+                  AND notification_tag_for_filter(metadata) <> ''
+                ORDER BY value COLLATE NOCASE
+                LIMIT ?
+                """,
+                [*values, tag_limit + 1],
+            ).fetchall()
+
+        machines = [
+            NotificationHistoryMachineOption(
+                id=_history_option_text(row["id"], 120) or None,
+                name=_history_option_text(row["name"], 120),
+            )
+            for row in machine_rows[:machine_limit]
+            if _history_option_text(row["name"], 120)
+        ]
+        agents = list(
+            dict.fromkeys(
+                text
+                for row in agent_rows[:agent_limit]
+                if (text := _history_option_text(row["value"], 40))
+            )
+        )
+        tags = list(
+            dict.fromkeys(
+                text
+                for row in tag_rows[:tag_limit]
+                if (text := _history_option_text(row["value"], 120))
+            )
+        )
+        return NotificationHistoryFilterOptions(
+            machines=machines,
+            agents=agents,
+            tags=tags,
+            truncated=(
+                len(machine_rows) > machine_limit
+                or len(agent_rows) > agent_limit
+                or len(tag_rows) > tag_limit
+            ),
+        )
 
     def acknowledge(
         self,

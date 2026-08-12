@@ -304,6 +304,144 @@ def test_recent_notifications_filter_client_hidden_events_before_counting(tmp_pa
     assert unfiltered.json()["total_pages"] == 2
 
 
+def test_recent_notifications_filter_by_machine_agent_tag_and_keyword(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    workstation = bind_tokens(client, name="WORKSTATION-01", platform="windows")
+    laptop = bind_tokens(client, name="Build-Laptop", platform="windows")
+
+    notifications = [
+        (
+            workstation["access_token"],
+            {
+                "source": "codex",
+                "session_id": "nightly-build",
+                "title": "Build completed",
+                "body": "All verification jobs passed",
+                "metadata": {"tag": "auto nightly"},
+            },
+        ),
+        (
+            laptop["access_token"],
+            {
+                "source": "claude",
+                "session_id": "review-session",
+                "title": "Review requested",
+                "body": "Please inspect the patch",
+                "metadata": {"tag": "manual_review"},
+            },
+        ),
+        (
+            workstation["access_token"],
+            {
+                "source": "codex",
+                "session_id": "literal-tag",
+                "title": "Coverage is complete",
+                "body": "Reached the target",
+                "metadata": {"tag": "100%"},
+            },
+        ),
+    ]
+    for token, payload in notifications:
+        response = client.post(
+            "/api/v1/notifications",
+            headers=auth(token),
+            json=payload,
+        )
+        assert response.status_code == 200, response.text
+
+    options_response = client.get(
+        "/api/v1/notifications/recent",
+        headers=auth(workstation["access_token"]),
+        params={"days": 1, "limit": 20},
+    )
+    assert options_response.status_code == 200, options_response.text
+    filter_options = options_response.json()["filter_options"]
+    assert [item["name"] for item in filter_options["machines"]] == [
+        "Build-Laptop",
+        "WORKSTATION-01",
+    ]
+    assert filter_options["agents"] == ["claude", "codex"]
+    assert filter_options["tags"] == ["100%", "auto nightly", "manual_review"]
+    assert filter_options["truncated"] is False
+
+    renamed = client.patch(
+        f"/api/v1/devices/{workstation['device']['id']}",
+        headers=auth(workstation["access_token"]),
+        json={"name": "Renamed-Workstation"},
+    )
+    assert renamed.status_code == 200, renamed.text
+
+    def titles(**params):
+        response = client.get(
+            "/api/v1/notifications/recent",
+            headers=auth(workstation["access_token"]),
+            params={"days": 1, "limit": 20, **params},
+        )
+        assert response.status_code == 200, response.text
+        page = response.json()
+        assert page["total_count"] == len(page["items"])
+        return [item["title"] for item in page["items"]]
+
+    assert titles(machine="workstation") == ["Coverage is complete", "Build completed"]
+    assert titles(machine="renamed-workstation") == ["Coverage is complete", "Build completed"]
+    assert titles(agent="CLAUDE") == ["Review requested"]
+    assert titles(tag="AUTO") == ["Build completed"]
+    assert titles(q="verification jobs") == ["Build completed"]
+    assert titles(machine="build-lap", agent="claude", tag="review") == ["Review requested"]
+    assert titles(tag="%") == ["Coverage is complete"]
+
+    filtered_options = client.get(
+        "/api/v1/notifications/recent",
+        headers=auth(workstation["access_token"]),
+        params={"days": 1, "limit": 20, "agent": "claude", "tag": "review"},
+    ).json()["filter_options"]
+    assert [item["name"] for item in filtered_options["machines"]] == [
+        "Build-Laptop",
+        "Renamed-Workstation",
+    ]
+    assert filtered_options["agents"] == ["claude", "codex"]
+    assert filtered_options["tags"] == ["100%", "auto nightly", "manual_review"]
+
+
+def test_recent_notification_filter_options_are_bounded_and_safe(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    for index in range(101):
+        tag = f"tag-{index:03d}"
+        if index == 0:
+            tag = f"\u202e{tag}"
+        if index == 1:
+            tag = f"{tag}-{'x' * 200}"
+        if index == 2:
+            tag = 0
+        response = client.post(
+            "/api/v1/notifications",
+            headers=auth(token),
+            json={
+                "source": "codex",
+                "session_id": f"options-{index}",
+                "title": f"Option {index}",
+                "body": "Option list bound test",
+                "metadata": {"tag": tag},
+            },
+        )
+        assert response.status_code == 200, response.text
+
+    response = client.get(
+        "/api/v1/notifications/recent",
+        headers=auth(token),
+        params={"days": 1, "limit": 1},
+    )
+    assert response.status_code == 200, response.text
+    options = response.json()["filter_options"]
+    assert len(options["tags"]) == 100
+    assert options["truncated"] is True
+    assert "tag-000" in options["tags"]
+    assert "0" in options["tags"]
+    assert all("\u202e" not in tag and len(tag) <= 120 for tag in options["tags"])
+
+
 def test_remote_clients_see_notification_origin_device(tmp_path):
     client = TestClient(create_app(tmp_path / "server.db"))
     desktop = bind_tokens(client, name="Desktop", platform="windows")
