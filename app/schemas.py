@@ -81,6 +81,7 @@ class DeviceUpdateRequest(BaseModel):
 class DevicePresenceUpdateRequest(BaseModel):
     session_state: DeviceSessionState
     notification_pause_until: datetime | None = None
+    suppress_codex_permission_requests: bool = False
 
     @field_validator("notification_pause_until")
     @classmethod
@@ -96,6 +97,7 @@ class WindowsDevicePresence(BaseModel):
     reported_session_state: DeviceSessionState
     effective_session_state: DeviceSessionState
     session_state_updated_at: datetime | None = None
+    suppress_codex_permission_requests: bool = False
 
 
 class DevicePresenceSummary(BaseModel):

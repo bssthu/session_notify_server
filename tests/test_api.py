@@ -493,12 +493,16 @@ def test_windows_presence_summary_and_android_realtime_invalidation(tmp_path):
             json={
                 "session_state": "unlocked",
                 "notification_pause_until": pause_until.isoformat(),
+                "suppress_codex_permission_requests": True,
             },
         )
         assert unlocked.status_code == 200, unlocked.text
         assert unlocked.json()["any_unlocked_windows"] is True
         assert unlocked.json()["any_unlocked_unpaused_windows"] is False
         assert unlocked.json()["fresh_windows"] == 1
+        assert unlocked.json()["windows_devices"][0][
+            "suppress_codex_permission_requests"
+        ] is True
         event = websocket.receive_json()
         assert event["event_type"] == "device.presence_changed"
         assert event["device_id"] == desktop["device"]["id"]
@@ -554,6 +558,23 @@ def test_windows_presence_summary_and_android_realtime_invalidation(tmp_path):
         assert event["event_type"] == "device.presence_changed"
         assert event["device_session_state"] == "locked"
 
+        policy_changed = client.post(
+            "/api/v1/devices/me/presence",
+            headers=auth(desktop["access_token"]),
+            json={
+                "session_state": "locked",
+                "notification_pause_until": None,
+                "suppress_codex_permission_requests": True,
+            },
+        )
+        assert policy_changed.status_code == 200, policy_changed.text
+        assert policy_changed.json()["windows_devices"][0][
+            "suppress_codex_permission_requests"
+        ] is True
+        event = websocket.receive_json()
+        assert event["event_type"] == "device.presence_changed"
+        assert event["device_session_state"] == "locked"
+
         devices = client.get(
             "/api/v1/devices",
             headers=auth(phone["access_token"]),
@@ -573,7 +594,10 @@ def test_presence_expires_and_android_cannot_report_windows_state(tmp_path):
     reported = client.post(
         "/api/v1/devices/me/presence",
         headers=auth(desktop["access_token"]),
-        json={"session_state": "unlocked"},
+        json={
+            "session_state": "unlocked",
+            "suppress_codex_permission_requests": True,
+        },
     )
     assert reported.status_code == 200, reported.text
 
@@ -594,6 +618,9 @@ def test_presence_expires_and_android_cannot_report_windows_state(tmp_path):
     assert summary.json()["fresh_windows"] == 0
     assert summary.json()["windows_devices"][0]["reported_session_state"] == "unlocked"
     assert summary.json()["windows_devices"][0]["effective_session_state"] == "unknown"
+    assert summary.json()["windows_devices"][0][
+        "suppress_codex_permission_requests"
+    ] is True
 
     rejected = client.post(
         "/api/v1/devices/me/presence",

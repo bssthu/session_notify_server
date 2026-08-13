@@ -417,6 +417,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 device.id,
                 request.session_state,
                 notification_pause_until=request.notification_pause_until,
+                suppress_codex_permission_requests=request.suppress_codex_permission_requests,
                 stale_after=DEVICE_PRESENCE_TTL,
             )
         except KeyError:

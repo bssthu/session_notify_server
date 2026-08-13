@@ -297,6 +297,7 @@ class Storage:
                     notification_pause_until TEXT,
                     session_state TEXT NOT NULL DEFAULT 'unknown',
                     session_state_updated_at TEXT,
+                    suppress_codex_permission_requests INTEGER NOT NULL DEFAULT 0,
                     access_expires_at TEXT,
                     refresh_expires_at TEXT
                 );
@@ -366,6 +367,7 @@ class Storage:
             "notification_pause_until": "TEXT",
             "session_state": "TEXT NOT NULL DEFAULT 'unknown'",
             "session_state_updated_at": "TEXT",
+            "suppress_codex_permission_requests": "INTEGER NOT NULL DEFAULT 0",
             "access_expires_at": "TEXT",
             "refresh_expires_at": "TEXT",
         }
@@ -467,7 +469,8 @@ class Storage:
                 SET name = ?, platform = ?, refresh_token_hash = ?, access_token_hash = ?,
                     access_expires_at = ?, refresh_expires_at = ?, last_seen_at = ?,
                     session_state = 'unknown', session_state_updated_at = NULL,
-                    notification_pause_until = NULL
+                    notification_pause_until = NULL,
+                    suppress_codex_permission_requests = 0
                 WHERE id = ?
                 """,
                 (name, platform.value, sha256_text(new_refresh), sha256_text(new_access),
@@ -600,6 +603,7 @@ class Storage:
         session_state: DeviceSessionState,
         *,
         notification_pause_until: datetime | None,
+        suppress_codex_permission_requests: bool,
         stale_after: timedelta,
     ) -> tuple[DevicePublic, bool]:
         """Store a Windows heartbeat and indicate whether effective availability changed."""
@@ -609,7 +613,8 @@ class Storage:
             row = self._conn.execute(
                 """
                 SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
-                       notification_pause_until, session_state, session_state_updated_at
+                       notification_pause_until, session_state, session_state_updated_at,
+                       suppress_codex_permission_requests
                 FROM devices
                 WHERE id = ? AND revoked_at IS NULL
                 """,
@@ -628,6 +633,7 @@ class Storage:
                 else DeviceSessionState.unknown
             )
             previous_pause_until = _parse_dt(row["notification_pause_until"])
+            previous_suppression = bool(row["suppress_codex_permission_requests"])
             previous_pause_active = (
                 previous_pause_until is not None and previous_pause_until > now
             )
@@ -637,7 +643,8 @@ class Storage:
             self._conn.execute(
                 """
                 UPDATE devices
-                SET session_state = ?, session_state_updated_at = ?, notification_pause_until = ?
+                SET session_state = ?, session_state_updated_at = ?, notification_pause_until = ?,
+                    suppress_codex_permission_requests = ?
                 WHERE id = ?
                 """,
                 (
@@ -646,6 +653,7 @@ class Storage:
                     _dt(notification_pause_until)
                     if notification_pause_until is not None and notification_pause_until > now
                     else None,
+                    1 if suppress_codex_permission_requests else 0,
                     device_id,
                 ),
             )
@@ -666,7 +674,9 @@ class Storage:
             or (previous_pause_until is not None and not next_pause_active)
         )
         return self._device_from_row(row), (
-            previous_effective is not session_state or pause_availability_changed
+            previous_effective is not session_state
+            or pause_availability_changed
+            or previous_suppression != suppress_codex_permission_requests
         )
 
     def device_presence_summary(
@@ -680,7 +690,8 @@ class Storage:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, name, notification_pause_until, session_state, session_state_updated_at
+                SELECT id, name, notification_pause_until, session_state, session_state_updated_at,
+                       suppress_codex_permission_requests
                 FROM devices
                 WHERE platform = ? AND revoked_at IS NULL
                 ORDER BY created_at ASC
@@ -711,6 +722,9 @@ class Storage:
                     reported_session_state=reported,
                     effective_session_state=effective,
                     session_state_updated_at=updated_at,
+                    suppress_codex_permission_requests=bool(
+                        row["suppress_codex_permission_requests"]
+                    ),
                 )
             )
         return DevicePresenceSummary(
