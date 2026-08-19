@@ -632,9 +632,27 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     @app.get("/api/v1/events", response_model=EventsResponse)
     def list_events(
         since_event_id: str | None = None,
+        limit: int | None = Query(default=None, ge=1, le=500),
         device: DevicePublic = Depends(current_device),
     ) -> EventsResponse:
-        return EventsResponse(events=storage.events_after(since_event_id, device))
+        if limit is None:
+            events = storage.events_after(since_event_id, device)
+            return EventsResponse(
+                events=events,
+                latest_event_id=events[-1].event_id if events else since_event_id,
+            )
+
+        events, latest_event_id, cursor_found, has_more = storage.event_window(
+            since_event_id,
+            limit,
+            device,
+        )
+        return EventsResponse(
+            events=events,
+            latest_event_id=latest_event_id,
+            cursor_found=cursor_found,
+            has_more=has_more,
+        )
 
     @app.websocket("/api/v1/ws")
     async def websocket_endpoint(websocket: WebSocket, token: str | None = None) -> None:

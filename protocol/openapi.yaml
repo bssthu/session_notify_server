@@ -299,6 +299,14 @@ paths:
           required: false
           schema:
             type: string
+        - name: limit
+          in: query
+          required: false
+          description: Bounds catch-up payloads. Without a cursor, returns only the latest event id for baseline initialization.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
       responses:
         "200":
           description: Event stream catch-up.
@@ -648,12 +656,19 @@ components:
           type: boolean
     EventsResponse:
       type: object
-      required: [events]
+      required: [events, latest_event_id, cursor_found, has_more]
       properties:
         events:
           type: array
           items:
             $ref: "./ws-events.schema.json"
+        latest_event_id:
+          type: [string, "null"]
+        cursor_found:
+          type: [boolean, "null"]
+          description: Null when no cursor was supplied, false when the supplied cursor is unknown.
+        has_more:
+          type: boolean
     HookPayload:
       type: object
       properties:

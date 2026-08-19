@@ -665,6 +665,74 @@ def test_event_pull_and_websocket_push(tmp_path):
     assert after == []
 
 
+def test_bounded_event_window_initializes_and_recovers_without_full_history(tmp_path):
+    app = create_app(tmp_path / "server.db")
+    client = TestClient(app)
+    token = bind(client)
+
+    for index in range(3):
+        created = client.post(
+            "/api/v1/notifications",
+            headers=auth(token),
+            json={
+                "source": "codex",
+                "session_id": f"bounded-{index}",
+                "title": f"Completion {index}",
+                "body": "Ready for review",
+                "level": "success",
+            },
+        )
+        assert created.status_code == 200, created.text
+
+    legacy_events = client.get("/api/v1/events", headers=auth(token)).json()["events"]
+    assert len(legacy_events) == 3
+
+    initialized = client.get(
+        "/api/v1/events",
+        headers=auth(token),
+        params={"limit": 2},
+    )
+    assert initialized.status_code == 200, initialized.text
+    assert initialized.json() == {
+        "events": [],
+        "latest_event_id": legacy_events[-1]["event_id"],
+        "cursor_found": None,
+        "has_more": False,
+    }
+
+    bounded = client.get(
+        "/api/v1/events",
+        headers=auth(token),
+        params={"since_event_id": legacy_events[0]["event_id"], "limit": 1},
+    )
+    assert bounded.status_code == 200, bounded.text
+    assert [event["event_id"] for event in bounded.json()["events"]] == [
+        legacy_events[1]["event_id"]
+    ]
+    assert bounded.json()["latest_event_id"] == legacy_events[-1]["event_id"]
+    assert bounded.json()["cursor_found"] is True
+    assert bounded.json()["has_more"] is True
+
+    missing = client.get(
+        "/api/v1/events",
+        headers=auth(token),
+        params={"since_event_id": "pruned-event", "limit": 2},
+    )
+    assert missing.status_code == 200, missing.text
+    assert missing.json() == {
+        "events": [],
+        "latest_event_id": legacy_events[-1]["event_id"],
+        "cursor_found": False,
+        "has_more": False,
+    }
+
+    assert client.get(
+        "/api/v1/events",
+        headers=auth(token),
+        params={"limit": 501},
+    ).status_code == 422
+
+
 def test_websocket_accepts_authorization_header(tmp_path):
     app = create_app(tmp_path / "server.db")
     client = TestClient(app)

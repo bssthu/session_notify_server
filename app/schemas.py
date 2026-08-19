@@ -250,6 +250,9 @@ class SyncEvent(BaseModel):
 
 class EventsResponse(BaseModel):
     events: list[SyncEvent]
+    latest_event_id: str | None = None
+    cursor_found: bool | None = None
+    has_more: bool = False
 
 
 class HookPayload(BaseModel):

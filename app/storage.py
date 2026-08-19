@@ -1439,6 +1439,50 @@ class Storage:
             return events
         return [self.event_for_device(event, device) for event in events]
 
+    def event_window(
+        self,
+        since_event_id: str | None,
+        limit: int,
+        device: DevicePublic | None = None,
+    ) -> tuple[list[SyncEvent], str | None, bool | None, bool]:
+        """Return a bounded catch-up window without expanding a missing cursor to all history.
+
+        A caller without a cursor only needs the latest event id to establish its
+        baseline after loading the authoritative active-notification snapshot. If a
+        supplied cursor has been pruned or is otherwise unknown, ``cursor_found`` is
+        false so the client can reload that snapshot and jump to ``latest_event_id``.
+        """
+        bounded_limit = max(1, int(limit))
+        with self._lock:
+            latest = self._conn.execute(
+                "SELECT id FROM events ORDER BY seq DESC LIMIT 1"
+            ).fetchone()
+            latest_event_id = latest["id"] if latest is not None else None
+
+            if not since_event_id:
+                return [], latest_event_id, None, False
+
+            cursor = self._conn.execute(
+                "SELECT seq FROM events WHERE id = ?",
+                (since_event_id,),
+            ).fetchone()
+            if cursor is None:
+                return [], latest_event_id, False, False
+
+            rows = self._conn.execute(
+                "SELECT payload FROM events WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+                (cursor["seq"], bounded_limit + 1),
+            ).fetchall()
+
+        has_more = len(rows) > bounded_limit
+        events = [
+            SyncEvent.model_validate_json(row["payload"])
+            for row in rows[:bounded_limit]
+        ]
+        if device is not None:
+            events = [self.event_for_device(event, device) for event in events]
+        return events, latest_event_id, True, has_more
+
     def expire_due_notifications(self) -> list[SyncEvent]:
         now = utc_now()
         with self._lock, self._conn:
