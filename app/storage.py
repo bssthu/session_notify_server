@@ -38,6 +38,7 @@ _PAIR_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 _HISTORY_MACHINE_OPTION_LIMIT = 100
 _HISTORY_AGENT_OPTION_LIMIT = 50
 _HISTORY_TAG_OPTION_LIMIT = 100
+_CLAUDE_APPROVAL_CORRELATION_WINDOW = timedelta(seconds=30)
 
 
 def _dt(value: datetime) -> str:
@@ -234,6 +235,79 @@ def _hook_turn_id(metadata: Any) -> str:
     )
     # turn_id 是不透明标识符，只去除边缘空白，不做大小写归一化。
     return str(value or "").strip()
+
+
+def _metadata_text(metadata: Any, *keys: str) -> str:
+    meta = metadata if isinstance(metadata, dict) else {}
+    raw = meta.get("raw") if isinstance(meta.get("raw"), dict) else {}
+    for key in keys:
+        value = meta.get(key)
+        if value is None:
+            value = raw.get(key)
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _claude_approval_transport(notification: NotificationPublic) -> str:
+    if notification.source.lower() != "claude" or "needs confirmation" not in notification.title.lower():
+        return ""
+    event_name = _metadata_text(
+        notification.metadata,
+        "hook_event_name",
+        "hookEventName",
+        "hook_event_type",
+        "hookEventType",
+    ).lower()
+    notification_type = _metadata_text(
+        notification.metadata,
+        "notification_type",
+        "notificationType",
+    ).lower()
+    if event_name == "permissionrequest":
+        return "permission_request"
+    if event_name == "notification" and notification_type == "permission_prompt":
+        return "permission_prompt"
+    return ""
+
+
+def _is_correlated_claude_approval_pair(
+    left: NotificationPublic,
+    right: NotificationPublic,
+) -> bool:
+    left_transport = _claude_approval_transport(left)
+    right_transport = _claude_approval_transport(right)
+    if not left_transport or not right_transport or left_transport == right_transport:
+        return False
+    if left.session_id != right.session_id or left.origin_device_id != right.origin_device_id:
+        return False
+    if abs(left.created_at - right.created_at) > _CLAUDE_APPROVAL_CORRELATION_WINDOW:
+        return False
+
+    for keys in (
+        ("cwd", "working_directory", "workingDirectory"),
+        ("transcript_path", "transcriptPath"),
+    ):
+        left_value = _metadata_text(left.metadata, *keys).lower()
+        right_value = _metadata_text(right.metadata, *keys).lower()
+        if left_value and right_value and left_value != right_value:
+            return False
+
+    left_turn_id = _hook_turn_id(left.metadata)
+    right_turn_id = _hook_turn_id(right.metadata)
+    return not (left_turn_id and right_turn_id and left_turn_id != right_turn_id)
+
+
+def _approval_detail_score(notification: NotificationPublic) -> int:
+    body = notification.body.strip()
+    generic = body.lower() in {
+        "claude needs your permission",
+        "needs your permission",
+        "session event received.",
+        "session event received",
+    } or body.lower().endswith(" needs your permission")
+    return len(notification.title) + len(body) - (1000 if generic else 0)
 
 
 class Storage:
@@ -910,6 +984,7 @@ class Storage:
         origin_device: DevicePublic | None = None,
         *,
         dedupe_key: str | None = None,
+        correlate_claude_approval: bool = False,
     ) -> tuple[NotificationPublic, SyncEvent | None]:
         now = utc_now()
         notification = NotificationPublic(
@@ -930,6 +1005,10 @@ class Storage:
             metadata=request.metadata,
         )
         with self._lock, self._conn:
+            if correlate_claude_approval:
+                correlated = self._find_correlated_claude_approval(notification)
+                if correlated is not None:
+                    return self._merge_correlated_claude_approval(correlated, notification)
             if dedupe_key:
                 existing = self._conn.execute(
                     "SELECT * FROM notifications WHERE dedupe_key = ?",
@@ -960,6 +1039,105 @@ class Storage:
                 )
             )
         return notification, event
+
+    def _find_correlated_claude_approval(
+        self,
+        incoming: NotificationPublic,
+    ) -> sqlite3.Row | None:
+        if not _claude_approval_transport(incoming):
+            return None
+        rows = self._conn.execute(
+            """
+            SELECT * FROM notifications
+            WHERE source = ? AND session_id = ?
+              AND status IN (?, ?)
+            ORDER BY created_at DESC
+            """,
+            (
+                incoming.source,
+                incoming.session_id,
+                NotificationStatus.active.value,
+                NotificationStatus.acknowledged.value,
+            ),
+        ).fetchall()
+        matches = [
+            (row, abs(self._notification_from_row(row).created_at - incoming.created_at))
+            for row in rows
+            if _is_correlated_claude_approval_pair(
+                self._notification_from_row(row),
+                incoming,
+            )
+        ]
+        matches.sort(key=lambda item: item[1])
+        if not matches or (len(matches) > 1 and matches[0][1] == matches[1][1]):
+            return None
+        return matches[0][0]
+
+    def _merge_correlated_claude_approval(
+        self,
+        existing_row: sqlite3.Row,
+        incoming: NotificationPublic,
+    ) -> tuple[NotificationPublic, SyncEvent | None]:
+        """Upsert Claude's PermissionRequest + permission_prompt transport pair."""
+        existing = self._notification_from_row(existing_row)
+        incoming_is_preferred = _approval_detail_score(incoming) > _approval_detail_score(existing)
+        preferred = incoming if incoming_is_preferred else existing
+        secondary = existing if incoming_is_preferred else incoming
+        merged_metadata = dict(preferred.metadata)
+        for key, value in secondary.metadata.items():
+            if key not in merged_metadata and value is not None:
+                merged_metadata[key] = value
+        merged_metadata["event_family"] = "claude_permission_prompt"
+        merged_metadata["correlated_hook_events"] = sorted(
+            {
+                _claude_approval_transport(existing),
+                _claude_approval_transport(incoming),
+            }
+        )
+
+        now = utc_now()
+        updated_at = now if existing.status == NotificationStatus.active else existing.updated_at
+        updated = existing.model_copy(
+            update={
+                "title": preferred.title,
+                "body": preferred.body,
+                "level": preferred.level,
+                "updated_at": updated_at,
+                "metadata": merged_metadata,
+            }
+        )
+        self._conn.execute(
+            """
+            UPDATE notifications
+            SET title = ?, body = ?, level = ?, metadata = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                updated.title,
+                updated.body,
+                updated.level.value,
+                json.dumps(updated.metadata, ensure_ascii=False, sort_keys=True),
+                _dt(updated_at),
+                updated.id,
+            ),
+        )
+
+        visible_change = incoming_is_preferred and (
+            incoming.title != existing.title
+            or incoming.body != existing.body
+            or incoming.level != existing.level
+        )
+        if not visible_change or updated.status != NotificationStatus.active:
+            return updated, None
+        event = self._append_event(
+            SyncEvent(
+                event_id=new_id(),
+                event_type=EventType.notification_created,
+                created_at=now,
+                notification=updated,
+            )
+        )
+        return updated, event
 
     def _merge_duplicate_notification(
         self,
@@ -1256,6 +1434,78 @@ class Storage:
                 )
 
         return AckResponse(notification=notification, already_acknowledged=already_acknowledged), event
+
+    def acknowledge_correlated_claude_approvals(
+        self,
+        reference: NotificationPublic,
+        *,
+        device_id: str,
+        reason: str,
+    ) -> list[SyncEvent]:
+        """Acknowledge active transport siblings of one logical Claude prompt."""
+        if not _claude_approval_transport(reference):
+            return []
+        now = utc_now()
+        events: list[SyncEvent] = []
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM notifications
+                WHERE status = ? AND source = ? AND session_id = ? AND id <> ?
+                """,
+                (
+                    NotificationStatus.active.value,
+                    reference.source,
+                    reference.session_id,
+                    reference.id,
+                ),
+            ).fetchall()
+            candidates = [
+                notification
+                for row in rows
+                if _is_correlated_claude_approval_pair(
+                    reference,
+                    notification := self._notification_from_row(row),
+                )
+            ]
+            candidates.sort(key=lambda item: abs(item.created_at - reference.created_at))
+            if len(candidates) > 1 and (
+                abs(candidates[0].created_at - reference.created_at)
+                == abs(candidates[1].created_at - reference.created_at)
+            ):
+                return []
+            if not candidates:
+                return []
+            notification = candidates[0]
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO acks(notification_id, device_id, ack_at, reason)
+                VALUES (?, ?, ?, ?)
+                """,
+                (notification.id, device_id, _dt(now), reason),
+            )
+            self._conn.execute(
+                """
+                UPDATE notifications
+                SET status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (NotificationStatus.acknowledged.value, _dt(now), notification.id),
+            )
+            events.append(
+                self._append_event(
+                    SyncEvent(
+                        event_id=new_id(),
+                        event_type=EventType.notification_acknowledged,
+                        created_at=now,
+                        notification_id=notification.id,
+                        ack_by_device_id=device_id,
+                        ack_at=now,
+                        reason=reason,
+                    )
+                )
+            )
+        return events
 
     def resolve_pending_permission(
         self,

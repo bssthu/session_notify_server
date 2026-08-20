@@ -508,6 +508,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 request,
                 origin_device=device,
                 dedupe_key=dedupe_key,
+                correlate_claude_approval=True,
             )
             if event is not None:
                 await hub.broadcast(event, storage.should_deliver_event_to_device)
@@ -627,6 +628,12 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Notification not found") from None
         if event is not None:
             await hub.broadcast(event, storage.should_deliver_event_to_device)
+        for related_event in storage.acknowledge_correlated_claude_approvals(
+            response.notification,
+            device_id=device.id,
+            reason=request.reason,
+        ):
+            await hub.broadcast(related_event, storage.should_deliver_event_to_device)
         return response
 
     @app.get("/api/v1/events", response_model=EventsResponse)

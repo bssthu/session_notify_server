@@ -996,6 +996,268 @@ def _hook_payload(
     return payload
 
 
+def _claude_interactive_payload(
+    event_name: str,
+    session_id: str,
+    *,
+    transcript_path: str,
+) -> dict:
+    base = {
+        "hook_event_name": event_name,
+        "event_type": "approval_requested",
+        "hook_status": "approval_requested",
+        "session_id": session_id,
+        "cwd": "R:\\",
+        "transcript_path": transcript_path,
+    }
+    if event_name == "PermissionRequest":
+        base.update({
+            "prompt": "在 JavaScript 中，`typeof null` 的返回结果是什么？",
+            "tool_name": "AskUserQuestion",
+            "tool_input": {
+                "questions": [{
+                    "question": "在 JavaScript 中，`typeof null` 的返回结果是什么？",
+                }],
+            },
+        })
+    else:
+        base.update({
+            "notification_type": "permission_prompt",
+            "message": "Claude needs your permission",
+        })
+    return base
+
+
+def test_claude_interactive_permission_transports_share_one_notification(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+    session_id = "s-interactive"
+    transcript = "C:/Users/tester/.claude/projects/R--/s-interactive.jsonl"
+
+    detailed = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json=_claude_interactive_payload(
+            "PermissionRequest",
+            session_id,
+            transcript_path=transcript,
+        ),
+    )
+    generic = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json=_claude_interactive_payload(
+            "Notification",
+            session_id,
+            transcript_path=transcript,
+        ),
+    )
+
+    assert detailed.status_code == 200, detailed.text
+    assert generic.status_code == 200, generic.text
+    assert generic.json()["id"] == detailed.json()["id"]
+    assert generic.json()["body"] == detailed.json()["body"]
+    assert generic.json()["metadata"]["hook_event_name"] == "PermissionRequest"
+    assert generic.json()["metadata"]["event_family"] == "claude_permission_prompt"
+    assert generic.json()["metadata"]["correlated_hook_events"] == [
+        "permission_prompt",
+        "permission_request",
+    ]
+
+    active = client.get("/api/v1/notifications", headers=auth(token)).json()
+    assert [item["id"] for item in active] == [detailed.json()["id"]]
+    created_events = [
+        event
+        for event in client.get("/api/v1/events", headers=auth(token)).json()["events"]
+        if event["event_type"] == "notification.created"
+        and event["notification"]["session_id"] == session_id
+    ]
+    assert len(created_events) == 1
+
+
+def test_claude_interactive_detail_upserts_an_earlier_generic_prompt(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+    session_id = "s-interactive-reverse"
+    transcript = "C:/Users/tester/.claude/projects/R--/s-interactive-reverse.jsonl"
+
+    generic = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json=_claude_interactive_payload(
+            "Notification",
+            session_id,
+            transcript_path=transcript,
+        ),
+    )
+    detailed = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json=_claude_interactive_payload(
+            "PermissionRequest",
+            session_id,
+            transcript_path=transcript,
+        ),
+    )
+
+    assert detailed.json()["id"] == generic.json()["id"]
+    assert detailed.json()["body"] == "在 JavaScript 中，`typeof null` 的返回结果是什么？"
+    created_events = [
+        event
+        for event in client.get("/api/v1/events", headers=auth(token)).json()["events"]
+        if event["event_type"] == "notification.created"
+        and event["notification"]["session_id"] == session_id
+    ]
+    assert len(created_events) == 2
+    assert created_events[-1]["notification"]["id"] == generic.json()["id"]
+    assert created_events[-1]["notification"]["body"] == detailed.json()["body"]
+
+
+def test_acknowledged_claude_prompt_is_not_reopened_by_later_transport(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+    session_id = "s-interactive-ack-race"
+    transcript = "C:/Users/tester/.claude/projects/R--/s-interactive-ack-race.jsonl"
+
+    detailed = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json=_claude_interactive_payload(
+            "PermissionRequest",
+            session_id,
+            transcript_path=transcript,
+        ),
+    ).json()
+    acknowledged = client.post(
+        f"/api/v1/notifications/{detailed['id']}/ack",
+        headers=auth(token),
+        json={"reason": "user_confirmed"},
+    )
+    assert acknowledged.status_code == 200, acknowledged.text
+
+    late_generic = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json=_claude_interactive_payload(
+            "Notification",
+            session_id,
+            transcript_path=transcript,
+        ),
+    )
+    assert late_generic.status_code == 200, late_generic.text
+    assert late_generic.json()["id"] == detailed["id"]
+    assert late_generic.json()["status"] == "acknowledged"
+    assert late_generic.json()["updated_at"] == acknowledged.json()["notification"]["updated_at"]
+    assert client.get("/api/v1/notifications", headers=auth(token)).json() == []
+
+
+def test_claude_generic_prompt_correlates_to_the_nearest_question(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+    session_id = "s-sequential-questions"
+    transcript = "C:/Users/tester/.claude/projects/R--/s-sequential-questions.jsonl"
+
+    first = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json=_claude_interactive_payload(
+            "PermissionRequest",
+            session_id,
+            transcript_path=transcript,
+        ),
+    ).json()
+    client.post(
+        f"/api/v1/notifications/{first['id']}/ack",
+        headers=auth(token),
+        json={"reason": "user_confirmed"},
+    )
+    second = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json=_claude_interactive_payload(
+            "PermissionRequest",
+            session_id,
+            transcript_path=transcript,
+        ),
+    ).json()
+    generic = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json=_claude_interactive_payload(
+            "Notification",
+            session_id,
+            transcript_path=transcript,
+        ),
+    ).json()
+
+    assert first["id"] != second["id"]
+    assert generic["id"] == second["id"]
+    assert generic["id"] != first["id"]
+    active_ids = {
+        item["id"]
+        for item in client.get("/api/v1/notifications", headers=auth(token)).json()
+    }
+    assert active_ids == {second["id"]}
+
+
+def test_acknowledging_one_legacy_claude_transport_acknowledges_its_sibling(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+    common = {
+        "source": "claude",
+        "session_id": "s-legacy-double",
+        "title": "claude needs confirmation",
+        "level": "critical",
+        "metadata": {
+            "cwd": "R:\\",
+            "transcript_path": "C:/Users/tester/.claude/projects/R--/s-legacy-double.jsonl",
+        },
+    }
+    detailed_payload = {
+        **common,
+        "body": "Choose a JavaScript answer",
+        "metadata": {
+            **common["metadata"],
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "AskUserQuestion",
+        },
+    }
+    generic_payload = {
+        **common,
+        "body": "Claude needs your permission",
+        "metadata": {
+            **common["metadata"],
+            "hook_event_name": "Notification",
+            "notification_type": "permission_prompt",
+        },
+    }
+    detailed = client.post(
+        "/api/v1/notifications",
+        headers=auth(token),
+        json=detailed_payload,
+    ).json()
+    generic = client.post(
+        "/api/v1/notifications",
+        headers=auth(token),
+        json=generic_payload,
+    ).json()
+    assert detailed["id"] != generic["id"]
+
+    response = client.post(
+        f"/api/v1/notifications/{generic['id']}/ack",
+        headers=auth(token),
+        json={"reason": "user_confirmed"},
+    )
+    assert response.status_code == 200, response.text
+    assert client.get("/api/v1/notifications", headers=auth(token)).json() == []
+    acknowledged_ids = {
+        event["notification_id"]
+        for event in client.get("/api/v1/events", headers=auth(token)).json()["events"]
+        if event["event_type"] == "notification.acknowledged"
+    }
+    assert {detailed["id"], generic["id"]} <= acknowledged_ids
+
+
 def _codex_terminal_failure_payload(
     *,
     session_id: str,
