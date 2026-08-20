@@ -299,7 +299,7 @@ def _is_correlated_claude_approval_pair(
     return not (left_turn_id and right_turn_id and left_turn_id != right_turn_id)
 
 
-def _approval_detail_score(notification: NotificationPublic) -> int:
+def _approval_detail_score(notification: NotificationPublic) -> tuple[int, int]:
     body = notification.body.strip()
     generic = body.lower() in {
         "claude needs your permission",
@@ -307,7 +307,20 @@ def _approval_detail_score(notification: NotificationPublic) -> int:
         "session event received.",
         "session event received",
     } or body.lower().endswith(" needs your permission")
-    return len(notification.title) + len(body) - (1000 if generic else 0)
+    tool_name = _metadata_text(notification.metadata, "tool_name", "toolName")
+    normalized_tool = "".join(
+        character
+        for character in tool_name.lower()
+        if character.isalpha() or character == "_"
+    )
+    interactive_permission = (
+        _claude_approval_transport(notification) == "permission_request"
+        and normalized_tool in {"askuserquestion", "request_user_input", "exitplanmode"}
+    )
+    return (
+        1 if interactive_permission else 0,
+        len(notification.title) + len(body) - (1000 if generic else 0),
+    )
 
 
 class Storage:

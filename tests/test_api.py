@@ -1028,6 +1028,48 @@ def _claude_interactive_payload(
     return base
 
 
+def _claude_plan_payload(
+    event_name: str,
+    session_id: str,
+    *,
+    transcript_path: str,
+) -> dict:
+    base = {
+        "hook_event_name": event_name,
+        "event_type": "approval_requested",
+        "hook_status": "approval_requested",
+        "session_id": session_id,
+        "cwd": "R:\\",
+        "transcript_path": transcript_path,
+    }
+    if event_name == "PermissionRequest":
+        base.update({
+            "permission_mode": "plan",
+            "tool_name": "ExitPlanMode",
+            "metadata": {
+                "raw": {
+                    "hook_event_name": "PermissionRequest",
+                    "permission_mode": "plan",
+                    "tool_name": "ExitPlanMode",
+                    "tool_input": {"plan": "# Network test plan"},
+                },
+            },
+        })
+    else:
+        base.update({
+            "notification_type": "permission_prompt",
+            "message": "Claude Code needs your approval for the plan",
+            "metadata": {
+                "raw": {
+                    "hook_event_name": "Notification",
+                    "notification_type": "permission_prompt",
+                    "message": "Claude Code needs your approval for the plan",
+                },
+            },
+        })
+    return base
+
+
 def test_claude_interactive_permission_transports_share_one_notification(tmp_path):
     client = TestClient(create_app(tmp_path / "server.db"))
     token = bind(client)
@@ -1066,6 +1108,49 @@ def test_claude_interactive_permission_transports_share_one_notification(tmp_pat
 
     active = client.get("/api/v1/notifications", headers=auth(token)).json()
     assert [item["id"] for item in active] == [detailed.json()["id"]]
+    created_events = [
+        event
+        for event in client.get("/api/v1/events", headers=auth(token)).json()["events"]
+        if event["event_type"] == "notification.created"
+        and event["notification"]["session_id"] == session_id
+    ]
+    assert len(created_events) == 1
+
+
+def test_claude_plan_permission_remains_the_canonical_transport(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+    session_id = "s-plan-confirmation"
+    transcript = "C:/Users/tester/.claude/projects/R--/s-plan-confirmation.jsonl"
+
+    permission = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json=_claude_plan_payload(
+            "PermissionRequest",
+            session_id,
+            transcript_path=transcript,
+        ),
+    )
+    generic = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json=_claude_plan_payload(
+            "Notification",
+            session_id,
+            transcript_path=transcript,
+        ),
+    )
+
+    assert permission.status_code == 200, permission.text
+    assert generic.status_code == 200, generic.text
+    assert permission.json()["body"] == "Session event received."
+    assert generic.json()["id"] == permission.json()["id"]
+    assert generic.json()["body"] == permission.json()["body"]
+    assert generic.json()["metadata"]["hook_event_name"] == "PermissionRequest"
+    assert generic.json()["metadata"]["tool_name"] == "ExitPlanMode"
+    assert generic.json()["metadata"]["raw"]["tool_input"]["plan"] == "# Network test plan"
+
     created_events = [
         event
         for event in client.get("/api/v1/events", headers=auth(token)).json()["events"]
