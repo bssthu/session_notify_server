@@ -885,7 +885,7 @@ def test_hook_mapping_and_expiry(tmp_path):
         },
     )
     assert hook.status_code == 200, hook.text
-    assert hook.json()["level"] == "critical"
+    assert hook.json()["level"] == "important"
     assert hook.json()["title"] == "codex needs confirmation"
     assert hook.json()["origin_device_id"] == tokens["device"]["id"]
     assert hook.json()["origin_device_name"] == "Hook Host"
@@ -956,7 +956,7 @@ def test_official_hook_event_mapping(tmp_path):
         },
     )
     assert permission.status_code == 200, permission.text
-    assert permission.json()["level"] == "critical"
+    assert permission.json()["level"] == "important"
     assert permission.json()["title"] == "claude needs confirmation"
 
 
@@ -1390,6 +1390,8 @@ def test_codex_terminal_failure_is_deduplicated_across_app_server_and_hook(tmp_p
 
     assert app_server.status_code == 200, app_server.text
     assert hook.status_code == 200, hook.text
+    assert app_server.json()["level"] == "critical"
+    assert hook.json()["level"] == "critical"
     assert hook.json()["id"] == app_server.json()["id"]
     assert hook.json()["metadata"]["ingest_sources"] == ["app_server", "hook_bridge"]
     assert hook.json()["metadata"]["event_correlation"] == "remote_correlated"
@@ -1774,7 +1776,7 @@ def test_plan_mode_stop_keeps_implementation_confirmation(tmp_path):
     )
     assert plan_ready.status_code == 200, plan_ready.text
     assert plan_ready.json()["title"] == "codex needs confirmation"
-    assert plan_ready.json()["level"] == "critical"
+    assert plan_ready.json()["level"] == "important"
     assert plan_ready.json()["body"] == "Plan is ready. Choose whether to implement it."
     assert plan_ready.json()["metadata"]["permission_mode"] == "plan"
     assert plan_ready.json()["metadata"]["body_generated"] is False
@@ -1921,14 +1923,14 @@ def test_receive_hook_suppresses_noise_but_keeps_value(tmp_path):
     assert idle.status_code == 200
     assert idle.json() is None
 
-    # needs-confirmation:保留(critical)
+    # needs-confirmation:保留(important)
     perm = client.post("/api/v1/hooks/claude", headers=auth(token),
                        json=_hook_payload("PermissionRequest", "s-perm", "npm test"))
     assert perm.status_code == 200
     assert perm.json()["title"] == "claude needs confirmation"
-    assert perm.json()["level"] == "critical"
+    assert perm.json()["level"] == "important"
 
-    # failure:保留(important)——非 contentless completed
+    # failure:保留(critical)——非 contentless completed
     fail = client.post("/api/v1/hooks/claude", headers=auth(token), json={
         "hook_event_name": "StopFailure",
         "event_type": "failure",
@@ -1938,6 +1940,7 @@ def test_receive_hook_suppresses_noise_but_keeps_value(tmp_path):
     })
     assert fail.status_code == 200
     assert fail.json()["title"] == "claude needs attention"
+    assert fail.json()["level"] == "critical"
 
     # 有内容 completed(带 last_assistant_message):保留(success)
     done = client.post("/api/v1/hooks/claude", headers=auth(token), json={
@@ -1952,6 +1955,41 @@ def test_receive_hook_suppresses_noise_but_keeps_value(tmp_path):
     # 只有 3 条有价值通知进入 active(perm/fail/done),噪声全部未创建
     titles = sorted(item["title"] for item in client.get("/api/v1/notifications", headers=auth(token)).json())
     assert titles == ["claude completed", "claude needs attention", "claude needs confirmation"]
+
+
+def test_hook_failure_severity_wins_over_approval_keyword(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    response = client.post("/api/v1/hooks/claude", headers=auth(token), json={
+        "hook_event_name": "PermissionError",
+        "event_type": "permission_error",
+        "hook_status": "failed",
+        "message": "Permission request failed.",
+        "session_id": "s-permission-error",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["title"] == "claude needs attention"
+    assert response.json()["level"] == "critical"
+
+
+def test_direct_non_hook_idle_notification_remains_visible(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    response = client.post("/api/v1/notifications", headers=auth(token), json={
+        "source": "session",
+        "session_id": "s-idle-reminder",
+        "title": "Session idle reminder",
+        "body": "No activity has been recorded recently.",
+        "level": "info",
+        "metadata": {},
+    })
+
+    assert response.status_code == 200
+    active = client.get("/api/v1/notifications", headers=auth(token)).json()
+    assert [item["id"] for item in active] == [response.json()["id"]]
 
 
 def test_receive_hook_suppresses_internal_codex_memory_consolidation_only(tmp_path):
