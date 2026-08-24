@@ -1434,6 +1434,37 @@ def test_codex_terminal_failure_dedupe_survives_server_restart(tmp_path):
     assert duplicate.json()["metadata"]["ingest_sources"] == ["app_server", "hook_bridge"]
 
 
+def test_hook_delivery_id_makes_replayed_claude_failure_idempotent(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+    payload = {
+        "hook_event_name": "StopFailure",
+        "event_type": "failed",
+        "hook_status": "failed",
+        "session_id": "claude-offline",
+        "message": "API Error: connection failed",
+        "metadata": {
+            "ingest_source": "hook_bridge",
+            "delivery_id": "offline-delivery-1",
+            "delivery_guarantee": "durable_outbox",
+        },
+    }
+
+    first = client.post("/api/v1/hooks/claude", headers=auth(token), json=payload)
+    replay = client.post("/api/v1/hooks/claude", headers=auth(token), json=payload)
+
+    assert first.status_code == 200, first.text
+    assert replay.status_code == 200, replay.text
+    assert first.json()["level"] == "critical"
+    assert replay.json()["id"] == first.json()["id"]
+    created = [
+        event
+        for event in client.get("/api/v1/events", headers=auth(token)).json()["events"]
+        if event["event_type"] == "notification.created"
+    ]
+    assert len(created) == 1
+
+
 def test_posttooluse_resolves_matching_permission_request(tmp_path):
     client = TestClient(create_app(tmp_path / "server.db"))
     token = bind(client)

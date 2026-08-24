@@ -173,6 +173,22 @@ def _terminal_failure_dedupe_key(
     )
 
 
+def _hook_delivery_dedupe_key(
+    source: str,
+    payload: HookPayload,
+    metadata: dict[str, object],
+    title: str,
+) -> str | None:
+    delivery_id = str(metadata.get("delivery_id") or "").strip()
+    if delivery_id:
+        return json.dumps(
+            ["hook_delivery", source.lower(), delivery_id],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    return _terminal_failure_dedupe_key(source, payload, metadata, title)
+
+
 def _resolve_hook_notification(source: str, payload: HookPayload) -> tuple[NotificationLevel, str]:
     event_type = (payload.event_type or payload.hook_event_name or "").lower()
     notification_type = (payload.notification_type or "").lower()
@@ -487,7 +503,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         body, body_generated = _resolve_hook_body(payload)
         hook_meta = _hook_metadata(payload, body_generated)
         hook_meta.setdefault("ingest_source", "hook_bridge")
-        dedupe_key = _terminal_failure_dedupe_key(source, payload, hook_meta, title)
+        dedupe_key = _hook_delivery_dedupe_key(source, payload, hook_meta, title)
         # 信号/噪声类 hook(PostToolUse/idle/paused/无内容 completed)不创建可见通知,从源头
         # 避免 active 堆积。resolve/ack 副作用与 suppress 无关,照常执行。
         suppress = _should_suppress_hook_notification(source, payload, body_generated, title)
