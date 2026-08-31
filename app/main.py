@@ -196,14 +196,17 @@ def _resolve_hook_notification(source: str, payload: HookPayload) -> tuple[Notif
     text = " ".join((event_type, notification_type, hook_status))
 
     if any(key in text for key in ("failure", "failed", "error", "stopfailure")):
-        return NotificationLevel.critical, f"{source} needs attention"
-    if any(key in text for key in ("auth", "approval", "permission", "confirm", "input", "elicitation")):
-        return NotificationLevel.important, f"{source} needs confirmation"
-    if any(key in text for key in ("done", "complete", "success", "finish", "stop", "taskcompleted")):
-        return NotificationLevel.success, f"{source} completed"
-    if "idle" in text:
-        return NotificationLevel.important, f"{source} idle"
-    return NotificationLevel.info, f"{source} update"
+        level, title = NotificationLevel.critical, f"{source} needs attention"
+    elif any(key in text for key in ("auth", "approval", "permission", "confirm", "input", "elicitation")):
+        level, title = NotificationLevel.important, f"{source} needs confirmation"
+    elif any(key in text for key in ("done", "complete", "success", "finish", "stop", "taskcompleted")):
+        level, title = NotificationLevel.success, f"{source} completed"
+    elif "idle" in text:
+        level, title = NotificationLevel.important, f"{source} idle"
+    else:
+        level, title = NotificationLevel.info, f"{source} update"
+
+    return payload.notification_level or level, payload.notification_title or title
 
 
 def _hook_payload_raw(payload: HookPayload) -> dict[str, Any]:

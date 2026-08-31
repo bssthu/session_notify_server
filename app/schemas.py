@@ -262,6 +262,8 @@ class HookPayload(BaseModel):
     hook_event_name: str | None = None
     hook_status: str | None = None
     notification_type: str | None = None
+    notification_title: str | None = Field(default=None, min_length=1, max_length=120)
+    notification_level: NotificationLevel | None = None
     title: str | None = None
     message: str | None = None
     prompt: str | None = None

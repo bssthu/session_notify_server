@@ -674,6 +674,16 @@ components:
       properties:
         event_type:
           type: [string, "null"]
+        notification_title:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 120
+          description: Optional explicit title override for external Hook Bridge callers. Installed agent hooks do not set it.
+        notification_level:
+          oneOf:
+            - $ref: "#/components/schemas/NotificationLevel"
+            - type: "null"
+          description: Optional explicit level override for external Hook Bridge callers. Installed agent hooks do not set it.
         message:
           type: [string, "null"]
         prompt:

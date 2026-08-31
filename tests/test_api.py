@@ -908,6 +908,44 @@ def test_hook_mapping_and_expiry(tmp_path):
     assert [item["title"] for item in active] == ["codex needs confirmation"]
 
 
+def test_hook_allows_explicit_external_title_and_level_overrides(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    overridden = client.post(
+        "/api/v1/hooks/backup-cli",
+        headers=auth(token),
+        json={
+            "event_type": "completed",
+            "session_id": "nightly-backup",
+            "message": "Database and attachments were backed up.",
+            "notification_title": "Nightly backup is ready",
+            "notification_level": "important",
+            "metadata": {"ingest_source": "hook_bridge"},
+        },
+    )
+
+    assert overridden.status_code == 200, overridden.text
+    assert overridden.json()["source"] == "backup-cli"
+    assert overridden.json()["title"] == "Nightly backup is ready"
+    assert overridden.json()["level"] == "important"
+    assert overridden.json()["body"] == "Database and attachments were backed up."
+
+    normal_hook = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json={
+            "hook_event_name": "Stop",
+            "session_id": "normal-claude-hook",
+            "title": "This remains the hook body",
+        },
+    )
+    assert normal_hook.status_code == 200, normal_hook.text
+    assert normal_hook.json()["title"] == "claude completed"
+    assert normal_hook.json()["level"] == "success"
+    assert normal_hook.json()["body"] == "This remains the hook body"
+
+
 def test_official_hook_event_mapping(tmp_path):
     app = create_app(tmp_path / "server.db")
     client = TestClient(app)
@@ -1457,6 +1495,37 @@ def test_hook_delivery_id_makes_replayed_claude_failure_idempotent(tmp_path):
     assert replay.status_code == 200, replay.text
     assert first.json()["level"] == "critical"
     assert replay.json()["id"] == first.json()["id"]
+    created = [
+        event
+        for event in client.get("/api/v1/events", headers=auth(token)).json()["events"]
+        if event["event_type"] == "notification.created"
+    ]
+    assert len(created) == 1
+
+
+def test_hook_delivery_id_makes_replayed_normal_update_idempotent(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+    payload = {
+        "event_type": "completed",
+        "session_id": "external-offline",
+        "message": "Backup completed",
+        "notification_title": "Backup is ready",
+        "notification_level": "success",
+        "metadata": {
+            "ingest_source": "hook_bridge",
+            "delivery_id": "offline-normal-delivery-1",
+            "delivery_guarantee": "retry_on_failure_outbox",
+        },
+    }
+
+    first = client.post("/api/v1/hooks/backup-cli", headers=auth(token), json=payload)
+    replay = client.post("/api/v1/hooks/backup-cli", headers=auth(token), json=payload)
+
+    assert first.status_code == 200, first.text
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["id"] == first.json()["id"]
+    assert replay.json()["title"] == "Backup is ready"
     created = [
         event
         for event in client.get("/api/v1/events", headers=auth(token)).json()["events"]
