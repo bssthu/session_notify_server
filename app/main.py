@@ -21,6 +21,8 @@ from .schemas import (
     AckRequest,
     AckResponse,
     AccessTokenResponse,
+    CodexAsyncQuestionAsked,
+    CodexAsyncQuestionAnswered,
     DeviceBindRequest,
     DeviceBindResponse,
     DevicePresenceSummary,
@@ -148,6 +150,8 @@ def _hook_metadata(payload: HookPayload, body_generated: bool) -> dict[str, obje
         metadata["turn_id"] = turn_id
     if payload.tool_input is not None:
         metadata["tool_input"] = payload.tool_input
+    if payload.codex_async is not None:
+        metadata["codex_async"] = payload.codex_async.model_dump(mode="json")
     metadata["body_generated"] = body_generated
     return {key: value for key, value in metadata.items() if value is not None}
 
@@ -507,10 +511,20 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         hook_meta = _hook_metadata(payload, body_generated)
         hook_meta.setdefault("ingest_source", "hook_bridge")
         dedupe_key = _hook_delivery_dedupe_key(source, payload, hook_meta, title)
+        signal = payload.codex_async
+        event_name = (payload.hook_event_name or "").lower()
+        valid_signal = source.lower() == "codex" and bool(payload.session_id) and (
+            isinstance(signal, CodexAsyncQuestionAsked) and event_name == "pretooluse"
+            and payload.tool_name in ("request_user_input_async", "functions.request_user_input_async")
+            or isinstance(signal, CodexAsyncQuestionAnswered) and event_name == "userpromptsubmit"
+        )
+        if valid_signal and isinstance(signal, CodexAsyncQuestionAsked):
+            dedupe_key = json.dumps(["codex_async_question", device.id, payload.session_id, signal.call_id])
         # 信号/噪声类 hook(PostToolUse/idle/paused/无内容 completed)不创建可见通知,从源头
         # 避免 active 堆积。resolve/ack 副作用与 suppress 无关,照常执行。
         suppress = _should_suppress_hook_notification(source, payload, body_generated, title)
         notification: Optional[NotificationPublic] = None
+        events_to_broadcast: list[SyncEvent] = []
         if not suppress:
             # approval 类(needs confirmation)即时性强,用短 TTL;其它 hook 通知维持默认 24h。
             permission_ttl = HOOK_PERMISSION_TTL if "needs confirmation" in title else HOOK_NOTIFICATION_TTL
@@ -530,7 +544,23 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 correlate_claude_approval=True,
             )
             if event is not None:
-                await hub.broadcast(event, storage.should_deliver_event_to_device)
+                events_to_broadcast.append(event)
+        if valid_signal and (notification is not None or isinstance(signal, CodexAsyncQuestionAnswered)):
+            delivery_id = str(hook_meta.get("delivery_id") or "")
+            if delivery_id:
+                resolved_events = storage.correlate_codex_async_question(
+                    device_id=device.id, session_id=payload.session_id, delivery_id=delivery_id,
+                    signal=signal, notification_id=notification.id if notification else None,
+                )
+                events_to_broadcast.extend(resolved_events)
+                if notification is not None:
+                    for resolved in resolved_events:
+                        if resolved.notification_id == notification.id:
+                            notification = notification.model_copy(update={
+                                "status": NotificationStatus.acknowledged, "updated_at": resolved.ack_at,
+                            })
+        for event in events_to_broadcast:
+            await hub.broadcast(event, storage.should_deliver_event_to_device)
         # 工具执行完成(PostToolUse)可作为审批已通过的尽力清理信号:按基础键 + turn_id
         # 仅 resolve 唯一匹配的活跃 permission request；歧义时保持 active，交给会话结束
         # 或 TTL 兜底。PostToolUse 本身被 suppress(不创建通知),但此副作用必须保留。

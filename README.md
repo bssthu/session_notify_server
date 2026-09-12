@@ -35,6 +35,7 @@ uv run pytest
 - 汇总 Windows 锁屏与通知暂停状态；Android 可按“未锁屏且未暂停”的电脑可用性决定是否展示提醒。
 - 幂等 ack：任一设备确认后，通知状态以服务端为准。
 - Codex / Claude Code hook payload 到统一通知的基础映射。
+- Codex 异步提问按来源设备、会话和完整题目指纹匹配回答，支持跨回合、逐题回答、重复投递和乱序补发；全部回答后持久确认并广播 `notification.acknowledged`。同题歧义时保留，Stop 和启动清理不消除未回答的异步问题。需要 Windows Hook bundle 9；应先更新服务端，再更新 Hook。
 - SQLite + WAL 本地存储。
 - 自签名证书生成脚本和 Docker Compose 部署骨架。
 - HTTPS/WSS 启动脚本，Compose 默认使用 `runtime/secrets/server.crt` 和 `server.key`。

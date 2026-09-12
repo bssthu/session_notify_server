@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
 
 SCHEMA_VERSION = 1
@@ -255,6 +255,22 @@ class EventsResponse(BaseModel):
     has_more: bool = False
 
 
+QuestionFingerprint = Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+
+
+class CodexAsyncQuestionAsked(BaseModel):
+    kind: Literal["asked"]
+    observed_at: AwareDatetime
+    call_id: str = Field(min_length=1, max_length=200)
+    question_hashes: list[QuestionFingerprint] = Field(min_length=1, max_length=100)
+
+
+class CodexAsyncQuestionAnswered(BaseModel):
+    kind: Literal["answered"]
+    observed_at: AwareDatetime
+    question_hash: QuestionFingerprint
+
+
 class HookPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -277,4 +293,5 @@ class HookPayload(BaseModel):
     tool_name: str | None = None
     permission_mode: str | None = None
     tool_input: dict[str, Any] | None = None
+    codex_async: CodexAsyncQuestionAsked | CodexAsyncQuestionAnswered | None = Field(default=None, discriminator="kind")
     metadata: dict[str, Any] = Field(default_factory=dict)

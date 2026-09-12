@@ -12,6 +12,8 @@ from typing import Any
 from .schemas import (
     AckResponse,
     AccessTokenResponse,
+    CodexAsyncQuestionAsked,
+    CodexAsyncQuestionAnswered,
     DeviceBindResponse,
     DevicePlatform,
     DevicePresenceSummary,
@@ -39,6 +41,16 @@ _HISTORY_MACHINE_OPTION_LIMIT = 100
 _HISTORY_AGENT_OPTION_LIMIT = 50
 _HISTORY_TAG_OPTION_LIMIT = 100
 _CLAUDE_APPROVAL_CORRELATION_WINDOW = timedelta(seconds=30)
+
+
+def _is_codex_async_question(source: str, metadata: dict[str, Any]) -> bool:
+    raw = metadata.get("raw")
+    raw = raw if isinstance(raw, dict) else {}
+    tool = str(metadata.get("tool_name") or metadata.get("toolName") or
+               raw.get("tool_name") or raw.get("toolName") or "").lower()
+    return source.lower() == "codex" and tool in (
+        "request_user_input_async", "functions.request_user_input_async",
+    )
 
 
 def _dt(value: datetime) -> str:
@@ -434,6 +446,31 @@ class Storage:
                     PRIMARY KEY(notification_id, device_id),
                     FOREIGN KEY(notification_id) REFERENCES notifications(id),
                     FOREIGN KEY(device_id) REFERENCES devices(id)
+                );
+
+                -- Keep answered question history too: identical wording asked
+                -- again cannot safely be paired by a quoted title alone.
+                CREATE TABLE IF NOT EXISTS codex_async_questions (
+                    device_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    call_id TEXT NOT NULL,
+                    question_index INTEGER NOT NULL,
+                    question_hash TEXT NOT NULL,
+                    asked_at TEXT NOT NULL,
+                    notification_id TEXT NOT NULL,
+                    answered_delivery_id TEXT,
+                    PRIMARY KEY(device_id, session_id, call_id, question_index)
+                );
+                CREATE INDEX IF NOT EXISTS idx_codex_async_question_match
+                ON codex_async_questions(device_id, session_id, question_hash, asked_at);
+
+                CREATE TABLE IF NOT EXISTS codex_async_answers (
+                    device_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    delivery_id TEXT NOT NULL,
+                    question_hash TEXT NOT NULL,
+                    answered_at TEXT NOT NULL,
+                    PRIMARY KEY(device_id, session_id, delivery_id)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_notifications_created_id
@@ -1605,6 +1642,87 @@ class Storage:
                 )
             )
 
+    def correlate_codex_async_question(
+        self,
+        *,
+        device_id: str,
+        session_id: str,
+        delivery_id: str,
+        signal: CodexAsyncQuestionAsked | CodexAsyncQuestionAnswered,
+        notification_id: str | None = None,
+    ) -> list[SyncEvent]:
+        """Persist receipts and uniquely match full-title fingerprints across turns.
+
+        Source timestamps prevent an old answer from clearing a later question.
+        Revisit stored answers after registration so failed/out-of-order delivery
+        does not lose an answer. Never guess between identical question titles.
+        """
+        observed_at = _dt(signal.observed_at.astimezone(timezone.utc))
+        events: list[SyncEvent] = []
+        with self._lock, self._conn:
+            if isinstance(signal, CodexAsyncQuestionAsked):
+                if notification_id is None:
+                    return []
+                for index, fingerprint in enumerate(signal.question_hashes):
+                    self._conn.execute(
+                        """INSERT OR IGNORE INTO codex_async_questions
+                        (device_id, session_id, call_id, question_index, question_hash,
+                         asked_at, notification_id) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (device_id, session_id, signal.call_id, index, fingerprint,
+                         observed_at, notification_id),
+                    )
+            else:
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO codex_async_answers
+                    (device_id, session_id, delivery_id, question_hash, answered_at)
+                    VALUES (?, ?, ?, ?, ?)""",
+                    (device_id, session_id, delivery_id, signal.question_hash, observed_at),
+                )
+
+            answers = self._conn.execute(
+                """SELECT * FROM codex_async_answers WHERE device_id = ? AND session_id = ?
+                ORDER BY answered_at, delivery_id""", (device_id, session_id),
+            ).fetchall()
+            for answer in answers:
+                matches = self._conn.execute(
+                    """SELECT rowid, answered_delivery_id FROM codex_async_questions
+                    WHERE device_id = ? AND session_id = ? AND question_hash = ? AND asked_at <= ?""",
+                    (device_id, session_id, answer["question_hash"], answer["answered_at"]),
+                ).fetchall()
+                if len(matches) != 1 or matches[0]["answered_delivery_id"] is not None:
+                    continue
+                self._conn.execute(
+                    "UPDATE codex_async_questions SET answered_delivery_id = ? WHERE rowid = ?",
+                    (answer["delivery_id"], matches[0]["rowid"]),
+                )
+
+            completed = self._conn.execute(
+                """SELECT notification_id FROM codex_async_questions
+                WHERE device_id = ? AND session_id = ? GROUP BY notification_id
+                HAVING COUNT(*) = COUNT(answered_delivery_id)""", (device_id, session_id),
+            ).fetchall()
+            now = utc_now()
+            for row in completed:
+                notification_id = row["notification_id"]
+                # Conditional update makes retries and simultaneous server workers
+                # produce exactly one acknowledgement event.
+                changed = self._conn.execute(
+                    "UPDATE notifications SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+                    (NotificationStatus.acknowledged.value, _dt(now), notification_id, NotificationStatus.active.value),
+                ).rowcount
+                if not changed:
+                    continue
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO acks(notification_id, device_id, ack_at, reason) VALUES (?, ?, ?, ?)",
+                    (notification_id, device_id, _dt(now), "async_question_answered"),
+                )
+                events.append(self._append_event(SyncEvent(
+                    event_id=new_id(), event_type=EventType.notification_acknowledged,
+                    created_at=now, notification_id=notification_id,
+                    ack_by_device_id=device_id, ack_at=now, reason="async_question_answered",
+                )))
+        return events
+
     def acknowledge_pending_permissions_for_session(
         self,
         *,
@@ -1639,6 +1757,10 @@ class Storage:
                 if notification.id == exclude_notification_id:
                     continue
                 if notification.session_id != target_session:
+                    continue
+                if _is_codex_async_question(source, notification.metadata):
+                    # Codex can receive the answer in a later turn; Stop does not
+                    # mean an asynchronous question was answered or dismissed.
                     continue
                 # approval 类(needs confirmation)都清理:claude 一次权限请求会产生
                 # PermissionRequest 与 Notification(permission_prompt) 两条通知,
@@ -1815,7 +1937,7 @@ class Storage:
         events: list[SyncEvent] = []
         with self._lock, self._conn:
             rows = self._conn.execute(
-                "SELECT id, title, metadata FROM notifications WHERE status = ?",
+                "SELECT id, source, title, metadata FROM notifications WHERE status = ?",
                 (NotificationStatus.active.value,),
             ).fetchall()
             for row in rows:
@@ -1828,6 +1950,8 @@ class Storage:
                 except (TypeError, ValueError):
                     metadata = {}
                 if not metadata.get("hook_event_name"):
+                    continue
+                if _is_codex_async_question(row["source"], metadata):
                     continue
                 self._conn.execute(
                     """

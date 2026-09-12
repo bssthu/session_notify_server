@@ -550,6 +550,9 @@ components:
             body_generated:
               type: boolean
               description: True when the server generated the notification body from its default fallback.
+            tag:
+              type: string
+              description: Optional bounded task tag copied from the hook environment and displayed defensively by clients.
           additionalProperties: true
     Notification:
       allOf:
@@ -669,6 +672,38 @@ components:
           description: Null when no cursor was supplied, false when the supplied cursor is unknown.
         has_more:
           type: boolean
+    CodexAsyncQuestionAsked:
+      type: object
+      required: [kind, observed_at, call_id, question_hashes]
+      properties:
+        kind:
+          const: asked
+        observed_at:
+          type: string
+          format: date-time
+        call_id:
+          type: string
+          minLength: 1
+          maxLength: 200
+        question_hashes:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            type: string
+            pattern: '^[a-f0-9]{64}$'
+    CodexAsyncQuestionAnswered:
+      type: object
+      required: [kind, observed_at, question_hash]
+      properties:
+        kind:
+          const: answered
+        observed_at:
+          type: string
+          format: date-time
+        question_hash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
     HookPayload:
       type: object
       properties:
@@ -698,5 +733,25 @@ components:
           type: [string, "null"]
         permission_mode:
           type: [string, "null"]
+        codex_async:
+          oneOf:
+            - $ref: "#/components/schemas/CodexAsyncQuestionAsked"
+            - $ref: "#/components/schemas/CodexAsyncQuestionAnswered"
+            - type: "null"
+          description: >-
+            Optional Codex async-question correlation, scoped to the authenticated
+            origin device and session_id. SHA-256 covers the full UTF-8 title with
+            CRLF/CR normalized to LF, before summary truncation. The bridge supplies
+            observed_at and metadata.delivery_id before queuing delivery. Asked is
+            accepted only for request_user_input_async PreToolUse; answered only for
+            UserPromptSubmit. Unique title matches may cross turn_id; all questions
+            in a call must be answered before notification.acknowledged is emitted
+            with reason async_question_answered. Submission creates no notification.
         metadata:
           type: object
+          properties:
+            tag:
+              type: string
+              maxLength: 120
+              description: Optional task tag. The Windows hook bridge populates this from SESSION_NOTIFY_TAG.
+          additionalProperties: true

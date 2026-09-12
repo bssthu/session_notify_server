@@ -85,8 +85,9 @@ def is_noise_hook_event(
     PostToolUse / idle / paused / 无内容 completed。needs-confirmation 与 failure 不命中。
     """
     # 1. PostToolUse:纯传输信号(用于 resolve 权限请求),不弹给用户。
-    if event_name == "posttooluse":
+    if event_name == "posttooluse" or (source == "codex" and event_name == "userpromptsubmit"):
         return True
+
 
     if _is_internal_codex_memory_consolidation(
         source=source,
