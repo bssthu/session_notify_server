@@ -9,7 +9,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any, Callable, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 
@@ -291,6 +291,17 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         pair_code_ttl=PAIR_CODE_TTL,
     )
     hub = WebSocketHub()
+
+    async def publish(
+        event: SyncEvent,
+        should_deliver: Callable[[SyncEvent, str], bool] | None = None,
+    ) -> None:
+        await hub.broadcast(
+            event,
+            storage.should_deliver_event_to_device if should_deliver is None else should_deliver,
+            storage.event_for_device_id,
+        )
+
     # 配对模式:strict(默认)= 已有已绑设备后新设备必须持配对码,首台裸 bind 放行;
     # easy = 配对码仅便捷入口,bind 永远放行(逃生口)。在 create_app 内读便于测试切换。
     pair_mode = os.getenv("SESSION_NOTIFY_PAIR_MODE", "strict").lower()
@@ -304,13 +315,13 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         # 残留(幂等,只动 active):它们永不会被 PostToolUse resolve,会一直 active 到 TTL,期间
         # 客户端重启 reload 会重显。置 acknowledged 后不再重显。
         for event in storage.acknowledge_legacy_permission_requests():
-            await hub.broadcast(event, storage.should_deliver_event_to_device)
+            await publish(event)
         # 一次性清空"创建层类型过滤"上线前的噪声历史堆积(主要是 PostToolUse),让客户端
         # reload/轮询立即干净,不必等 24h TTL。幂等:只动 active。
         for event in storage.acknowledge_legacy_noise_notifications():
-            await hub.broadcast(event, storage.should_deliver_event_to_device)
+            await publish(event)
         for event in storage.expire_due_notifications():
-            await hub.broadcast(event, storage.should_deliver_event_to_device)
+            await publish(event)
         expire_task = asyncio.create_task(_expire_due_loop(storage, hub))
         try:
             yield
@@ -410,7 +421,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             pair_consumed_device_name=meta["consumed_device_name"],
         )
         issued_by_device_id = meta["issued_by_device_id"]
-        await hub.broadcast(event, lambda _event, device_id: device_id == issued_by_device_id)
+        await publish(event, lambda _event, device_id: device_id == issued_by_device_id)
         return response
 
     @app.post("/api/v1/devices/pair/status", response_model=PairStatusResponse)
@@ -467,7 +478,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 any_unlocked_windows=summary.any_unlocked_windows,
                 any_unlocked_unpaused_windows=summary.any_unlocked_unpaused_windows,
             )
-            await hub.broadcast(event, lambda _event, device_id: storage.is_android_device(device_id))
+            await publish(event, lambda _event, device_id: storage.is_android_device(device_id))
         return summary
 
     @app.patch("/api/v1/devices/{device_id}", response_model=DevicePublic)
@@ -503,8 +514,9 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         device: DevicePublic = Depends(current_device),
     ) -> NotificationPublic:
         notification, event = storage.create_notification(request, origin_device=device)
-        await hub.broadcast(event, storage.should_deliver_event_to_device)
-        return notification
+        if event is not None:
+            await publish(event)
+        return storage.notification_for_device(notification, device.id)
 
     @app.post("/api/v1/hooks/{source}", response_model=Optional[NotificationPublic])
     async def receive_hook(
@@ -566,7 +578,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                                 "status": NotificationStatus.acknowledged, "updated_at": resolved.ack_at,
                             })
         for event in events_to_broadcast:
-            await hub.broadcast(event, storage.should_deliver_event_to_device)
+            await publish(event)
         # 工具执行完成(PostToolUse)可作为审批已通过的尽力清理信号:按基础键 + turn_id
         # 仅 resolve 唯一匹配的活跃 permission request；歧义时保持 active，交给会话结束
         # 或 TTL 兜底。PostToolUse 本身被 suppress(不创建通知),但此副作用必须保留。
@@ -579,7 +591,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 reason="auto_resolved",
             )
             if resolved is not None:
-                await hub.broadcast(resolved, storage.should_deliver_event_to_device)
+                await publish(resolved)
         # 会话结束类 hook = 该 session 的旧 permission request 必然已无意义(用户已拒绝/已处理/
         # 会话中断,不会有 PostToolUse 到达)。按会话批量 acknowledge 兜底清理,覆盖
         # resolve_pending_permission(只处理 PostToolUse)漏掉的拒绝/中断场景,避免短 TTL
@@ -597,8 +609,8 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 reason="session_finalized",
                 exclude_notification_id=preserved_notification_id,
             ):
-                await hub.broadcast(ev, storage.should_deliver_event_to_device)
-        return notification
+                await publish(ev)
+        return None if notification is None else storage.notification_for_device(notification, device.id)
 
     @app.get("/api/v1/notifications", response_model=list[NotificationPublic])
     def list_notifications(
@@ -607,10 +619,13 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     ) -> list[NotificationPublic]:
         if not device.notifications_enabled:
             return []
-        return storage.list_notifications(
-            status_filter or [NotificationStatus.active],
-            created_since=utc_now() - timedelta(days=NOTIFICATION_HISTORY_MAX_DAYS),
-        )
+        return [
+            storage.notification_for_device(item, device.id)
+            for item in storage.list_notifications(
+                status_filter or [NotificationStatus.active],
+                created_since=utc_now() - timedelta(days=NOTIFICATION_HISTORY_MAX_DAYS),
+            )
+        ]
 
     @app.get("/api/v1/notifications/recent", response_model=NotificationPage)
     def list_recent_notifications(
@@ -657,7 +672,9 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             agent=agent,
             tag=tag,
             query_text=q,
+            viewer_device_id=device.id,
         )
+        items = [storage.notification_for_device(item, device.id) for item in items]
         next_cursor = _encode_notification_cursor(items[-1]) if has_more and items else None
         return NotificationPage(
             items=items,
@@ -682,14 +699,18 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         except KeyError:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Notification not found") from None
         if event is not None:
-            await hub.broadcast(event, storage.should_deliver_event_to_device)
+            await publish(event)
         for related_event in storage.acknowledge_correlated_claude_approvals(
             response.notification,
             device_id=device.id,
             reason=request.reason,
         ):
-            await hub.broadcast(related_event, storage.should_deliver_event_to_device)
-        return response
+            await publish(related_event)
+        return response.model_copy(
+            update={
+                "notification": storage.notification_for_device(response.notification, device.id),
+            }
+        )
 
     @app.get("/api/v1/events", response_model=EventsResponse)
     def list_events(
@@ -744,7 +765,11 @@ async def _expire_due_loop(storage: Storage, hub: WebSocketHub) -> None:
         await asyncio.sleep(_EXPIRE_POLL_INTERVAL_SECONDS)
         try:
             for event in storage.expire_due_notifications():
-                await hub.broadcast(event, storage.should_deliver_event_to_device)
+                await hub.broadcast(
+                    event,
+                    storage.should_deliver_event_to_device,
+                    storage.event_for_device_id,
+                )
         except Exception:  # pragma: no cover
             pass
 

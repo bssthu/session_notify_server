@@ -70,7 +70,16 @@
           "properties": {
             "body_generated": {
               "type": "boolean",
-              "description": "True when the server generated the notification body from its default fallback because the hook payload contained no displayable text."
+              "description": "服务端因 Hook payload 没有可展示文本而写入默认正文时为 true。"
+            },
+            "tag": {
+              "type": "string",
+              "description": "可选任务标签。Hook Bridge 从 SESSION_NOTIFY_TAG 写入。"
+            },
+            "privacy_tag": {
+              "type": "string",
+              "enum": ["hide", "local"],
+              "description": "可选隐私模式。hide：所有设备下发的正文为 ***。local：仅来源设备看到明文。服务端存储保持明文，仅在下发时替换。"
             }
           },
           "additionalProperties": true

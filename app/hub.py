@@ -26,14 +26,20 @@ class WebSocketHub:
         self,
         event: SyncEvent,
         should_deliver: Callable[[SyncEvent, str], bool] | None = None,
+        prepare_event: Callable[[SyncEvent, str], SyncEvent] | None = None,
     ) -> None:
-        payload = event.model_dump(mode="json")
+        shared_payload = None if prepare_event is not None else event.model_dump(mode="json")
         async with self._lock:
             connections = list(self._connections.items())
         stale: list[WebSocket] = []
         for websocket, device_id in connections:
             if should_deliver is not None and not should_deliver(event, device_id):
                 continue
+            payload = (
+                prepare_event(event, device_id).model_dump(mode="json")
+                if prepare_event is not None
+                else shared_payload
+            )
             try:
                 await websocket.send_json(payload)
             except RuntimeError:

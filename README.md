@@ -35,6 +35,8 @@ uv run pytest
 - 汇总 Windows 锁屏与通知暂停状态；Android 可按“未锁屏且未暂停”的电脑可用性决定是否展示提醒。
 - 幂等 ack：任一设备确认后，通知状态以服务端为准。
 - Codex / Claude Code / Cursor / DeepSeek Harness hook payload 到统一通知的基础映射。
+- `SESSION_NOTIFY_TAG` 作为 `metadata.tag` 随通知保存，供客户端展示和历史筛选。
+- `SESSION_NOTIFY_PRIVACY_TAG`：`hide` 时所有设备下发的正文替换为 `***`；`local` 时仅来源设备看到明文。服务端存储保持明文，只在 REST / WebSocket 下发时按查看设备替换；对当前设备不可见的明文正文也不会进入历史关键词搜索。需要 Windows Hook bundle 11。
 - Codex 异步提问按来源设备、会话和完整题目指纹匹配回答，支持跨回合、逐题回答、重复投递和乱序补发；全部回答后持久确认并广播 `notification.acknowledged`。同题歧义时保留，Stop 和启动清理不消除未回答的异步问题。需要 Windows Hook bundle 9；应先更新服务端，再更新 Hook。
 - SQLite + WAL 本地存储。
 - 自签名证书生成脚本和 Docker Compose 部署骨架。

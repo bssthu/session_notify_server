@@ -252,14 +252,14 @@ paths:
         - name: tag
           in: query
           required: false
-          description: Case-insensitive literal substring matched against the notification tag metadata.
+          description: 大小写不敏感的字面子串，匹配通知 metadata 中的任务标签。
           schema:
             type: string
             maxLength: 120
         - name: q
           in: query
           required: false
-          description: Case-insensitive literal substring matched across title, body, session, source, machine, and tag.
+          description: 大小写不敏感的字面子串，匹配标题、正文、会话、来源、机器名和标签。对 hide 正文，或非来源设备查看 local 正文时，不会用存储中的明文正文做关键词匹配。
           schema:
             type: string
             maxLength: 160
@@ -545,14 +545,22 @@ components:
           type: boolean
         metadata:
           type: object
-          description: Arbitrary notification metadata. Hook notifications include `body_generated=true` when the server generated the body from its default fallback because the hook payload contained no displayable text.
+          description: 任意通知元数据。Hook 通知在服务端因 payload 没有可展示文本而写入默认正文时会带 `body_generated=true`。
           properties:
             body_generated:
               type: boolean
-              description: True when the server generated the notification body from its default fallback.
+              description: 服务端用默认回退正文时为 true。
             tag:
               type: string
-              description: Optional bounded task tag copied from the hook environment and displayed defensively by clients.
+              description: 可选任务标签。Hook Bridge 从 SESSION_NOTIFY_TAG 写入，客户端做有界展示。
+            privacy_tag:
+              type: string
+              enum: [hide, local]
+              description: >-
+                可选隐私模式。hide：所有设备下发的正文替换为 ***。
+                local：仅来源设备看到明文，其他设备替换为 ***。
+                服务端存储保持明文，仅在 REST / WebSocket 下发时替换。
+                Hook Bridge 从 SESSION_NOTIFY_PRIVACY_TAG 写入此字段。
           additionalProperties: true
     Notification:
       allOf:
@@ -753,5 +761,13 @@ components:
             tag:
               type: string
               maxLength: 120
-              description: Optional task tag. The Windows hook bridge populates this from SESSION_NOTIFY_TAG.
+              description: 可选任务标签。Windows Hook Bridge 从 SESSION_NOTIFY_TAG 写入。
+            privacy_tag:
+              type: string
+              enum: [hide, local]
+              description: >-
+                可选隐私模式。hide：所有设备下发的正文替换为 ***。
+                local：仅来源设备看到明文，其他设备替换为 ***。
+                服务端存储保持明文，仅在 REST / WebSocket 下发时替换。
+                Windows Hook Bridge 从 SESSION_NOTIFY_PRIVACY_TAG 写入。
           additionalProperties: true

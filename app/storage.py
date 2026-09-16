@@ -33,6 +33,12 @@ from .schemas import (
     utc_now,
 )
 from .hook_policy import is_codex_permission_request, is_noise_hook_event
+from .privacy import (
+    canonicalize_privacy_metadata,
+    redact_event_for_device,
+    redact_notification_for_device,
+    sqlite_body_visible_to_device,
+)
 from .security import new_token, sha256_text
 
 # 配对码字符集:去掉易混淆的 I/L/O/U/0/1,生成形如 7Q4K-9XKM 的人类可读码。
@@ -374,6 +380,12 @@ class Storage:
             "notification_tag_for_filter",
             1,
             _notification_tag_for_filter,
+            deterministic=True,
+        )
+        self._conn.create_function(
+            "notification_body_visible_to_device",
+            3,
+            sqlite_body_visible_to_device,
             deterministic=True,
         )
         self._conn.execute("PRAGMA foreign_keys = ON")
@@ -969,9 +981,19 @@ class Storage:
         return bool(row and row["notifications_enabled"])
 
     def event_for_device(self, event: SyncEvent, device: DevicePublic) -> SyncEvent:
-        if event.event_type != EventType.notification_created or device.notifications_enabled:
-            return event
-        return event.model_copy(update={"notification": None})
+        if event.event_type == EventType.notification_created and not device.notifications_enabled:
+            event = event.model_copy(update={"notification": None})
+        return self.event_for_device_id(event, device.id)
+
+    def event_for_device_id(self, event: SyncEvent, device_id: str) -> SyncEvent:
+        return redact_event_for_device(event, device_id)
+
+    def notification_for_device(
+        self,
+        notification: NotificationPublic,
+        device_id: str | None,
+    ) -> NotificationPublic:
+        return redact_notification_for_device(notification, device_id)
 
     def should_deliver_event_to_device(self, event: SyncEvent, device_id: str) -> bool:
         if event.event_type != EventType.notification_created:
@@ -1056,7 +1078,7 @@ class Storage:
             updated_at=now,
             expires_at=request.expires_at,
             requires_ack=request.requires_ack,
-            metadata=request.metadata,
+            metadata=canonicalize_privacy_metadata(request.metadata),
         )
         with self._lock, self._conn:
             if correlate_claude_approval:
@@ -1265,6 +1287,7 @@ class Storage:
         agent: str | None = None,
         tag: str | None = None,
         query_text: str | None = None,
+        viewer_device_id: str | None = None,
     ) -> tuple[list[NotificationPublic], bool, int, NotificationHistoryFilterOptions]:
         """Return one newest-first history page using a stable (created_at, id) cursor."""
         self.expire_due_notifications()
@@ -1298,9 +1321,17 @@ class Storage:
             values.append(tag_pattern)
         query_pattern = _history_contains_pattern(query_text)
         if query_pattern is not None:
+            body_match = "OR body LIKE ? ESCAPE '\\' COLLATE NOCASE "
+            body_values: list[Any] = [query_pattern]
+            if viewer_device_id:
+                body_match = (
+                    "OR (body LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                    "AND notification_body_visible_to_device(metadata, origin_device_id, ?) = 1) "
+                )
+                body_values = [query_pattern, viewer_device_id]
             conditions.append(
                 "(title LIKE ? ESCAPE '\\' COLLATE NOCASE "
-                "OR body LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                f"{body_match}"
                 "OR session_id LIKE ? ESCAPE '\\' COLLATE NOCASE "
                 "OR source LIKE ? ESCAPE '\\' COLLATE NOCASE "
                 "OR COALESCE(origin_device_name, '') LIKE ? ESCAPE '\\' COLLATE NOCASE "
@@ -1309,7 +1340,9 @@ class Storage:
                 "SELECT id FROM devices WHERE name LIKE ? ESCAPE '\\' COLLATE NOCASE) "
                 "OR notification_tag_for_filter(metadata) LIKE ? ESCAPE '\\' COLLATE NOCASE)"
             )
-            values.extend([query_pattern] * 8)
+            values.extend(
+                [query_pattern, *body_values, query_pattern, query_pattern, query_pattern, query_pattern, query_pattern, query_pattern]
+            )
 
         filter_options = self._recent_notification_filter_options(
             base_conditions,

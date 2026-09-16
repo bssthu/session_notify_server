@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from app.schemas import utc_now
+from app.schemas import NotificationStatus, utc_now
 
 
 def bind(client: TestClient, name: str = "desktop", platform: str = "windows") -> str:
@@ -752,6 +752,173 @@ def test_websocket_accepts_authorization_header(tmp_path):
         )
         assert response.status_code == 200, response.text
         assert websocket.receive_json()["notification"]["title"] == "Header auth works"
+
+
+def test_privacy_tag_redacts_body_on_distribution_but_keeps_storage_plaintext(tmp_path):
+    app = create_app(tmp_path / "server.db")
+    client = TestClient(app)
+    origin = bind_tokens(client, name="OriginPC")
+    phone = bind_tokens(client, name="Phone", platform="android")
+    secret = "Allow publishing the release notes?"
+
+    with client.websocket_connect("/api/v1/ws", headers=auth(origin["access_token"])) as origin_ws:
+        with client.websocket_connect("/api/v1/ws", headers=auth(phone["access_token"])) as phone_ws:
+            hidden = client.post(
+                "/api/v1/notifications",
+                headers=auth(origin["access_token"]),
+                json={
+                    "source": "codex",
+                    "session_id": "s-privacy-hide",
+                    "title": "Hidden body",
+                    "body": secret,
+                    "level": "info",
+                    "metadata": {"privacyTag": "HIDE"},
+                },
+            )
+            assert hidden.status_code == 200, hidden.text
+            assert hidden.json()["body"] == "***"
+            assert hidden.json()["metadata"]["privacy_tag"] == "hide"
+            assert origin_ws.receive_json()["notification"]["body"] == "***"
+            assert phone_ws.receive_json()["notification"]["body"] == "***"
+
+            local = client.post(
+                "/api/v1/notifications",
+                headers=auth(origin["access_token"]),
+                json={
+                    "source": "codex",
+                    "session_id": "s-privacy-local",
+                    "title": "Local body",
+                    "body": secret,
+                    "level": "info",
+                    "metadata": {"privacy_tag": "local"},
+                },
+            )
+            assert local.status_code == 200, local.text
+            assert local.json()["body"] == secret
+            assert local.json()["metadata"]["privacy_tag"] == "local"
+            assert origin_ws.receive_json()["notification"]["body"] == secret
+            assert phone_ws.receive_json()["notification"]["body"] == "***"
+
+    stored = [
+        item
+        for item in app.state.storage.list_notifications([NotificationStatus.active])
+        if item.title in {"Hidden body", "Local body"}
+    ]
+    assert [item.body for item in stored] == [secret, secret]
+
+    origin_list = client.get("/api/v1/notifications", headers=auth(origin["access_token"])).json()
+    phone_list = client.get("/api/v1/notifications", headers=auth(phone["access_token"])).json()
+    origin_by_title = {item["title"]: item["body"] for item in origin_list}
+    phone_by_title = {item["title"]: item["body"] for item in phone_list}
+    assert origin_by_title["Hidden body"] == "***"
+    assert origin_by_title["Local body"] == secret
+    assert phone_by_title["Hidden body"] == "***"
+    assert phone_by_title["Local body"] == "***"
+
+    origin_events = {
+        event["notification"]["title"]: event["notification"]["body"]
+        for event in client.get("/api/v1/events", headers=auth(origin["access_token"])).json()["events"]
+        if event.get("notification") and event["notification"]["title"] in {"Hidden body", "Local body"}
+    }
+    phone_events = {
+        event["notification"]["title"]: event["notification"]["body"]
+        for event in client.get("/api/v1/events", headers=auth(phone["access_token"])).json()["events"]
+        if event.get("notification") and event["notification"]["title"] in {"Hidden body", "Local body"}
+    }
+    assert origin_events == {"Hidden body": "***", "Local body": secret}
+    assert phone_events == {"Hidden body": "***", "Local body": "***"}
+
+    hidden_id = hidden.json()["id"]
+    origin_ack = client.post(
+        f"/api/v1/notifications/{hidden_id}/ack",
+        headers=auth(origin["access_token"]),
+        json={"reason": "user_confirmed"},
+    )
+    assert origin_ack.json()["notification"]["body"] == "***"
+
+    local_id = local.json()["id"]
+    phone_ack = client.post(
+        f"/api/v1/notifications/{local_id}/ack",
+        headers=auth(phone["access_token"]),
+        json={"reason": "user_confirmed"},
+    )
+    assert phone_ack.json()["notification"]["body"] == "***"
+
+    ignored = client.post(
+        "/api/v1/notifications",
+        headers=auth(origin["access_token"]),
+        json={
+            "source": "codex",
+            "session_id": "s-privacy-ignored",
+            "title": "Ignored privacy",
+            "body": secret,
+            "level": "info",
+            "metadata": {"privacy_tag": "secret"},
+        },
+    )
+    assert ignored.status_code == 200, ignored.text
+    assert ignored.json()["body"] == secret
+    assert "privacy_tag" not in ignored.json()["metadata"]
+
+
+def test_privacy_tag_keeps_hidden_bodies_out_of_remote_keyword_search(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    origin = bind_tokens(client, name="OriginPC")
+    phone = bind_tokens(client, name="Phone", platform="android")
+    secret = "unique-privacy-secret-phrase"
+
+    created = client.post(
+        "/api/v1/notifications",
+        headers=auth(origin["access_token"]),
+        json={
+            "source": "codex",
+            "session_id": "s-privacy-search",
+            "title": "Visible title",
+            "body": secret,
+            "level": "info",
+            "metadata": {"privacy_tag": "local"},
+        },
+    )
+    assert created.status_code == 200, created.text
+
+    origin_by_body = client.get(
+        "/api/v1/notifications/recent",
+        headers=auth(origin["access_token"]),
+        params={"days": 1, "q": secret, "visible_only": False},
+    )
+    phone_by_body = client.get(
+        "/api/v1/notifications/recent",
+        headers=auth(phone["access_token"]),
+        params={"days": 1, "q": secret, "visible_only": False},
+    )
+    phone_by_title = client.get(
+        "/api/v1/notifications/recent",
+        headers=auth(phone["access_token"]),
+        params={"days": 1, "q": "Visible title", "visible_only": False},
+    )
+    assert [item["body"] for item in origin_by_body.json()["items"]] == [secret]
+    assert phone_by_body.json()["items"] == []
+    assert [item["body"] for item in phone_by_title.json()["items"]] == ["***"]
+
+    hidden = client.post(
+        "/api/v1/hooks/codex",
+        headers=auth(origin["access_token"]),
+        json={
+            "hook_event_name": "Stop",
+            "session_id": "s-privacy-hook",
+            "message": secret,
+            "metadata": {"privacy_tag": "hide", "cwd": "I:/Projects/session_notify"},
+        },
+    )
+    assert hidden.status_code == 200, hidden.text
+    assert hidden.json()["body"] == "***"
+    assert hidden.json()["metadata"]["privacy_tag"] == "hide"
+    origin_hidden_search = client.get(
+        "/api/v1/notifications/recent",
+        headers=auth(origin["access_token"]),
+        params={"days": 1, "q": secret, "visible_only": False},
+    )
+    assert [item["id"] for item in origin_hidden_search.json()["items"]] == [created.json()["id"]]
 
 
 def test_refresh_token_rotates_access_token(tmp_path):
