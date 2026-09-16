@@ -242,8 +242,12 @@ def _hook_turn_id(metadata: Any) -> str:
     value = (
         meta.get("turn_id")
         or meta.get("turnId")
+        or meta.get("generation_id")
+        or meta.get("generationId")
         or raw.get("turn_id")
         or raw.get("turnId")
+        or raw.get("generation_id")
+        or raw.get("generationId")
     )
     # turn_id 是不透明标识符，只去除边缘空白，不做大小写归一化。
     return str(value or "").strip()

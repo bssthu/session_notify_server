@@ -998,6 +998,109 @@ def test_official_hook_event_mapping(tmp_path):
     assert permission.json()["title"] == "claude needs confirmation"
 
 
+def test_cursor_hook_event_mapping(tmp_path):
+    app = create_app(tmp_path / "server.db")
+    client = TestClient(app)
+    token = bind(client)
+
+    completed = client.post(
+        "/api/v1/hooks/cursor",
+        headers=auth(token),
+        json={
+            "event_type": "completed",
+            "hook_event_name": "stop",
+            "hook_status": "completed",
+            "session_id": "cursor-conversation",
+            "message": "Refactor finished.",
+        },
+    )
+    assert completed.status_code == 200, completed.text
+    assert completed.json()["level"] == "success"
+    assert completed.json()["title"] == "cursor completed"
+    assert completed.json()["body"] == "Refactor finished."
+    assert completed.json()["source"] == "cursor"
+
+    question = client.post(
+        "/api/v1/hooks/cursor",
+        headers=auth(token),
+        json={
+            "event_type": "approval_requested",
+            "hook_event_name": "preToolUse",
+            "hook_status": "approval_requested",
+            "tool_name": "AskQuestion",
+            "prompt": "Which environment?",
+            "session_id": "cursor-question",
+        },
+    )
+    assert question.status_code == 200, question.text
+    assert question.json()["level"] == "important"
+    assert question.json()["title"] == "cursor needs confirmation"
+    assert question.json()["body"] == "Which environment?"
+
+    failed = client.post(
+        "/api/v1/hooks/cursor",
+        headers=auth(token),
+        json={
+            "event_type": "failed",
+            "hook_event_name": "stop",
+            "hook_status": "failed",
+            "session_id": "cursor-error",
+        },
+    )
+    assert failed.status_code == 200, failed.text
+    assert failed.json()["level"] == "critical"
+    assert failed.json()["title"] == "cursor needs attention"
+
+    resolve = client.post(
+        "/api/v1/hooks/cursor",
+        headers=auth(token),
+        json={
+            "event_type": "postToolUse",
+            "hook_event_name": "postToolUse",
+            "hook_status": "postToolUse",
+            "tool_name": "AskQuestion",
+            "session_id": "cursor-question",
+        },
+    )
+    assert resolve.status_code == 200, resolve.text
+    assert resolve.json() is None
+
+    aborted = client.post(
+        "/api/v1/hooks/cursor",
+        headers=auth(token),
+        json={
+            "event_type": "paused",
+            "hook_event_name": "stop",
+            "hook_status": "paused",
+            "session_id": "cursor-aborted",
+        },
+    )
+    assert aborted.status_code == 200, aborted.text
+    assert aborted.json() is None
+
+
+def test_cursor_generation_id_promoted_to_turn_id(tmp_path):
+    app = create_app(tmp_path / "server.db")
+    client = TestClient(app)
+    token = bind(client)
+
+    question = client.post(
+        "/api/v1/hooks/cursor",
+        headers=auth(token),
+        json={
+            "event_type": "approval_requested",
+            "hook_event_name": "preToolUse",
+            "hook_status": "approval_requested",
+            "tool_name": "AskQuestion",
+            "prompt": "Which environment?",
+            "session_id": "cursor-generation",
+            "metadata": {"raw": {"generation_id": "cursor-gen-99"}},
+        },
+    )
+    assert question.status_code == 200, question.text
+    assert question.json()["metadata"]["turn_id"] == "cursor-gen-99"
+
+
 def test_requires_authorization(tmp_path):
     client = TestClient(create_app(tmp_path / "server.db"))
     response = client.get("/api/v1/notifications")
