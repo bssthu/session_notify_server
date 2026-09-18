@@ -580,8 +580,9 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         for event in events_to_broadcast:
             await publish(event)
         # 工具执行完成(PostToolUse)可作为审批已通过的尽力清理信号:按基础键 + turn_id
-        # 仅 resolve 唯一匹配的活跃 permission request；歧义时保持 active，交给会话结束
-        # 或 TTL 兜底。PostToolUse 本身被 suppress(不创建通知),但此副作用必须保留。
+        # 仅 resolve 唯一匹配的活跃 PermissionRequest / PreToolUse 提问；歧义时保持
+        # active，交给会话结束或 TTL 兜底。Codex 异步提问不走这条路径(PostToolUse 会
+        # 在用户回答前到达)。PostToolUse 本身被 suppress(不创建通知),但此副作用必须保留。
         if (payload.hook_event_name or "").lower() == "posttooluse":
             resolved = storage.resolve_pending_permission(
                 source=source,

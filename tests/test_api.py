@@ -1218,6 +1218,7 @@ def test_cursor_hook_event_mapping(tmp_path):
     assert failed.json()["level"] == "critical"
     assert failed.json()["title"] == "cursor needs attention"
 
+    question_id = question.json()["id"]
     resolve = client.post(
         "/api/v1/hooks/cursor",
         headers=auth(token),
@@ -1231,6 +1232,19 @@ def test_cursor_hook_event_mapping(tmp_path):
     )
     assert resolve.status_code == 200, resolve.text
     assert resolve.json() is None
+    active_ids = {
+        item["id"]
+        for item in client.get("/api/v1/notifications", headers=auth(token)).json()
+    }
+    assert question_id not in active_ids
+    question_acks = [
+        event
+        for event in client.get("/api/v1/events", headers=auth(token)).json()["events"]
+        if event["event_type"] == "notification.acknowledged"
+        and event["notification_id"] == question_id
+    ]
+    assert len(question_acks) == 1
+    assert question_acks[0]["reason"] == "auto_resolved"
 
     aborted = client.post(
         "/api/v1/hooks/cursor",
@@ -1841,6 +1855,179 @@ def test_posttooluse_resolves_matching_permission_request(tmp_path):
     assert len(ack_events) == 1
     assert ack_events[0]["notification_id"] == perm_id
     assert ack_events[0]["reason"] == "auto_resolved"
+
+
+def _interactive_question_payload(
+    event_name,
+    session_id,
+    *,
+    tool_name,
+    prompt="Which environment?",
+    cwd="I:/Projects/x",
+    event_type=None,
+):
+    if event_name.lower() == "posttooluse":
+        event_type = event_type or "completed"
+        hook_status = event_type
+    else:
+        event_type = event_type or "approval_requested"
+        hook_status = "approval_requested"
+    payload = {
+        "hook_event_name": event_name,
+        "event_type": event_type,
+        "hook_status": hook_status,
+        "session_id": session_id,
+        "cwd": cwd,
+        "tool_name": tool_name,
+    }
+    if prompt is not None and event_name.lower() != "posttooluse":
+        payload["prompt"] = prompt
+    return payload
+
+
+def _assert_auto_resolved(client, token, notification_id):
+    active_ids = {
+        item["id"]
+        for item in client.get("/api/v1/notifications", headers=auth(token)).json()
+    }
+    assert notification_id not in active_ids
+    ack_events = [
+        event
+        for event in client.get("/api/v1/events", headers=auth(token)).json()["events"]
+        if event["event_type"] == "notification.acknowledged"
+        and event["notification_id"] == notification_id
+    ]
+    assert len(ack_events) == 1
+    assert ack_events[0]["reason"] == "auto_resolved"
+
+
+def test_posttooluse_resolves_dsh_interactive_question(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    question = client.post(
+        "/api/v1/hooks/dsh",
+        headers=auth(token),
+        json=_interactive_question_payload(
+            "PreToolUse", "dsh-question", tool_name="ask_user_question"
+        ),
+    )
+    assert question.status_code == 200, question.text
+    assert question.json()["title"] == "dsh needs confirmation"
+    question_id = question.json()["id"]
+
+    post = client.post(
+        "/api/v1/hooks/dsh",
+        headers=auth(token),
+        json=_interactive_question_payload(
+            "PostToolUse", "dsh-question", tool_name="ask_user_question", prompt=None
+        ),
+    )
+    assert post.status_code == 200, post.text
+    assert post.json() is None
+    _assert_auto_resolved(client, token, question_id)
+
+
+def test_posttooluse_resolves_dsh_plan_confirmation(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    plan = client.post(
+        "/api/v1/hooks/dsh",
+        headers=auth(token),
+        json=_interactive_question_payload(
+            "PreToolUse",
+            "dsh-plan",
+            tool_name="exit_plan_mode",
+            prompt="Ship the floating window z-order fix.",
+        ),
+    )
+    assert plan.status_code == 200, plan.text
+    plan_id = plan.json()["id"]
+
+    post = client.post(
+        "/api/v1/hooks/dsh",
+        headers=auth(token),
+        json=_interactive_question_payload(
+            "PostToolUse", "dsh-plan", tool_name="exit_plan_mode", prompt=None
+        ),
+    )
+    assert post.status_code == 200, post.text
+    assert post.json() is None
+    _assert_auto_resolved(client, token, plan_id)
+
+
+def test_posttooluse_does_not_resolve_ambiguous_dsh_questions_without_turn_id(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    first = client.post(
+        "/api/v1/hooks/dsh",
+        headers=auth(token),
+        json=_interactive_question_payload(
+            "PreToolUse", "dsh-ambiguous", tool_name="ask_user_question", prompt="One?"
+        ),
+    )
+    second = client.post(
+        "/api/v1/hooks/dsh",
+        headers=auth(token),
+        json=_interactive_question_payload(
+            "PreToolUse", "dsh-ambiguous", tool_name="ask_user_question", prompt="Two?"
+        ),
+    )
+    assert first.status_code == 200 and second.status_code == 200
+
+    post = client.post(
+        "/api/v1/hooks/dsh",
+        headers=auth(token),
+        json=_interactive_question_payload(
+            "PostToolUse", "dsh-ambiguous", tool_name="ask_user_question", prompt=None
+        ),
+    )
+    assert post.status_code == 200, post.text
+    active_ids = {
+        item["id"]
+        for item in client.get("/api/v1/notifications", headers=auth(token)).json()
+    }
+    assert first.json()["id"] in active_ids
+    assert second.json()["id"] in active_ids
+
+
+def test_posttooluse_resolves_dsh_permission_request(tmp_path):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+
+    permission = client.post(
+        "/api/v1/hooks/dsh",
+        headers=auth(token),
+        json=_hook_payload(
+            "PermissionRequest",
+            "dsh-perm",
+            "",
+            cwd="R:/project",
+            tool_name="bash",
+            turn_id="call-77",
+        ),
+    )
+    assert permission.status_code == 200, permission.text
+    assert permission.json()["title"] == "dsh needs confirmation"
+    permission_id = permission.json()["id"]
+
+    post = client.post(
+        "/api/v1/hooks/dsh",
+        headers=auth(token),
+        json=_hook_payload(
+            "PostToolUse",
+            "dsh-perm",
+            "",
+            cwd="R:/project",
+            tool_name="bash",
+            turn_id="call-77",
+        ),
+    )
+    assert post.status_code == 200, post.text
+    assert post.json() is None
+    _assert_auto_resolved(client, token, permission_id)
 
 
 def test_posttooluse_does_not_resolve_same_command_from_another_turn(tmp_path):

@@ -59,6 +59,21 @@ def _is_codex_async_question(source: str, metadata: dict[str, Any]) -> bool:
     )
 
 
+def _is_posttooluse_resolvable_notification(notification: NotificationPublic) -> bool:
+    """PermissionRequest 与交互提问类 PreToolUse 都可由匹配的 PostToolUse 自动 resolve。
+
+    Codex 异步提问必须排除：PostToolUse 会在用户回答之前就到达，真正的关闭靠
+    UserPromptSubmit + correlate_codex_async_question。
+    """
+    metadata = notification.metadata if isinstance(notification.metadata, dict) else {}
+    if _is_codex_async_question(notification.source, metadata):
+        return False
+    if "needs confirmation" not in (notification.title or "").lower():
+        return False
+    event_name = _metadata_text(metadata, "hook_event_name", "hookEventName").lower()
+    return event_name in {"permissionrequest", "pretooluse"}
+
+
 def _dt(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
@@ -1603,7 +1618,11 @@ class Storage:
         device_id: str,
         reason: str,
     ) -> SyncEvent | None:
-        """PostToolUse 到达时,按基础键与 turn_id resolve 唯一匹配的活跃 permission。
+        """PostToolUse 到达时,按基础键与 turn_id resolve 唯一匹配的活跃审批。
+
+        覆盖 PermissionRequest（Claude/Codex 工具权限）以及 PreToolUse 交互提问
+        （DSH ask_user_question/exit_plan_mode、Cursor AskQuestion、Codex 同步
+        request_user_input）。Codex 异步提问除外。
 
         双方都有 turn_id 时必须相等；同一 turn 命中多条视为歧义并保持 no-op。为兼容
         旧 Bridge/历史通知，仅在没有带其它 turn_id 的候选且恰好只有一条 legacy 候选
@@ -1621,9 +1640,9 @@ class Storage:
             candidates: list[tuple[NotificationPublic, str]] = []
             for row in rows:
                 notification = self._notification_from_row(row)
-                meta = notification.metadata or {}
-                if str(meta.get("hook_event_name") or "").lower() != "permissionrequest":
+                if not _is_posttooluse_resolvable_notification(notification):
                     continue
+                meta = notification.metadata or {}
                 stored_key = _hook_resolution_key(
                     source=notification.source,
                     session_id=notification.session_id,
