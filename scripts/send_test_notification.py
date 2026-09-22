@@ -3,11 +3,11 @@
 
 This is the "test interface" for triggering notifications from your local
 machine so you can check how the Android (or Windows) floating island renders.
-It binds a throwaway test device, caches its token, and creates notifications.
+It pairs a test device with an explicit code, caches its token, and creates notifications.
 
 Run it from the server project (so ``uv`` can resolve the environment):
 
-    uv run python scripts/send_test_notification.py                  # one critical
+    uv run python scripts/send_test_notification.py --pair-code CODE # first run
     uv run python scripts/send_test_notification.py --all            # one of each level
     uv run python scripts/send_test_notification.py --level success
     uv run python scripts/send_test_notification.py --meeting        # countdown
@@ -24,27 +24,30 @@ Options:
     --meeting [SECONDS] Send a meeting-countdown notification (default 300s).
     --stack N           Send N notifications so the island shows the stack state.
     --clear             Acknowledge every active notification.
-    --no-cache          Always bind a fresh test device instead of reusing the
-                        cached token.
+    --pair-code CODE    Pair a new test device using a code from a bound client
+                        (or scripts/issue_bootstrap_code.py for the first device).
+    --no-cache          Ignore the cached token; requires --pair-code.
 
 The token cache lives at ``runtime/.test_device.json`` and is keyed by base URL,
-so the same test device is reused across runs (unless the server DB is reset,
-in which case the script rebinds automatically on HTTP 401).
+so the same test device is reused across runs. After expiry or a server reset,
+provide a fresh pairing code; HTTP 401 never creates an anonymous device.
 
 TLS: the server uses a self-signed certificate. For a localhost test trigger
-this script skips certificate verification (it only *creates* notifications; the
-real clients still pin the certificate fingerprint).
+this script skips certificate verification only for loopback. Remote servers
+require HTTPS and a trusted certificate. Redirects are not followed.
 """
 
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import ssl
 import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from datetime import datetime
 from pathlib import Path
 from typing import TextIO
@@ -86,10 +89,21 @@ def _log(message: str = "", *, file: TextIO = sys.stdout) -> None:
     print(f"[{_timestamp()}] {message}", file=file)
 
 
-def _ssl_context() -> ssl.SSLContext:
-    # Self-signed dev cert on localhost — verification is intentionally skipped
-    # for this test-only trigger.
-    return ssl._create_unverified_context()
+def _ssl_context(base_url: str) -> ssl.SSLContext:
+    parsed = urlsplit(base_url)
+    try:
+        loopback = ipaddress.ip_address(parsed.hostname or "").is_loopback
+    except ValueError:
+        loopback = parsed.hostname == "localhost"
+    if (not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or (parsed.scheme != "https" and not (parsed.scheme == "http" and loopback))):
+        raise ValueError("Use HTTPS for remote servers and a URL without credentials, query or fragment")
+    return ssl._create_unverified_context() if loopback else ssl.create_default_context()
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def _request(base_url: str, method: str, path: str, payload: dict | None, token: str | None) -> dict:
@@ -100,7 +114,10 @@ def _request(base_url: str, method: str, path: str, payload: dict | None, token:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, context=_ssl_context(), timeout=10) as resp:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=_ssl_context(base_url)), NoRedirect(),
+        )
+        with opener.open(req, timeout=10) as resp:
             body = resp.read().decode("utf-8")
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as exc:
@@ -136,12 +153,14 @@ def _save_cache(base_url: str, token: str) -> None:
     CACHE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-def _bind_device(base_url: str) -> str:
+def _bind_device(base_url: str, pair_code: str) -> str:
+    if not pair_code:
+        raise ValueError("A --pair-code is required to create the test device")
     resp = _request(
         base_url,
         "POST",
-        "/api/v1/devices/bind",
-        {"name": "test-sender", "platform": "windows"},
+        "/api/v1/devices/pair/consume",
+        {"name": "test-sender", "platform": "windows", "code": pair_code.strip().upper()},
         token=None,
     )
     token = resp["access_token"]
@@ -151,11 +170,13 @@ def _bind_device(base_url: str) -> str:
 
 
 def _get_token(args: argparse.Namespace) -> str:
+    if args.pair_code:
+        return _bind_device(args.base_url, args.pair_code)
     if not args.no_cache:
         cached = _load_cache(args.base_url)
         if cached:
             return cached
-    return _bind_device(args.base_url)
+    raise ValueError("No cached credential; supply --pair-code from a bound device or the local bootstrap command")
 
 
 def _create(base_url: str, token: str, notification: dict) -> dict:
@@ -164,8 +185,7 @@ def _create(base_url: str, token: str, notification: dict) -> dict:
     except HttpError as exc:
         if exc.status != 401:
             raise
-        token = _bind_device(base_url)
-        return _request(base_url, "POST", "/api/v1/notifications", notification, token)
+        raise ValueError("Test device credential is no longer valid; supply a fresh --pair-code") from exc
 
 
 def _ack_all(base_url: str, token: str) -> int:
@@ -213,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stack", type=int, default=0, help="send N stacked notifications")
     parser.add_argument("--clear", action="store_true", help="acknowledge all active notifications")
     parser.add_argument("--no-cache", action="store_true", help="bind a fresh test device")
+    parser.add_argument("--pair-code", default="", help="pair a new test device with this one-time code")
     args = parser.parse_args(argv)
 
     token = _get_token(args)
@@ -260,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except HttpError as exc:
+    except (HttpError, ValueError) as exc:
         _log(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
     except urllib.error.URLError as exc:

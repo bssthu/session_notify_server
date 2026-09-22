@@ -20,6 +20,22 @@ HTTPS/WSS 开发运行（**多设备扫码绑定必须用此方式**）：
 
 > 多设备绑定(桌面端「绑定新设备」生成二维码、移动端扫码)要求服务端以 HTTPS 启动:二维码里的服务端地址取自服务端实际协议,HTTP 启动会编出 `http://` 地址,而 Android 强制 HTTPS,会报 `baseUrl must use HTTPS`。HTTPS 下,Windows 桌面端首次连接会自动固定证书指纹(TOFU)、二维码也会带上服务端自报的指纹,移动端一扫即绑,无需手动配置指纹。**移动端要连上,服务端必须 `-HostAddress 0.0.0.0` 监听所有网卡**(默认 127.0.0.1 只回环,局域网设备连不上),并在 Windows 防火墙放行 8765 入站。
 
+## 首次绑定与凭据管理
+
+首次绑定（以及重置后的重新绑定）需要在服务端本机生成一次性配对码：
+
+```powershell
+uv run python scripts/issue_bootstrap_code.py
+# 使用非默认数据库时增加 --db <数据库路径>
+# Docker Compose: docker compose exec server python scripts/issue_bootstrap_code.py
+```
+
+在客户端填写服务器地址、证书指纹和该配对码即可绑定。配对码默认五分钟有效、只能使用一次；后续设备由已绑定设备签发配对码。已有设备仍可使用 refresh token 重新绑定。`SESSION_NOTIFY_PAIR_MODE` 默认 `strict`，未知取值拒绝启动；`easy` 仅供隔离开发环境使用，会关闭配对门禁。
+
+凭据全部丢失时，在服务端运行 `uv run python scripts/reset_devices.py`，然后重新生成初始化配对码。HTTP 重置入口已移除；本地重置会同时废止所有未使用配对码。撤销单台设备也会废止该设备签发的码。WebSocket 在令牌过期、轮换或设备撤销后断开，客户端刷新后重连；广播前也会重新检查授权。
+
+Docker 构建使用 `uv.lock` 中的应用依赖版本。隐私隐藏仍是下发过滤，数据库和 Hook 队列不是端到端加密存储。
+
 ## 测试
 
 ```powershell

@@ -553,33 +553,36 @@ class Storage:
         )
 
     def bind_device(self, name: str, platform: DevicePlatform) -> DeviceBindResponse:
+        with self._lock, self._conn:
+            return self._bind_device_locked(name, platform)
+
+    def _bind_device_locked(self, name: str, platform: DevicePlatform) -> DeviceBindResponse:
         created_at = utc_now()
         device_id = new_id()
         refresh_token = new_token("sn_refresh")
         access_token = new_token("sn_access")
         access_expires_at = created_at + self.access_ttl
         refresh_expires_at = created_at + self.refresh_ttl
-        with self._lock, self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO devices (
-                    id, name, platform, refresh_token_hash, access_token_hash,
-                    created_at, last_seen_at, revoked_at, notifications_enabled,
-                    access_expires_at, refresh_expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
-                """,
-                (
-                    device_id,
-                    name,
-                    platform.value,
-                    sha256_text(refresh_token),
-                    sha256_text(access_token),
-                    _dt(created_at),
-                    _dt(created_at),
-                    _dt(access_expires_at),
-                    _dt(refresh_expires_at),
-                ),
-            )
+        self._conn.execute(
+            """
+            INSERT INTO devices (
+                id, name, platform, refresh_token_hash, access_token_hash,
+                created_at, last_seen_at, revoked_at, notifications_enabled,
+                access_expires_at, refresh_expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
+            """,
+            (
+                device_id,
+                name,
+                platform.value,
+                sha256_text(refresh_token),
+                sha256_text(access_token),
+                _dt(created_at),
+                _dt(created_at),
+                _dt(access_expires_at),
+                _dt(refresh_expires_at),
+            ),
+        )
         return DeviceBindResponse(
             device=DevicePublic(
                 id=device_id,
@@ -646,13 +649,14 @@ class Storage:
         )
 
     def revoke_all_devices(self) -> int:
-        """撤销所有未撤销设备,回到 bootstrap 态。供 localhost-only 的 reset 端点用。返回撤销数。"""
+        """撤销所有未撤销设备,回到 bootstrap 态。仅供服务端本地管理脚本使用。返回撤销数。"""
         now = utc_now()
         with self._lock, self._conn:
             cursor = self._conn.execute(
                 "UPDATE devices SET revoked_at = ? WHERE revoked_at IS NULL",
                 (_dt(now),),
             )
+            self._conn.execute("DELETE FROM pair_codes")
         return cursor.rowcount
 
     def list_devices(self) -> list[DevicePublic]:
@@ -733,6 +737,7 @@ class Storage:
                 "UPDATE devices SET revoked_at = ? WHERE id = ?",
                 (_dt(revoked_at), device_id),
             )
+            self._conn.execute("DELETE FROM pair_codes WHERE issued_by_device_id = ?", (device_id,))
             row = self._conn.execute(
                 """
                 SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
@@ -901,60 +906,69 @@ class Storage:
         return bool(row and row["platform"] == DevicePlatform.android.value)
 
     def issue_pair_code(self, device: DevicePublic) -> tuple[str, datetime]:
-        """已绑设备签发一个一次性配对码(默认 5 分钟有效)。明文码不落库,只存哈希。"""
-        created_at = utc_now()
-        expires_at = created_at + self.pair_code_ttl
-        code = "{}-{}".format(
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            if not self._conn.execute(
+                "SELECT 1 FROM devices WHERE id = ? AND revoked_at IS NULL", (device.id,),
+            ).fetchone():
+                raise ValueError("Pairing issuer is no longer active")
+            return self._issue_pair_code_locked(device.id)
+
+    def issue_bootstrap_code(self) -> tuple[str, datetime]:
+        """Local administrator operation; deliberately has no HTTP endpoint."""
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            if self.has_any_device():
+                raise ValueError("An active device already exists; issue a code from that device")
+            self._conn.execute("DELETE FROM pair_codes WHERE issued_by_device_id = '@bootstrap'")
+            return self._issue_pair_code_locked("@bootstrap")
+
+    def _issue_pair_code_locked(self, issuer: str) -> tuple[str, datetime]:
+        now = utc_now()
+        expires_at = now + self.pair_code_ttl
+        code = secrets.token_hex(16).upper() if issuer == "@bootstrap" else "{}-{}".format(
             "".join(secrets.choice(_PAIR_ALPHABET) for _ in range(4)),
             "".join(secrets.choice(_PAIR_ALPHABET) for _ in range(4)),
         )
-        with self._lock, self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO pair_codes (code_hash, issued_by_device_id, created_at, expires_at, consumed_at, consumed_device_id)
-                VALUES (?, ?, ?, ?, NULL, NULL)
-                """,
-                (sha256_text(code), device.id, _dt(created_at), _dt(expires_at)),
-            )
+        self._conn.execute(
+            "INSERT INTO pair_codes (code_hash, issued_by_device_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (sha256_text(code), issuer, _dt(now), _dt(expires_at)),
+        )
         return code, expires_at
 
     def consume_pair_code(
         self, code: str, name: str, platform: DevicePlatform
     ) -> tuple[DeviceBindResponse, dict] | None:
-        """消费配对码 → 复用 bind_device 绑定新设备。无效/过期/已用返回 None(一次性)。
-
-        成功时额外返回配对码元信息(供调用方构造 pair.consumed 推送事件):
-        {code_hash, issued_by_device_id, consumed_device_name}。
-        """
         code_hash = sha256_text(code)
         now = utc_now()
+        # Serialize against other processes as well as threads. The issuer check,
+        # code consumption and device insert are committed as one transaction.
         with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
             row = self._conn.execute(
                 "SELECT code_hash, expires_at, consumed_at, issued_by_device_id FROM pair_codes WHERE code_hash = ?",
                 (code_hash,),
             ).fetchone()
-            if row is None or row["consumed_at"] is not None:
+            if row is None or row["consumed_at"] is not None or (_parse_dt(row["expires_at"]) or now) <= now:
                 return None
-            if (_parse_dt(row["expires_at"]) or now) <= now:
+            issuer = row["issued_by_device_id"]
+            if issuer == "@bootstrap":
+                if self.has_any_device():
+                    return None
+            elif not self._conn.execute(
+                "SELECT 1 FROM devices WHERE id = ? AND revoked_at IS NULL", (issuer,),
+            ).fetchone():
                 return None
-            issued_by_device_id = row["issued_by_device_id"]
-            # 先标记消费防并发重复使用,再在锁外执行 bind_device(它自带锁)。
+            response = self._bind_device_locked(name, platform)
             self._conn.execute(
-                "UPDATE pair_codes SET consumed_at = ? WHERE code_hash = ?",
-                (_dt(now), code_hash),
+                "UPDATE pair_codes SET consumed_at = ?, consumed_device_id = ? WHERE code_hash = ?",
+                (_dt(now), response.device.id, code_hash),
             )
-        response = self.bind_device(name, platform)
-        with self._lock, self._conn:
-            self._conn.execute(
-                "UPDATE pair_codes SET consumed_device_id = ? WHERE code_hash = ?",
-                (response.device.id, code_hash),
-            )
-        meta = {
-            "code_hash": code_hash,
-            "issued_by_device_id": issued_by_device_id,
-            "consumed_device_name": response.device.name,
-        }
-        return response, meta
+            return response, {
+                "code_hash": code_hash,
+                "issued_by_device_id": issuer,
+                "consumed_device_name": response.device.name,
+            }
 
     def pair_code_status(self, code: str) -> dict | None:
         """按明文码查询配对状态(只读,不消费)。查不到返回 None;
@@ -1011,9 +1025,20 @@ class Storage:
         return redact_notification_for_device(notification, device_id)
 
     def should_deliver_event_to_device(self, event: SyncEvent, device_id: str) -> bool:
-        if event.event_type != EventType.notification_created:
-            return True
-        return self.device_notifications_enabled(device_id)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT notifications_enabled FROM devices WHERE id = ? AND revoked_at IS NULL", (device_id,),
+            ).fetchone()
+        return bool(row) and (event.event_type != EventType.notification_created or bool(row["notifications_enabled"]))
+
+    def access_token_is_valid(self, token_hash: str) -> bool:
+        # Read-only check for long-lived transports (does not renew last_seen_at).
+        with self._lock:
+            return self._conn.execute(
+                "SELECT 1 FROM devices WHERE access_token_hash = ? AND revoked_at IS NULL "
+                "AND (access_expires_at IS NULL OR access_expires_at > ?)",
+                (token_hash, _dt(utc_now())),
+            ).fetchone() is not None
 
     def authenticate(self, access_token: str) -> DevicePublic | None:
         token_hash = sha256_text(access_token)

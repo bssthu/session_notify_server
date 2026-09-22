@@ -48,6 +48,7 @@ from .schemas import (
 )
 from .hook_policy import is_noise_hook_event
 from .storage import Storage
+from .security import sha256_text
 
 configure_server_logging()
 
@@ -289,6 +290,9 @@ def _should_suppress_hook_notification(
 
 
 def create_app(db_path: str | Path | None = None) -> FastAPI:
+    pair_mode = os.getenv("SESSION_NOTIFY_PAIR_MODE", "strict").strip().lower()
+    if pair_mode not in {"strict", "easy"}:
+        raise ValueError("SESSION_NOTIFY_PAIR_MODE must be strict or easy")
     storage = Storage(
         db_path or os.getenv("SESSION_NOTIFY_DB", "runtime/session_notify.db"),
         access_ttl=ACCESS_TOKEN_TTL,
@@ -307,9 +311,8 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             storage.event_for_device_id,
         )
 
-    # 配对模式:strict(默认)= 已有已绑设备后新设备必须持配对码,首台裸 bind 放行;
-    # easy = 配对码仅便捷入口,bind 永远放行(逃生口)。在 create_app 内读便于测试切换。
-    pair_mode = os.getenv("SESSION_NOTIFY_PAIR_MODE", "strict").lower()
+    # strict also requires a locally issued pairing code for the first device.
+    # easy is an explicit development-only opt-out.
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -350,10 +353,10 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
 
     @app.post("/api/v1/devices/bind", response_model=DeviceBindResponse)
     def bind_device(request: DeviceBindRequest) -> DeviceBindResponse:
-        # strict 模式:已存在已绑设备时,裸 bind 拒绝。但本机可凭旧 refresh_token 重新绑定
-        # (rebind,换发新 token),避免本机凭证丢失时死锁。首台(无设备)直接放行。
+        # Every new device requires a pairing code, including the first device.
+        # A refresh token may rebind an existing device.
         # easy 模式:bind 永远放行,配对码仅作免填地址的便捷入口。
-        if pair_mode == "strict" and storage.has_any_device():
+        if pair_mode == "strict":
             if request.refresh_token:
                 rebound = storage.rebind_device(request.refresh_token, request.name, request.platform)
                 if rebound is not None:
@@ -363,15 +366,6 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 detail="Pairing code required; use POST /api/v1/devices/pair/consume or rebind with refresh_token",
             )
         return storage.bind_device(request.name, request.platform)
-
-    @app.post("/api/v1/devices/reset", response_model=dict)
-    def reset_all_devices(request: Request) -> dict:
-        # 撤销所有设备回到 bootstrap 态。仅限本机调用(自托管用户在服务端主机操作),
-        # 避免远程任意重置。用于 strict 模式下本机凭证全丢、又无其他设备签发配对码的死锁。
-        client_host = request.client.host if request.client else ""
-        if client_host not in ("127.0.0.1", "::1", "localhost"):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Device reset is only allowed from localhost")
-        return {"revoked": storage.revoke_all_devices()}
 
     @app.post("/api/v1/auth/refresh", response_model=AccessTokenResponse)
     def refresh_access_token(request: TokenRefreshRequest) -> AccessTokenResponse:
@@ -396,7 +390,10 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         request: Request,
         device: DevicePublic = Depends(current_device),
     ) -> PairIssueResponse:
-        code, expires_at = storage.issue_pair_code(device)
+        try:
+            code, expires_at = storage.issue_pair_code(device)
+        except ValueError:
+            raise HTTPException(status_code=401, detail="Pairing issuer is no longer active") from None
         scheme = request.url.scheme or "https"
         port = request.url.port or int(os.getenv("SESSION_NOTIFY_PORT", "8765"))
         candidate_base_urls = [f"{scheme}://{ip}:{port}" for ip in list_local_ipv4_addresses()]
@@ -751,15 +748,26 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         header_token = None
         if auth_header and auth_header.lower().startswith("bearer "):
             header_token = auth_header.split(" ", 1)[1].strip()
-        device = storage.authenticate(header_token or token or "")
+        access_token = header_token or token or ""
+        device = storage.authenticate(access_token)
         if device is None:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
-        await hub.connect(websocket, device.id)
+        token_hash = sha256_text(access_token)
+        authorized = lambda: storage.access_token_is_valid(token_hash)
+        await hub.connect(websocket, device.id, authorized)
         try:
             while True:
-                await websocket.receive_text()
-        except WebSocketDisconnect:
+                if not authorized():
+                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                    break
+                try:
+                    await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
             await hub.disconnect(websocket)
 
     return app

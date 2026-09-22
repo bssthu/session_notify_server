@@ -15,6 +15,7 @@ paths:
           description: Service health.
   /api/v1/devices/bind:
     post:
+      description: In strict mode this endpoint only rebinds an existing device using its refresh token. New devices, including the first device, consume a pairing code issued locally or by an active device.
       security: []
       requestBody:
         required: true
@@ -49,27 +50,11 @@ paths:
               $ref: "#/components/schemas/PairConsumeRequest"
       responses:
         "200":
-          description: Newly bound device credentials (same shape as bind).
+          description: Newly bound device credentials. Bootstrap codes are issued by the server-local issue_bootstrap_code.py command. Device-issued codes become invalid when their issuer is revoked.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceBindResponse"
-  /api/v1/devices/reset:
-    post:
-      security: []
-      description: Revoke all devices and return to bootstrap state. Localhost-only (127.0.0.1/::1).
-      responses:
-        "200":
-          description: Count of revoked devices.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  revoked:
-                    type: integer
-        "403":
-          description: Called from a non-localhost host.
   /api/v1/devices:
     get:
       responses:

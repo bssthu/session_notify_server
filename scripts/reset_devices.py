@@ -2,9 +2,9 @@
 """撤销所有已绑设备,回到 bootstrap 态。
 
 用于 strict 配对模式下,本机凭证完全丢失、又没有其他已绑设备能签发配对码的死锁:
-在服务端主机本地跑此脚本 → 所有设备撤销 → 首台设备可重新裸 bind。
+在服务端主机本地跑此脚本 → 所有设备和配对码撤销 → 重新签发初始化配对码。
 
-等价于 localhost 调用 POST /api/v1/devices/reset,但无需服务端在跑、无需 curl。
+只能在服务端本机运行；不提供 HTTP 重置入口。
 
 用法:
     uv run python scripts/reset_devices.py            # 交互确认
@@ -50,10 +50,6 @@ def main() -> int:
 
     storage = Storage(db_path)
     try:
-        if not storage.has_any_device():
-            print("当前没有已绑设备,已是 bootstrap 态,无需重置。")
-            return 0
-
         if not args.yes:
             answer = input("将撤销所有已绑设备(所有客户端需重新绑定)。继续?[y/N] ").strip().lower()
             if answer not in ("y", "yes"):
@@ -62,7 +58,7 @@ def main() -> int:
 
         revoked = storage.revoke_all_devices()
         print(f"已撤销 {revoked} 台设备。服务端回到 bootstrap 态。")
-        print("下一步:在客户端重新「绑定设备」(首台直接 bind;strict 模式下后续设备走配对码)。")
+        print("下一步:运行 scripts/issue_bootstrap_code.py，在客户端输入生成的配对码。")
         return 0
     finally:
         storage.close()

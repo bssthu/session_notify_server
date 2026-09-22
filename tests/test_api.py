@@ -2892,12 +2892,13 @@ def test_pair_consume_broadcasts_to_issuer(tmp_path):
         assert event["notification"] is None
 
 
-def test_strict_mode_first_device_binds_then_bare_bind_blocked(tmp_path, monkeypatch):
+def test_strict_mode_first_device_uses_local_pairing_code(tmp_path, monkeypatch):
     # conftest 默认 easy;此处显式切 strict 验证 bootstrap 门禁
     monkeypatch.setenv("SESSION_NOTIFY_PAIR_MODE", "strict")
     client = TestClient(create_app(tmp_path / "server.db"))
 
-    first = client.post("/api/v1/devices/bind", json={"name": "Host", "platform": "windows"})
+    code, _ = client.app.state.storage.issue_bootstrap_code()
+    first = client.post("/api/v1/devices/pair/consume", json={"code": code, "name": "Host", "platform": "windows"})
     assert first.status_code == 200, first.text
     host = first.json()
 
@@ -2919,7 +2920,8 @@ def test_easy_mode_allows_multiple_bare_binds(tmp_path, monkeypatch):
 def test_strict_mode_rebind_with_old_refresh_token(tmp_path, monkeypatch):
     monkeypatch.setenv("SESSION_NOTIFY_PAIR_MODE", "strict")
     client = TestClient(create_app(tmp_path / "server.db"))
-    first = client.post("/api/v1/devices/bind", json={"name": "Host", "platform": "windows"})
+    code, _ = client.app.state.storage.issue_bootstrap_code()
+    first = client.post("/api/v1/devices/pair/consume", json={"code": code, "name": "Host", "platform": "windows"})
     assert first.status_code == 200, first.text
     old_refresh = first.json()["refresh_token"]
     device_id = first.json()["device"]["id"]
@@ -2961,12 +2963,9 @@ def test_revoke_all_devices_via_storage(tmp_path):
     storage.close()
 
 
-def test_reset_endpoint_rejects_non_localhost(tmp_path):
-    # TestClient 的 client.host 非 127.0.0.1,reset 端点应 403(只允许本机调用)。
-    client = TestClient(create_app(tmp_path / "server.db"))
-    bind_tokens(client, name="A")
-    response = client.post("/api/v1/devices/reset")
-    assert response.status_code == 403
+def test_reset_is_only_a_local_management_operation(tmp_path):
+    app = create_app(tmp_path / "server.db")
+    assert "/api/v1/devices/reset" not in app.openapi()["paths"]
 
 
 def test_reset_devices_script_revokes_all(tmp_path):
@@ -2987,6 +2986,7 @@ def test_reset_devices_script_revokes_all(tmp_path):
         [sys.executable, str(script), "--yes", "--db", str(db)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=False,
     )
     assert result.returncode == 0, result.stderr
