@@ -18,7 +18,9 @@ HTTPS/WSS 开发运行（**多设备扫码绑定必须用此方式**）：
 .\scripts\run_dev_server.ps1 -HostAddress 0.0.0.0   # 监听所有网卡;默认 127.0.0.1 只回环,移动端/局域网设备连不上
 ```
 
-> 多设备绑定(桌面端「绑定新设备」生成二维码、移动端扫码)要求服务端以 HTTPS 启动:二维码里的服务端地址取自服务端实际协议,HTTP 启动会编出 `http://` 地址,而 Android 强制 HTTPS,会报 `baseUrl must use HTTPS`。HTTPS 下,Windows 桌面端首次连接会自动固定证书指纹(TOFU)、二维码也会带上服务端自报的指纹,移动端一扫即绑,无需手动配置指纹。**移动端要连上,服务端必须 `-HostAddress 0.0.0.0` 监听所有网卡**(默认 127.0.0.1 只回环,局域网设备连不上),并在 Windows 防火墙放行 8765 入站。
+Windows 桌面端首次 HTTPS 连接可自动固定证书指纹（TOFU），也可以预先填写证书脚本输出的 SHA-256 指纹。首台设备仍需按下节使用初始化配对码；绑定成功后，桌面端才能通过「绑定新设备」生成二维码。Android 扫码会填入地址、指纹和配对码，再点「连接 / 绑定」完成配对。
+
+二维码中的协议取自服务端请求，Android 只接受 HTTPS。手机应选用可达的局域网地址；`127.0.0.1` 仅供服务端本机使用，`10.0.2.2` 仅供 Android Emulator 访问宿主机。局域网设备连接时，服务端需监听 `0.0.0.0` 或对应网卡，并在防火墙放行 8765 入站。
 
 ## 首次绑定与凭据管理
 
@@ -30,11 +32,54 @@ uv run python scripts/issue_bootstrap_code.py
 # Docker Compose: docker compose exec server python scripts/issue_bootstrap_code.py
 ```
 
-在客户端填写服务器地址、证书指纹和该配对码即可绑定。配对码默认五分钟有效、只能使用一次；后续设备由已绑定设备签发配对码。已有设备仍可使用 refresh token 重新绑定。`SESSION_NOTIFY_PAIR_MODE` 默认 `strict`，未知取值拒绝启动；`easy` 仅供隔离开发环境使用，会关闭配对门禁。
+命令须在服务端项目目录执行，并使用运行中服务的同一个数据库。初始化配对码仅在没有有效设备时可签发，重新签发会废止前一个初始化码；已有有效设备时，应由该设备签发后续配对码。
+
+在客户端填写服务器地址、证书指纹和该配对码即可绑定。配对码默认五分钟有效、只能使用一次；客户端通过 `POST /api/v1/devices/pair/consume` 消费。默认 `strict` 模式下，`POST /api/v1/devices/bind` 只允许携带有效 refresh token 重新绑定已有设备，新设备（包括首台）不允许匿名绑定。`SESSION_NOTIFY_PAIR_MODE` 未知取值拒绝启动；`easy` 仅供隔离开发环境使用，会关闭配对门禁。
 
 凭据全部丢失时，在服务端运行 `uv run python scripts/reset_devices.py`，然后重新生成初始化配对码。HTTP 重置入口已移除；本地重置会同时废止所有未使用配对码。撤销单台设备也会废止该设备签发的码。WebSocket 在令牌过期、轮换或设备撤销后断开，客户端刷新后重连；广播前也会重新检查授权。
 
-Docker 构建使用 `uv.lock` 中的应用依赖版本。隐私隐藏仍是下发过滤，数据库和 Hook 队列不是端到端加密存储。
+隐私隐藏仍是下发过滤，数据库和 Hook 队列不是端到端加密存储。
+
+## Docker Compose
+
+在服务端项目目录执行；证书已存在时跳过生成步骤：
+
+```powershell
+.\scripts\generate_self_signed_cert.ps1
+docker compose up -d --build
+docker compose exec server python scripts/issue_bootstrap_code.py
+```
+
+Compose 使用 HTTPS 监听 8765，挂载 `runtime/secrets/` 中的证书和私钥，数据库保存在 `session_notify_data` 命名卷中。初始化和重置命令应通过 `docker compose exec server` 在容器内执行，使用 `/data/session_notify.db`；宿主机默认的 `runtime/session_notify.db` 是另一个数据库。构建通过 `uv sync --frozen --no-dev` 使用 `uv.lock` 中的应用依赖版本。
+
+## 配置
+
+服务从进程环境读取配置；`.env.example` 不会被启动脚本自动加载。PowerShell 中使用 `$env:变量名 = "值"`，Compose 部署则在 `compose.yaml` 的 `environment` 中配置。
+
+| 环境变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `SESSION_NOTIFY_DB` | `runtime/session_notify.db` | SQLite 数据库路径；Compose 覆盖为 `/data/session_notify.db` |
+| `SESSION_NOTIFY_PAIR_MODE` | `strict` | 新设备配对门禁 |
+| `SESSION_NOTIFY_CERT_FILE` | `runtime/secrets/server.crt` | 配对二维码所需的服务端证书指纹来源 |
+| `SESSION_NOTIFY_ACCESS_TTL_SECONDS` | `3600` | access token 有效秒数 |
+| `SESSION_NOTIFY_REFRESH_TTL_DAYS` | `90` | refresh token 有效天数 |
+| `SESSION_NOTIFY_PAIR_CODE_TTL_SECONDS` | `300` | 已绑定设备签发的配对码有效秒数；本地初始化脚本使用默认五分钟 |
+| `SESSION_NOTIFY_HOOK_TTL_HOURS` | `24` | 普通 Hook 通知有效小时数 |
+| `SESSION_NOTIFY_PERMISSION_TTL_MINUTES` | `30` | 普通工具权限审批通知有效分钟数 |
+| `SESSION_NOTIFY_DEVICE_PRESENCE_TTL_SECONDS` | `90` | Windows 在线状态有效秒数 |
+
+监听地址和端口由 `run_dev_server.ps1 -HostAddress ... -Port ...` 或 uvicorn 参数决定，`.env.example` 的 `SESSION_NOTIFY_HOST` / `SESSION_NOTIFY_PORT` 不会替代这些参数。若通过 `-CertFile` 指定其他证书，还需把 `SESSION_NOTIFY_CERT_FILE` 指向同一文件，保证二维码指纹一致。
+
+## 手动发送测试通知
+
+先从已绑定客户端取得一个新的配对码，再在服务端项目目录运行：
+
+```powershell
+uv run python scripts/send_test_notification.py --base-url https://127.0.0.1:8765 --pair-code "PASTE-PAIR-CODE" --all
+uv run python scripts/send_test_notification.py --base-url https://127.0.0.1:8765 --stack 3
+```
+
+脚本将测试设备的 access token 按地址缓存到 `runtime/.test_device.json`。缓存过期或设备被撤销后，需重新提供 `--pair-code`，不会自动匿名绑定或刷新 token。服务端尚无设备时，可先用本地初始化命令取码。自签证书的校验豁免仅限回环地址；远程地址必须使用 HTTPS 和受信任证书。`--clear` 会确认该设备可见的全部 active 通知，不限于测试通知。
 
 ## 测试
 
@@ -42,7 +87,7 @@ Docker 构建使用 `uv.lock` 中的应用依赖版本。隐私隐藏仍是下�
 uv run pytest
 ```
 
-## 首版能力
+## 当前能力
 
 - 设备绑定和 bearer token 认证。
 - refresh token 换取/轮换 access token。
