@@ -36,8 +36,8 @@ uv run pytest
 - 幂等 ack：任一设备确认后，通知状态以服务端为准。
 - Codex / Claude Code / Cursor / DeepSeek Harness hook payload 到统一通知的基础映射。
 - `SESSION_NOTIFY_TAG` 作为 `metadata.tag` 随通知保存，供客户端展示和历史筛选。
-- `SESSION_NOTIFY_PRIVACY_TAG`：`hide` 时所有设备下发的正文替换为 `***`；`local` 时仅来源设备看到明文。服务端存储保持明文，只在 REST / WebSocket 下发时按查看设备替换；对当前设备不可见的明文正文也不会进入历史关键词搜索。需要 Windows Hook bundle 11。
-- Codex 异步提问按来源设备、会话和完整题目指纹匹配回答，支持跨回合、逐题回答、重复投递和乱序补发；全部回答后持久确认并广播 `notification.acknowledged`。同题歧义时保留，Stop 和启动清理不消除未回答的异步问题。需要 Windows Hook bundle 9；应先更新服务端，再更新 Hook。
+- `SESSION_NOTIFY_PRIVACY_TAG`：`hide` 时所有设备下发的正文替换为 `***`；`local` 时仅来源设备看到明文。正文不可见时，metadata 仅保留展示与关联控制字段，移除原始 payload、工具输入和自由文本诊断。服务端存储保持明文；不可见的正文不会进入历史关键词搜索。需要 Windows Hook bundle 11。
+- Codex 异步提问按来源设备、会话和完整题目指纹匹配回答，支持跨回合、逐题回答、重复投递和乱序补发；全部回答后持久确认并广播 `notification.acknowledged`。同题歧义时保留；迟到题目使原匹配产生歧义时，撤销未过期通知的自动确认，并通过原 ID 的 `notification.created` 更新两端，手动确认始终保留。Stop 和启动清理不消除未回答的异步问题。需要 Windows Hook bundle 9；应先更新服务端，再更新 Hook。
 - SQLite + WAL 本地存储。
 - 自签名证书生成脚本和 Docker Compose 部署骨架。
 - HTTPS/WSS 启动脚本，Compose 默认使用 `runtime/secrets/server.crt` 和 `server.key`。

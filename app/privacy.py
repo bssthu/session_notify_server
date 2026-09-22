@@ -21,6 +21,36 @@ PRIVACY_METADATA_KEYS = (
     "sessionNotifyPrivacyTag",
 )
 
+# Hidden notifications expose only presentation/correlation controls. Hook raw
+# payloads, tool inputs and arbitrary diagnostic fields can all duplicate the
+# body, so a denylist of message field names is not sufficient.
+_PUBLIC_METADATA_KEYS = frozenset({
+    "privacytag", "sessionnotifyprivacytag", "tag", "sessionnotifytag",
+    "hookeventtype", "hookeventname", "hookstatus", "raweventtype", "notificationtype",
+    "sourcetool", "toolname", "permissionmode", "permissionmodesource", "bodygenerated",
+    "cwd", "workingdirectory", "transcriptpath", "sessionid", "turnid", "generationid",
+    "deliveryid", "deliveryguarantee", "ingestsource", "eventfamily", "eventcorrelation",
+    "kind", "localonly", "controllable", "remainingfraction", "remainingseconds",
+    "totalseconds", "durationseconds", "countdownlocal", "countdownstatus", "countdownrun",
+    "countdownnodekey", "alarmtime", "alarmrepeat", "alarmeffect", "alarmeventkey",
+    "alarmsnoozeminutes", "alarmpreview", "alarmlocal", "color",
+})
+
+
+def _public_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        key: value for key, value in metadata.items()
+        if key.replace("_", "").lower() in _PUBLIC_METADATA_KEYS
+        and isinstance(value, (str, bool, int, float, type(None)))
+    }
+    signal = metadata.get("codex_async")
+    if isinstance(signal, dict):
+        result["codex_async"] = {
+            key: signal[key] for key in ("kind", "call_id")
+            if isinstance(signal.get(key), str)
+        }
+    return result
+
 
 def _is_unsafe_format_control(code_point: int) -> bool:
     return (
@@ -117,9 +147,10 @@ def redact_notification_for_device(
         device_id,
     ):
         return notification
-    if notification.body == PRIVACY_HIDDEN_BODY:
+    metadata = _public_metadata(notification.metadata)
+    if notification.body == PRIVACY_HIDDEN_BODY and metadata == notification.metadata:
         return notification
-    return notification.model_copy(update={"body": PRIVACY_HIDDEN_BODY})
+    return notification.model_copy(update={"body": PRIVACY_HIDDEN_BODY, "metadata": metadata})
 
 
 def redact_event_for_device(event: SyncEvent, device_id: str | None) -> SyncEvent:

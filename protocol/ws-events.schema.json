@@ -79,7 +79,7 @@
             "privacy_tag": {
               "type": "string",
               "enum": ["hide", "local"],
-              "description": "可选隐私模式。hide：所有设备下发的正文为 ***。local：仅来源设备看到明文。服务端存储保持明文，仅在下发时替换。"
+              "description": "可选隐私模式。hide：所有设备下发的正文为 ***。local：仅来源设备看到明文。正文不可见时 metadata 只下发展示和关联控制字段，移除 raw、工具输入和自由文本诊断。服务端存储保持明文。"
             }
           },
           "additionalProperties": true
@@ -98,7 +98,8 @@
       "format": "date-time"
     },
     "reason": {
-      "type": ["string", "null"]
+      "type": ["string", "null"],
+      "description": "async_question_ambiguous on notification.created restores a previously auto-acknowledged, unexpired question by its original id after late delivery reveals ambiguous title matching. Manual acknowledgements are preserved."
     },
     "pair_code_hash": {
       "type": ["string", "null"]

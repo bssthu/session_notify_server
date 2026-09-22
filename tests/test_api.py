@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
@@ -1681,6 +1683,7 @@ def _codex_terminal_failure_payload(
         "message": "stream disconnected before completion",
         "metadata": {
             "ingest_source": ingest_source,
+            **({"delivery_id": uuid4().hex} if not is_app_server else {}),
             "event_correlation": "remote_correlated" if is_app_server else "hook_only",
             "app_server_port": 4500 if is_app_server else None,
         },
@@ -1754,6 +1757,31 @@ def test_codex_terminal_failure_dedupe_survives_server_restart(tmp_path):
     assert duplicate.status_code == 200, duplicate.text
     assert duplicate.json()["id"] == first.json()["id"]
     assert duplicate.json()["metadata"]["ingest_sources"] == ["app_server", "hook_bridge"]
+
+
+@pytest.mark.parametrize("first_source", ["hook_bridge", "app_server"])
+def test_terminal_failure_delivery_ids_preserve_ack_and_distinguish_turns(tmp_path, first_source):
+    db = tmp_path / "server.db"
+    with TestClient(create_app(db)) as client:
+        headers = auth(bind(client))
+        def failure(transport, turn="turn-1"):
+            return _codex_terminal_failure_payload(
+                session_id="terminal", turn_id=turn, ingest_source=transport,
+            )
+        first = client.post("/api/v1/hooks/codex", headers=headers, json=failure(first_source)).json()
+        client.post(f"/api/v1/notifications/{first['id']}/ack", headers=headers, json={})
+    with TestClient(create_app(db)) as client:
+        for transport in ("hook_bridge", "app_server", "hook_bridge"):
+            replay = client.post("/api/v1/hooks/codex", headers=headers, json=failure(transport))
+            assert replay.status_code == 200, replay.text
+            assert replay.json()["id"] == first["id"]
+            assert replay.json()["status"] == "acknowledged"
+        next_turn = client.post("/api/v1/hooks/codex", headers=headers, json=failure("hook_bridge", "turn-2"))
+        assert next_turn.json()["id"] != first["id"]
+        assert next_turn.json()["status"] == "active"
+        created = [event for event in client.get("/api/v1/events", headers=headers).json()["events"]
+                   if event["event_type"] == "notification.created"]
+        assert len(created) == 2
 
 
 def test_hook_delivery_id_makes_replayed_claude_failure_idempotent(tmp_path):

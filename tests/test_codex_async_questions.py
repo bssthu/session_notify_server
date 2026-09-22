@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from itertools import permutations
 from datetime import timedelta
 from uuid import uuid4
 
@@ -166,3 +167,89 @@ def test_ordinary_prompt_is_transport_only_even_without_new_metadata(tmp_path):
         headers = bind(client)
         assert post(client, {"hook_event_name": "UserPromptSubmit", "prompt": "Continue", "session_id": "session-1"}, headers) is None
         assert active(client, headers) == []
+
+
+@pytest.mark.parametrize("order", list(permutations(("first", "second", "answer"))))
+def test_ambiguous_answers_converge_for_every_delivery_order_across_restarts(tmp_path, order):
+    db = tmp_path / "server.db"
+    now = utc_now() - timedelta(seconds=10)
+    payloads = {
+        "first": ask(call="call-1", at=now),
+        "second": ask(call="call-2", at=now + timedelta(seconds=1)),
+        "answer": answer(at=now + timedelta(seconds=2)),
+    }
+    with TestClient(create_app(db)) as client:
+        headers = bind(client)
+    for kind in order:
+        with TestClient(create_app(db)) as client:
+            post(client, payloads[kind], headers)
+    with TestClient(create_app(db)) as client:
+        pending = active(client, headers)
+        assert {item["metadata"]["codex_async"]["call_id"] for item in pending} == {"call-1", "call-2"}
+        events_before_replay = client.get("/api/v1/events", headers=headers).json()["events"]
+        # The existing event contract must restore the same ids on live clients.
+        visible = set()
+        for event in events_before_replay:
+            if event["event_type"] == "notification.created":
+                visible.add(event["notification"]["id"])
+            elif event["event_type"] == "notification.acknowledged":
+                visible.discard(event["notification_id"])
+        assert visible == {item["id"] for item in pending}
+        for payload in payloads.values():
+            post(client, payload, headers)
+        assert client.get("/api/v1/events", headers=headers).json()["events"] == events_before_replay
+
+
+@pytest.mark.parametrize("manual_timing", ["before_answer", "after_answer"])
+@pytest.mark.parametrize("other_device", [False, True])
+def test_late_ambiguity_never_undoes_manual_ack(tmp_path, manual_timing, other_device):
+    with TestClient(create_app(tmp_path / "server.db")) as client:
+        headers = bind(client)
+        manual_headers = bind(client, "other") if other_device else headers
+        now = utc_now() - timedelta(seconds=10)
+        first = post(client, ask(at=now), headers)
+        def manual_ack():
+            response = client.post(f"/api/v1/notifications/{first['id']}/ack",
+                                   headers=manual_headers, json={"reason": "user_confirmed"})
+            assert response.status_code == 200
+        if manual_timing == "before_answer":
+            manual_ack()
+        post(client, answer(at=now + timedelta(seconds=2)), headers)
+        if manual_timing == "after_answer":
+            manual_ack()
+        second = post(client, ask(call="call-2", at=now + timedelta(seconds=1)), headers)
+        assert [item["id"] for item in active(client, headers)] == [second["id"]]
+
+
+def test_late_ambiguity_does_not_restore_expired_question(tmp_path):
+    app = create_app(tmp_path / "server.db")
+    with TestClient(app) as client:
+        headers = bind(client)
+        now = utc_now() - timedelta(seconds=10)
+        first = post(client, ask(at=now), headers)
+        post(client, answer(at=now + timedelta(seconds=2)), headers)
+        with app.state.storage._conn:
+            app.state.storage._conn.execute(
+                "UPDATE notifications SET expires_at = ? WHERE id = ?", (now.isoformat(), first["id"]),
+            )
+        second = post(client, ask(call="call-2", at=now + timedelta(seconds=1)), headers)
+        assert [item["id"] for item in active(client, headers)] == [second["id"]]
+
+
+def test_retracted_auto_ack_is_pushed_as_active_notification(tmp_path):
+    with TestClient(create_app(tmp_path / "server.db")) as client:
+        headers = bind(client)
+        now = utc_now() - timedelta(seconds=10)
+        with client.websocket_connect("/api/v1/ws", headers=headers) as websocket:
+            first = post(client, ask(at=now), headers)
+            assert websocket.receive_json()["notification"]["id"] == first["id"]
+            post(client, answer(at=now + timedelta(seconds=2)), headers)
+            assert websocket.receive_json()["event_type"] == "notification.acknowledged"
+            second = post(client, ask(call="call-2", at=now + timedelta(seconds=1)), headers)
+            assert websocket.receive_json()["notification"]["id"] == second["id"]
+            restored = websocket.receive_json()
+            assert restored["event_type"] == "notification.created"
+            assert restored["reason"] == "async_question_ambiguous"
+            assert restored["notification"]["id"] == first["id"]
+            assert restored["notification"]["status"] == "active"
+            assert restored["notification"]["expires_at"] == first["expires_at"]

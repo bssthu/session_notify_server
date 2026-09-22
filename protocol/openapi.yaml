@@ -560,6 +560,7 @@ components:
                 可选隐私模式。hide：所有设备下发的正文替换为 ***。
                 local：仅来源设备看到明文，其他设备替换为 ***。
                 服务端存储保持明文，仅在 REST / WebSocket 下发时替换。
+                正文不可见时 metadata 只下发展示和关联控制字段；raw、工具输入和自由文本诊断不下发。
                 Hook Bridge 从 SESSION_NOTIFY_PRIVACY_TAG 写入此字段。
           additionalProperties: true
     Notification:
@@ -755,6 +756,10 @@ components:
             UserPromptSubmit. Unique title matches may cross turn_id; all questions
             in a call must be answered before notification.acknowledged is emitted
             with reason async_question_answered. Submission creates no notification.
+            Late delivery that makes a prior match ambiguous retracts only automatic
+            acknowledgements of unexpired notifications, using notification.created
+            as an upsert of the original id with reason async_question_ambiguous.
+            Manual acknowledgements are never retracted.
         metadata:
           type: object
           properties:
@@ -769,5 +774,6 @@ components:
                 可选隐私模式。hide：所有设备下发的正文替换为 ***。
                 local：仅来源设备看到明文，其他设备替换为 ***。
                 服务端存储保持明文，仅在 REST / WebSocket 下发时替换。
+                正文不可见时 metadata 只下发展示和关联控制字段；raw、工具输入和自由文本诊断不下发。
                 Windows Hook Bridge 从 SESSION_NOTIFY_PRIVACY_TAG 写入。
           additionalProperties: true

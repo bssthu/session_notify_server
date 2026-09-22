@@ -189,6 +189,11 @@ def _hook_delivery_dedupe_key(
     metadata: dict[str, object],
     title: str,
 ) -> str | None:
+    terminal_key = _terminal_failure_dedupe_key(source, payload, metadata, title)
+    if terminal_key:
+        # The bridge's per-delivery UUID and the App Server transport describe
+        # the same terminal failure. Prefer its stable session/turn identity.
+        return terminal_key
     delivery_id = str(metadata.get("delivery_id") or "").strip()
     if delivery_id:
         return json.dumps(
@@ -196,7 +201,7 @@ def _hook_delivery_dedupe_key(
             ensure_ascii=False,
             separators=(",", ":"),
         )
-    return _terminal_failure_dedupe_key(source, payload, metadata, title)
+    return None
 
 
 def _resolve_hook_notification(source: str, payload: HookPayload) -> tuple[NotificationLevel, str]:
@@ -573,7 +578,9 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 events_to_broadcast.extend(resolved_events)
                 if notification is not None:
                     for resolved in resolved_events:
-                        if resolved.notification_id == notification.id:
+                        if resolved.notification is not None and resolved.notification.id == notification.id:
+                            notification = resolved.notification
+                        elif resolved.notification_id == notification.id:
                             notification = notification.model_copy(update={
                                 "status": NotificationStatus.acknowledged, "updated_at": resolved.ack_at,
                             })

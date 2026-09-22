@@ -1504,8 +1504,11 @@ class Storage:
 
             self._conn.execute(
                 """
-                INSERT OR IGNORE INTO acks(notification_id, device_id, ack_at, reason)
+                INSERT INTO acks(notification_id, device_id, ack_at, reason)
                 VALUES (?, ?, ?, ?)
+                ON CONFLICT(notification_id, device_id) DO UPDATE
+                SET ack_at = excluded.ack_at, reason = excluded.reason
+                WHERE acks.reason = 'async_question_answered'
                 """,
                 (notification_id, device_id, _dt(now), reason),
             )
@@ -1711,7 +1714,8 @@ class Storage:
 
         Source timestamps prevent an old answer from clearing a later question.
         Revisit stored answers after registration so failed/out-of-order delivery
-        does not lose an answer. Never guess between identical question titles.
+        does not lose an answer. A late question can invalidate an earlier unique
+        match: recalculate receipts and retract only automatic acknowledgements.
         """
         observed_at = _dt(signal.observed_at.astimezone(timezone.utc))
         events: list[SyncEvent] = []
@@ -1735,6 +1739,10 @@ class Storage:
                     (device_id, session_id, delivery_id, signal.question_hash, observed_at),
                 )
 
+            self._conn.execute(
+                """UPDATE codex_async_questions SET answered_delivery_id = NULL
+                WHERE device_id = ? AND session_id = ?""", (device_id, session_id),
+            )
             answers = self._conn.execute(
                 """SELECT * FROM codex_async_answers WHERE device_id = ? AND session_id = ?
                 ORDER BY answered_at, delivery_id""", (device_id, session_id),
@@ -1752,14 +1760,47 @@ class Storage:
                     (answer["delivery_id"], matches[0]["rowid"]),
                 )
 
-            completed = self._conn.execute(
-                """SELECT notification_id FROM codex_async_questions
-                WHERE device_id = ? AND session_id = ? GROUP BY notification_id
-                HAVING COUNT(*) = COUNT(answered_delivery_id)""", (device_id, session_id),
+            questions = self._conn.execute(
+                """SELECT n.*, COUNT(*) = COUNT(q.answered_delivery_id) AS fully_answered
+                FROM codex_async_questions q JOIN notifications n ON n.id = q.notification_id
+                WHERE q.device_id = ? AND q.session_id = ? GROUP BY n.id""", (device_id, session_id),
             ).fetchall()
             now = utc_now()
-            for row in completed:
-                notification_id = row["notification_id"]
+            for row in questions:
+                notification_id = row["id"]
+                expires_at = _parse_dt(row["expires_at"])
+                if expires_at is not None and expires_at <= now:
+                    continue
+                if not row["fully_answered"]:
+                    if row["status"] != NotificationStatus.acknowledged.value:
+                        continue
+                    acknowledgements = self._conn.execute(
+                        "SELECT reason FROM acks WHERE notification_id = ?", (notification_id,),
+                    ).fetchall()
+                    # An explicit acknowledgement, including one made after the
+                    # automatic ack on the same device, is never undone.
+                    if not acknowledgements or any(
+                        ack["reason"] != "async_question_answered" for ack in acknowledgements
+                    ):
+                        continue
+                    self._conn.execute(
+                        "UPDATE notifications SET status = ?, updated_at = ? WHERE id = ?",
+                        (NotificationStatus.active.value, _dt(now), notification_id),
+                    )
+                    self._conn.execute(
+                        "DELETE FROM acks WHERE notification_id = ? AND reason = ?",
+                        (notification_id, "async_question_answered"),
+                    )
+                    restored = self._notification_from_row(row).model_copy(update={
+                        "status": NotificationStatus.active, "updated_at": now,
+                    })
+                    # notification.created is already an idempotent upsert on
+                    # both clients, and also triggers Android's snapshot refresh.
+                    events.append(self._append_event(SyncEvent(
+                        event_id=new_id(), event_type=EventType.notification_created,
+                        created_at=now, notification=restored, reason="async_question_ambiguous",
+                    )))
+                    continue
                 # Conditional update makes retries and simultaneous server workers
                 # produce exactly one acknowledgement event.
                 changed = self._conn.execute(
