@@ -18,6 +18,7 @@ from .schemas import (
     DevicePlatform,
     DevicePresenceSummary,
     DevicePublic,
+    DeviceRole,
     DeviceSessionState,
     EventType,
     NotificationCreate,
@@ -40,6 +41,10 @@ from .privacy import (
     sqlite_body_visible_to_device,
 )
 from .security import new_token, sha256_text
+
+
+class LastAdministratorError(ValueError):
+    pass
 
 # 配对码字符集:去掉易混淆的 I/L/O/U/0/1,生成形如 7Q4K-9XKM 的人类可读码。
 _PAIR_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -418,6 +423,7 @@ class Storage:
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
                     platform TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'member',
                     refresh_token_hash TEXT NOT NULL UNIQUE,
                     access_token_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL,
@@ -435,6 +441,7 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS pair_codes (
                     code_hash TEXT PRIMARY KEY,
                     issued_by_device_id TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'member',
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
                     consumed_at TEXT,
@@ -511,9 +518,22 @@ class Storage:
                 ON notifications(status, created_at DESC, id DESC);
                 """
             )
+            # Serialize migrations across server workers too.
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._ensure_device_role_columns()
             self._ensure_device_columns()
             self._ensure_notification_origin_columns()
             self._ensure_notification_dedupe_column()
+
+    def _ensure_device_role_columns(self) -> None:
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(devices)")}
+        if "role" not in columns:
+            self._conn.execute("ALTER TABLE devices ADD COLUMN role TEXT NOT NULL DEFAULT 'member'")
+            # Legacy devices retain their existing management access, once only.
+            self._conn.execute("UPDATE devices SET role = 'admin'")
+        pair_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(pair_codes)")}
+        if "role" not in pair_columns:
+            self._conn.execute("ALTER TABLE pair_codes ADD COLUMN role TEXT NOT NULL DEFAULT 'member'")
 
     def _ensure_device_columns(self) -> None:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(devices)").fetchall()}
@@ -554,9 +574,11 @@ class Storage:
 
     def bind_device(self, name: str, platform: DevicePlatform) -> DeviceBindResponse:
         with self._lock, self._conn:
-            return self._bind_device_locked(name, platform)
+            self._conn.execute("BEGIN IMMEDIATE")
+            role = DeviceRole.member if self.has_any_device() else DeviceRole.admin
+            return self._bind_device_locked(name, platform, role)
 
-    def _bind_device_locked(self, name: str, platform: DevicePlatform) -> DeviceBindResponse:
+    def _bind_device_locked(self, name: str, platform: DevicePlatform, role: DeviceRole) -> DeviceBindResponse:
         created_at = utc_now()
         device_id = new_id()
         refresh_token = new_token("sn_refresh")
@@ -568,8 +590,8 @@ class Storage:
             INSERT INTO devices (
                 id, name, platform, refresh_token_hash, access_token_hash,
                 created_at, last_seen_at, revoked_at, notifications_enabled,
-                access_expires_at, refresh_expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
+                access_expires_at, refresh_expires_at, role
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?, ?)
             """,
             (
                 device_id,
@@ -581,6 +603,7 @@ class Storage:
                 _dt(created_at),
                 _dt(access_expires_at),
                 _dt(refresh_expires_at),
+                role.value,
             ),
         )
         return DeviceBindResponse(
@@ -588,6 +611,7 @@ class Storage:
                 id=device_id,
                 name=name,
                 platform=platform,
+                role=role,
                 created_at=created_at,
                 last_seen_at=created_at,
                 notifications_enabled=True,
@@ -610,7 +634,7 @@ class Storage:
         with self._lock, self._conn:
             row = self._conn.execute(
                 """
-                SELECT id, created_at, notifications_enabled FROM devices
+                SELECT id, created_at, notifications_enabled, role FROM devices
                 WHERE refresh_token_hash = ? AND revoked_at IS NULL
                   AND (refresh_expires_at IS NULL OR refresh_expires_at > ?)
                 """,
@@ -642,6 +666,7 @@ class Storage:
                 created_at=created_at,
                 last_seen_at=now,
                 notifications_enabled=notifications_enabled,
+                role=DeviceRole(row["role"]),
             ),
             refresh_token=new_refresh,
             access_token=new_access,
@@ -663,7 +688,7 @@ class Storage:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
                        notification_pause_until, session_state, session_state_updated_at
                 FROM devices
                 WHERE revoked_at IS NULL
@@ -678,6 +703,8 @@ class Storage:
         *,
         name: str | None = None,
         notifications_enabled: bool | None = None,
+        role: DeviceRole | None = None,
+        actor_id: str | None = None,
     ) -> DevicePublic:
         values: list[Any] = []
         assignments: list[str] = []
@@ -690,11 +717,17 @@ class Storage:
         if notifications_enabled is not None:
             assignments.append("notifications_enabled = ?")
             values.append(1 if notifications_enabled else 0)
+        if role is not None:
+            role = DeviceRole(role)
+            assignments.append("role = ?")
+            values.append(role.value)
 
         with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._authorize_device_change_locked(actor_id, device_id, changing_role=role is not None)
             row = self._conn.execute(
                 """
-                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
                        notification_pause_until, session_state, session_state_updated_at
                 FROM devices
                 WHERE id = ? AND revoked_at IS NULL
@@ -703,6 +736,10 @@ class Storage:
             ).fetchone()
             if row is None:
                 raise KeyError(device_id)
+            if role == DeviceRole.member and row["role"] == DeviceRole.admin.value:
+                if actor_id is not None:
+                    self._require_another_admin_locked(device_id)
+                self._conn.execute("DELETE FROM pair_codes WHERE issued_by_device_id = ?", (device_id,))
             if assignments:
                 self._conn.execute(
                     f"UPDATE devices SET {', '.join(assignments)} WHERE id = ?",
@@ -710,7 +747,7 @@ class Storage:
                 )
                 row = self._conn.execute(
                     """
-                    SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                    SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
                            notification_pause_until, session_state, session_state_updated_at
                     FROM devices
                     WHERE id = ?
@@ -719,12 +756,14 @@ class Storage:
                 ).fetchone()
         return self._device_from_row(row)
 
-    def revoke_device(self, device_id: str) -> DevicePublic:
+    def revoke_device(self, device_id: str, *, actor_id: str | None = None) -> DevicePublic:
         revoked_at = utc_now()
         with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._authorize_device_change_locked(actor_id, device_id)
             row = self._conn.execute(
                 """
-                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
                        notification_pause_until, session_state, session_state_updated_at
                 FROM devices
                 WHERE id = ?
@@ -733,6 +772,8 @@ class Storage:
             ).fetchone()
             if row is None or row["revoked_at"] is not None:
                 raise KeyError(device_id)
+            if actor_id is not None and row["role"] == DeviceRole.admin.value:
+                self._require_another_admin_locked(device_id)
             self._conn.execute(
                 "UPDATE devices SET revoked_at = ? WHERE id = ?",
                 (_dt(revoked_at), device_id),
@@ -740,7 +781,7 @@ class Storage:
             self._conn.execute("DELETE FROM pair_codes WHERE issued_by_device_id = ?", (device_id,))
             row = self._conn.execute(
                 """
-                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
                        notification_pause_until, session_state, session_state_updated_at
                 FROM devices
                 WHERE id = ?
@@ -748,6 +789,25 @@ class Storage:
                 (device_id,),
             ).fetchone()
         return self._device_from_row(row)
+
+    def _authorize_device_change_locked(
+        self, actor_id: str | None, target_id: str, *, changing_role: bool = False
+    ) -> None:
+        # No actor is reserved for trusted server-local maintenance, never HTTP handlers.
+        if actor_id is None:
+            return
+        actor = self._conn.execute(
+            "SELECT role FROM devices WHERE id = ? AND revoked_at IS NULL", (actor_id,)
+        ).fetchone()
+        if actor is None or (actor["role"] != DeviceRole.admin.value and (actor_id != target_id or changing_role)):
+            raise PermissionError("Only administrators may manage other devices or change device roles")
+
+    def _require_another_admin_locked(self, device_id: str) -> None:
+        if not self._conn.execute(
+            "SELECT 1 FROM devices WHERE role = 'admin' AND revoked_at IS NULL AND id != ? LIMIT 1",
+            (device_id,),
+        ).fetchone():
+            raise LastAdministratorError("Keep at least one administrator; promote another device first")
 
     def has_any_device(self) -> bool:
         """是否存在未撤销的已绑设备。strict 模式下据此判断:已有设备时裸 bind 被拒。"""
@@ -772,7 +832,7 @@ class Storage:
         with self._lock, self._conn:
             row = self._conn.execute(
                 """
-                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
                        notification_pause_until, session_state, session_state_updated_at,
                        suppress_codex_permission_requests
                 FROM devices
@@ -819,7 +879,7 @@ class Storage:
             )
             row = self._conn.execute(
                 """
-                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
                        notification_pause_until, session_state, session_state_updated_at
                 FROM devices
                 WHERE id = ?
@@ -905,14 +965,17 @@ class Storage:
             ).fetchone()
         return bool(row and row["platform"] == DevicePlatform.android.value)
 
-    def issue_pair_code(self, device: DevicePublic) -> tuple[str, datetime]:
+    def issue_pair_code(self, device: DevicePublic, role: DeviceRole = DeviceRole.member) -> tuple[str, datetime]:
         with self._lock, self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
-            if not self._conn.execute(
-                "SELECT 1 FROM devices WHERE id = ? AND revoked_at IS NULL", (device.id,),
-            ).fetchone():
+            issuer = self._conn.execute(
+                "SELECT role FROM devices WHERE id = ? AND revoked_at IS NULL", (device.id,),
+            ).fetchone()
+            if issuer is None:
                 raise ValueError("Pairing issuer is no longer active")
-            return self._issue_pair_code_locked(device.id)
+            if issuer["role"] != DeviceRole.admin.value:
+                raise PermissionError("Only administrators may invite devices")
+            return self._issue_pair_code_locked(device.id, DeviceRole(role))
 
     def issue_bootstrap_code(self) -> tuple[str, datetime]:
         """Local administrator operation; deliberately has no HTTP endpoint."""
@@ -921,9 +984,9 @@ class Storage:
             if self.has_any_device():
                 raise ValueError("An active device already exists; issue a code from that device")
             self._conn.execute("DELETE FROM pair_codes WHERE issued_by_device_id = '@bootstrap'")
-            return self._issue_pair_code_locked("@bootstrap")
+            return self._issue_pair_code_locked("@bootstrap", DeviceRole.admin)
 
-    def _issue_pair_code_locked(self, issuer: str) -> tuple[str, datetime]:
+    def _issue_pair_code_locked(self, issuer: str, role: DeviceRole) -> tuple[str, datetime]:
         now = utc_now()
         expires_at = now + self.pair_code_ttl
         code = secrets.token_hex(16).upper() if issuer == "@bootstrap" else "{}-{}".format(
@@ -931,8 +994,8 @@ class Storage:
             "".join(secrets.choice(_PAIR_ALPHABET) for _ in range(4)),
         )
         self._conn.execute(
-            "INSERT INTO pair_codes (code_hash, issued_by_device_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-            (sha256_text(code), issuer, _dt(now), _dt(expires_at)),
+            "INSERT INTO pair_codes (code_hash, issued_by_device_id, created_at, expires_at, role) VALUES (?, ?, ?, ?, ?)",
+            (sha256_text(code), issuer, _dt(now), _dt(expires_at), role.value),
         )
         return code, expires_at
 
@@ -946,7 +1009,7 @@ class Storage:
         with self._lock, self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
             row = self._conn.execute(
-                "SELECT code_hash, expires_at, consumed_at, issued_by_device_id FROM pair_codes WHERE code_hash = ?",
+                "SELECT code_hash, expires_at, consumed_at, issued_by_device_id, role FROM pair_codes WHERE code_hash = ?",
                 (code_hash,),
             ).fetchone()
             if row is None or row["consumed_at"] is not None or (_parse_dt(row["expires_at"]) or now) <= now:
@@ -956,10 +1019,11 @@ class Storage:
                 if self.has_any_device():
                     return None
             elif not self._conn.execute(
-                "SELECT 1 FROM devices WHERE id = ? AND revoked_at IS NULL", (issuer,),
+                "SELECT 1 FROM devices WHERE id = ? AND revoked_at IS NULL AND role = 'admin'", (issuer,),
             ).fetchone():
                 return None
-            response = self._bind_device_locked(name, platform)
+            role = DeviceRole.admin if issuer == "@bootstrap" else DeviceRole(row["role"])
+            response = self._bind_device_locked(name, platform, role)
             self._conn.execute(
                 "UPDATE pair_codes SET consumed_at = ?, consumed_device_id = ? WHERE code_hash = ?",
                 (_dt(now), response.device.id, code_hash),
@@ -1046,7 +1110,7 @@ class Storage:
         with self._lock, self._conn:
             row = self._conn.execute(
                 """
-                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
                        notification_pause_until, session_state, session_state_updated_at
                 FROM devices
                 WHERE access_token_hash = ? AND revoked_at IS NULL
@@ -1070,7 +1134,7 @@ class Storage:
         with self._lock, self._conn:
             row = self._conn.execute(
                 """
-                SELECT id, name, platform, created_at, last_seen_at, revoked_at, notifications_enabled,
+                SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
                        notification_pause_until, session_state, session_state_updated_at
                 FROM devices
                 WHERE refresh_token_hash = ? AND revoked_at IS NULL
@@ -2237,6 +2301,7 @@ class Storage:
             id=row["id"],
             name=row["name"],
             platform=DevicePlatform(row["platform"]),
+            role=DeviceRole(row["role"]),
             created_at=_parse_dt(row["created_at"]) or utc_now(),
             last_seen_at=last_seen_at or _parse_dt(row["last_seen_at"]),
             revoked_at=_parse_dt(row["revoked_at"]),

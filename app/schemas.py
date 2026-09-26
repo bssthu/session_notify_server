@@ -24,6 +24,11 @@ class DevicePlatform(StrEnum):
     android = "android"
 
 
+class DeviceRole(StrEnum):
+    admin = "admin"
+    member = "member"
+
+
 class DeviceSessionState(StrEnum):
     unknown = "unknown"
     locked = "locked"
@@ -54,6 +59,7 @@ class EventType(StrEnum):
 
 
 class DeviceBindRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=80)
     platform: DevicePlatform
     # 可选:strict 模式下用于本机重新绑定(rebind)。凭旧 refresh_token 证明本机身份。
@@ -64,6 +70,7 @@ class DevicePublic(BaseModel):
     id: str
     name: str
     platform: DevicePlatform
+    role: DeviceRole = DeviceRole.member
     created_at: datetime
     last_seen_at: datetime | None = None
     revoked_at: datetime | None = None
@@ -74,8 +81,10 @@ class DevicePublic(BaseModel):
 
 
 class DeviceUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     name: str | None = Field(default=None, min_length=1, max_length=80)
     notifications_enabled: bool | None = None
+    role: DeviceRole | None = None
 
 
 class DevicePresenceUpdateRequest(BaseModel):
@@ -129,9 +138,15 @@ class AccessTokenResponse(BaseModel):
     token_type: Literal["bearer"] = "bearer"
 
 
+class PairIssueRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    role: DeviceRole = DeviceRole.member
+
+
 class PairIssueResponse(BaseModel):
     code: str
     expires_at: datetime
+    role: DeviceRole = DeviceRole.member
     # 本机网卡候选地址(供「绑定新设备」二维码选用真实可达地址,避免 localhost 回环)。
     candidate_base_urls: list[str] = Field(default_factory=list)
     # 服务端证书 SHA-256 指纹(整个 DER 证书)。编入二维码后新设备一扫即绑,无需手填指纹。
@@ -139,6 +154,7 @@ class PairIssueResponse(BaseModel):
 
 
 class PairConsumeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     code: str = Field(min_length=1, max_length=40)
     name: str = Field(min_length=1, max_length=80)
     platform: DevicePlatform

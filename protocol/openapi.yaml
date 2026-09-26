@@ -15,7 +15,7 @@ paths:
           description: Service health.
   /api/v1/devices/bind:
     post:
-      description: In strict mode this endpoint only rebinds an existing device using its refresh token. New devices, including the first device, consume a pairing code issued locally or by an active device.
+      description: In strict mode this endpoint only rebinds an existing device using its refresh token, preserving its role. New devices consume a pairing code issued locally or by an administrator. Bootstrap creates an administrator; subsequent invitations default to member. Clients cannot choose their role when binding.
       security: []
       requestBody:
         required: true
@@ -32,13 +32,42 @@ paths:
                 $ref: "#/components/schemas/DeviceBindResponse"
   /api/v1/devices/pair/issue:
     post:
+      description: Administrator only. The selected role is stored with the one-time code and cannot be changed by the joining device.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PairIssueRequest"
       responses:
         "200":
-          description: One-time pairing code signed by an already-bound device.
+          description: One-time pairing code issued by an administrator.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/PairIssueResponse"
+        "403":
+          description: Only administrators may invite devices.
+  /api/v1/devices/pair/status:
+    post:
+      description: Administrator-only pairing progress lookup. Ordinary devices retain device-list and notification access.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PairStatusRequest"
+      responses:
+        "200":
+          description: Pairing progress.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PairStatusResponse"
+        "403":
+          description: Administrator role required.
+        "404":
+          description: Pairing code not found.
   /api/v1/devices/pair/consume:
     post:
       security: []
@@ -50,7 +79,7 @@ paths:
               $ref: "#/components/schemas/PairConsumeRequest"
       responses:
         "200":
-          description: Newly bound device credentials. Bootstrap codes are issued by the server-local issue_bootstrap_code.py command. Device-issued codes become invalid when their issuer is revoked.
+          description: Newly bound device credentials. Bootstrap creates an administrator. Device-issued codes carry the role selected by the administrator and become invalid when the issuer is revoked or demoted.
           content:
             application/json:
               schema:
@@ -94,6 +123,7 @@ paths:
           description: Only a bound Windows device can report desktop session state.
   /api/v1/devices/{device_id}:
     patch:
+      description: Administrators may modify any device and its role. Members may only rename themselves or change their own notification setting. The last active administrator cannot be demoted.
       parameters:
         - name: device_id
           in: path
@@ -113,7 +143,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Device"
+        "403":
+          description: Insufficient device management permissions.
+        "409":
+          description: At least one active administrator must remain.
     delete:
+      description: Administrators may revoke other devices. Members may only revoke themselves. The last active administrator cannot be revoked through the API.
       parameters:
         - name: device_id
           in: path
@@ -127,6 +162,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Device"
+        "403":
+          description: Insufficient device management permissions.
+        "409":
+          description: At least one active administrator must remain.
   /api/v1/auth/refresh:
     post:
       security: []
@@ -340,6 +379,7 @@ components:
   schemas:
     DeviceBindRequest:
       type: object
+      additionalProperties: false
       required: [name, platform]
       properties:
         name:
@@ -370,6 +410,7 @@ components:
           const: bearer
     DeviceUpdateRequest:
       type: object
+      additionalProperties: false
       properties:
         name:
           type: string
@@ -377,6 +418,9 @@ components:
           maxLength: 80
         notifications_enabled:
           type: boolean
+        role:
+          $ref: "#/components/schemas/DeviceRole"
+          description: Administrator only, including changes to one's own role.
     DevicePresenceUpdateRequest:
       type: object
       required: [session_state]
@@ -449,10 +493,40 @@ components:
         token_type:
           type: string
           const: bearer
+    DeviceRole:
+      type: string
+      enum: [admin, member]
+    PairStatusRequest:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 40
+    PairStatusResponse:
+      type: object
+      required: [consumed, expired]
+      properties:
+        consumed:
+          type: boolean
+        expired:
+          type: boolean
+        consumed_device_name:
+          type: [string, "null"]
+    PairIssueRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        role:
+          $ref: "#/components/schemas/DeviceRole"
+          default: member
     PairIssueResponse:
       type: object
-      required: [code, expires_at]
+      required: [code, expires_at, role]
       properties:
+        role:
+          $ref: "#/components/schemas/DeviceRole"
         code:
           type: string
           description: One-time human-readable pairing code, e.g. 7Q4K-9XKM.
@@ -461,6 +535,7 @@ components:
           format: date-time
     PairConsumeRequest:
       type: object
+      additionalProperties: false
       required: [code, name, platform]
       properties:
         code:
@@ -474,7 +549,7 @@ components:
           enum: [windows, android]
     Device:
       type: object
-      required: [id, name, platform, created_at, notifications_enabled, notification_pause_until, session_state]
+      required: [id, name, platform, role, created_at, notifications_enabled, notification_pause_until, session_state]
       properties:
         id:
           type: string
@@ -483,6 +558,8 @@ components:
         platform:
           type: string
           enum: [windows, android]
+        role:
+          $ref: "#/components/schemas/DeviceRole"
         created_at:
           type: string
           format: date-time

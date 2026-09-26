@@ -28,6 +28,7 @@ from .schemas import (
     DevicePresenceSummary,
     DevicePresenceUpdateRequest,
     DevicePublic,
+    DeviceRole,
     DeviceUpdateRequest,
     EventType,
     EventsResponse,
@@ -38,6 +39,7 @@ from .schemas import (
     NotificationPublic,
     NotificationStatus,
     PairConsumeRequest,
+    PairIssueRequest,
     PairIssueResponse,
     PairStatusRequest,
     PairStatusResponse,
@@ -47,7 +49,7 @@ from .schemas import (
     utc_now,
 )
 from .hook_policy import is_noise_hook_event
-from .storage import Storage
+from .storage import LastAdministratorError, Storage
 from .security import sha256_text
 
 configure_server_logging()
@@ -388,10 +390,14 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     @app.post("/api/v1/devices/pair/issue", response_model=PairIssueResponse)
     def issue_pair_code(
         request: Request,
+        payload: PairIssueRequest | None = None,
         device: DevicePublic = Depends(current_device),
     ) -> PairIssueResponse:
         try:
-            code, expires_at = storage.issue_pair_code(device)
+            role = payload.role if payload else DeviceRole.member
+            code, expires_at = storage.issue_pair_code(device, role)
+        except PermissionError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from None
         except ValueError:
             raise HTTPException(status_code=401, detail="Pairing issuer is no longer active") from None
         scheme = request.url.scheme or "https"
@@ -400,6 +406,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         return PairIssueResponse(
             code=code,
             expires_at=expires_at,
+            role=role,
             candidate_base_urls=candidate_base_urls,
             server_fingerprint=server_certificate_fingerprint(),
         )
@@ -431,7 +438,8 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         request: PairStatusRequest,
         device: DevicePublic = Depends(current_device),
     ) -> PairStatusResponse:
-        # 供签发端面板轮询配对码是否已被消费(WS 断线兜底);要求已绑设备鉴权,与 issue 同源。
+        if device.role != DeviceRole.admin:
+            raise HTTPException(status_code=403, detail="Only administrators may inspect pairing codes")
         status_info = storage.pair_code_status(request.code)
         if status_info is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pairing code not found")
@@ -494,7 +502,13 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 device_id,
                 name=request.name,
                 notifications_enabled=request.notifications_enabled,
+                role=request.role,
+                actor_id=device.id,
             )
+        except PermissionError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from None
+        except LastAdministratorError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
         except KeyError:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found") from None
         except ValueError as error:
@@ -506,7 +520,11 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         device: DevicePublic = Depends(current_device),
     ) -> DevicePublic:
         try:
-            return storage.revoke_device(device_id)
+            return storage.revoke_device(device_id, actor_id=device.id)
+        except PermissionError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from None
+        except LastAdministratorError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
         except KeyError:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found") from None
 
