@@ -14,6 +14,7 @@ from .schemas import (
     AccessTokenResponse,
     CodexAsyncQuestionAsked,
     CodexAsyncQuestionAnswered,
+    CodexAsyncQuestionsAnswered,
     DeviceBindResponse,
     DevicePlatform,
     DevicePresenceSummary,
@@ -509,6 +510,20 @@ class Storage:
                     question_hash TEXT NOT NULL,
                     answered_at TEXT NOT NULL,
                     PRIMARY KEY(device_id, session_id, delivery_id)
+                );
+
+                -- Structured TUI answers identify the tool call and question.
+                -- Keep legacy receipts intact when upgrading an existing DB.
+                CREATE TABLE IF NOT EXISTS codex_async_exact_answers (
+                    device_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    delivery_id TEXT NOT NULL,
+                    answer_index INTEGER NOT NULL,
+                    call_id TEXT NOT NULL,
+                    question_index INTEGER NOT NULL,
+                    question_hash TEXT NOT NULL,
+                    answered_at TEXT NOT NULL,
+                    PRIMARY KEY(device_id, session_id, delivery_id, answer_index)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_notifications_created_id
@@ -1796,7 +1811,7 @@ class Storage:
         device_id: str,
         session_id: str,
         delivery_id: str,
-        signal: CodexAsyncQuestionAsked | CodexAsyncQuestionAnswered,
+        signal: CodexAsyncQuestionAsked | CodexAsyncQuestionAnswered | CodexAsyncQuestionsAnswered,
         notification_id: str | None = None,
     ) -> list[SyncEvent]:
         """Persist receipts and uniquely match full-title fingerprints across turns.
@@ -1820,6 +1835,15 @@ class Storage:
                         (device_id, session_id, signal.call_id, index, fingerprint,
                          observed_at, notification_id),
                     )
+            elif isinstance(signal, CodexAsyncQuestionsAnswered):
+                self._conn.executemany(
+                    """INSERT OR IGNORE INTO codex_async_exact_answers
+                    (device_id, session_id, delivery_id, answer_index, call_id,
+                     question_index, question_hash, answered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [(device_id, session_id, delivery_id, index, answer.call_id,
+                      answer.question_index, answer.question_hash, observed_at)
+                     for index, answer in enumerate(signal.answers)],
+                )
             else:
                 self._conn.execute(
                     """INSERT OR IGNORE INTO codex_async_answers
@@ -1833,14 +1857,26 @@ class Storage:
                 WHERE device_id = ? AND session_id = ?""", (device_id, session_id),
             )
             answers = self._conn.execute(
-                """SELECT * FROM codex_async_answers WHERE device_id = ? AND session_id = ?
-                ORDER BY answered_at, delivery_id""", (device_id, session_id),
+                """SELECT delivery_id, question_hash, answered_at,
+                          NULL AS call_id, NULL AS question_index
+                   FROM codex_async_answers WHERE device_id = ? AND session_id = ?
+                   UNION ALL
+                   SELECT delivery_id, question_hash, answered_at, call_id, question_index
+                   FROM codex_async_exact_answers WHERE device_id = ? AND session_id = ?
+                   ORDER BY answered_at, delivery_id""", (device_id, session_id, device_id, session_id),
             ).fetchall()
             for answer in answers:
+                # Never fall back to wording when a structured answer names a
+                # different call/index. Also verify its full question fingerprint.
+                exact = answer["call_id"] is not None
+                target = " AND call_id = ? AND question_index = ?" if exact else ""
+                parameters = (device_id, session_id, answer["question_hash"], answer["answered_at"])
+                if exact:
+                    parameters += (answer["call_id"], answer["question_index"])
                 matches = self._conn.execute(
                     """SELECT rowid, answered_delivery_id FROM codex_async_questions
-                    WHERE device_id = ? AND session_id = ? AND question_hash = ? AND asked_at <= ?""",
-                    (device_id, session_id, answer["question_hash"], answer["answered_at"]),
+                    WHERE device_id = ? AND session_id = ? AND question_hash = ? AND asked_at <= ?""" + target,
+                    parameters,
                 ).fetchall()
                 if len(matches) != 1 or matches[0]["answered_delivery_id"] is not None:
                     continue

@@ -775,6 +775,36 @@ components:
         question_hash:
           type: string
           pattern: '^[a-f0-9]{64}$'
+    CodexAsyncAnswerItem:
+      type: object
+      required: [call_id, question_index, question_hash]
+      properties:
+        call_id:
+          type: string
+          minLength: 1
+          maxLength: 200
+        question_index:
+          type: integer
+          minimum: 0
+          maximum: 99
+        question_hash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+    CodexAsyncQuestionsAnswered:
+      type: object
+      required: [kind, observed_at, answers]
+      properties:
+        kind:
+          const: answered_batch
+        observed_at:
+          type: string
+          format: date-time
+        answers:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/CodexAsyncAnswerItem"
     HookPayload:
       type: object
       properties:
@@ -808,14 +838,19 @@ components:
           oneOf:
             - $ref: "#/components/schemas/CodexAsyncQuestionAsked"
             - $ref: "#/components/schemas/CodexAsyncQuestionAnswered"
+            - $ref: "#/components/schemas/CodexAsyncQuestionsAnswered"
             - type: "null"
           description: >-
             Optional Codex async-question correlation, scoped to the authenticated
             origin device and session_id. SHA-256 covers the full UTF-8 title with
             CRLF/CR normalized to LF, before summary truncation. The bridge supplies
             observed_at and metadata.delivery_id before queuing delivery. Asked is
-            accepted only for request_user_input_async PreToolUse; answered only for
-            UserPromptSubmit. Unique title matches may cross turn_id; all questions
+            accepted only for request_user_input_async PreToolUse; answered and
+            answered_batch only for UserPromptSubmit. answered is the legacy unique
+            title match; answered_batch uses the call_id and zero-based question_index
+            from questionItemId plus the full title hash, without a title-only fallback.
+            Answer text is never included. Batches are persisted atomically and
+            support out-of-order replay. Both formats may cross turn_id; all questions
             in a call must be answered before notification.acknowledged is emitted
             with reason async_question_answered. Submission creates no notification.
             Late delivery that makes a prior match ambiguous retracts only automatic

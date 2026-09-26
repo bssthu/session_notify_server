@@ -23,6 +23,7 @@ from .schemas import (
     AccessTokenResponse,
     CodexAsyncQuestionAsked,
     CodexAsyncQuestionAnswered,
+    CodexAsyncQuestionsAnswered,
     DeviceBindRequest,
     DeviceBindResponse,
     DevicePresenceSummary,
@@ -554,7 +555,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         valid_signal = source.lower() == "codex" and bool(payload.session_id) and (
             isinstance(signal, CodexAsyncQuestionAsked) and event_name == "pretooluse"
             and payload.tool_name in ("request_user_input_async", "functions.request_user_input_async")
-            or isinstance(signal, CodexAsyncQuestionAnswered) and event_name == "userpromptsubmit"
+            or isinstance(signal, (CodexAsyncQuestionAnswered, CodexAsyncQuestionsAnswered)) and event_name == "userpromptsubmit"
         )
         if valid_signal and isinstance(signal, CodexAsyncQuestionAsked):
             dedupe_key = json.dumps(["codex_async_question", device.id, payload.session_id, signal.call_id])
@@ -583,7 +584,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             )
             if event is not None:
                 events_to_broadcast.append(event)
-        if valid_signal and (notification is not None or isinstance(signal, CodexAsyncQuestionAnswered)):
+        if valid_signal and (notification is not None or isinstance(signal, (CodexAsyncQuestionAnswered, CodexAsyncQuestionsAnswered))):
             delivery_id = str(hook_meta.get("delivery_id") or "")
             if delivery_id:
                 resolved_events = storage.correlate_codex_async_question(

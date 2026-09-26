@@ -287,6 +287,18 @@ class CodexAsyncQuestionAnswered(BaseModel):
     question_hash: QuestionFingerprint
 
 
+class CodexAsyncAnswerItem(BaseModel):
+    call_id: str = Field(min_length=1, max_length=200)
+    question_index: int = Field(strict=True, ge=0, lt=100)
+    question_hash: QuestionFingerprint
+
+
+class CodexAsyncQuestionsAnswered(BaseModel):
+    kind: Literal["answered_batch"]
+    observed_at: AwareDatetime
+    answers: list[CodexAsyncAnswerItem] = Field(min_length=1, max_length=100)
+
+
 class HookPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -309,5 +321,5 @@ class HookPayload(BaseModel):
     tool_name: str | None = None
     permission_mode: str | None = None
     tool_input: dict[str, Any] | None = None
-    codex_async: CodexAsyncQuestionAsked | CodexAsyncQuestionAnswered | None = Field(default=None, discriminator="kind")
+    codex_async: CodexAsyncQuestionAsked | CodexAsyncQuestionAnswered | CodexAsyncQuestionsAnswered | None = Field(default=None, discriminator="kind")
     metadata: dict[str, Any] = Field(default_factory=dict)

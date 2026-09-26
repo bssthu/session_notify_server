@@ -35,6 +35,16 @@ def answer(title="Question?", *, session="session-1", at=None):
     }
 
 
+def structured_answer(items=(("call-1", 0, "Question?"),), *, session="session-1", at=None):
+    payload = answer(session=session, at=at)
+    payload["codex_async"] = {
+        "kind": "answered_batch", "observed_at": (at or utc_now()).isoformat(),
+        "answers": [{"call_id": call, "question_index": index, "question_hash": digest(title)}
+                    for call, index, title in items],
+    }
+    return payload
+
+
 def bind(client, name="test"):
     response = client.post("/api/v1/devices/bind", json={"name": name, "platform": "windows"})
     assert response.status_code == 200, response.text
@@ -253,3 +263,94 @@ def test_retracted_auto_ack_is_pushed_as_active_notification(tmp_path):
             assert restored["notification"]["id"] == first["id"]
             assert restored["notification"]["status"] == "active"
             assert restored["notification"]["expires_at"] == first["expires_at"]
+
+
+def test_structured_answers_distinguish_repeated_titles_and_wait_for_all_questions(tmp_path):
+    db = tmp_path / "server.db"
+    with TestClient(create_app(db)) as client:
+        headers = bind(client)
+        first = post(client, ask(("Question?", "Question?")), headers)
+        second = post(client, ask(call="call-2"), headers)
+        part = structured_answer()
+        post(client, part, headers)
+        post(client, part, headers)
+        assert {n["id"] for n in active(client, headers)} == {first["id"], second["id"]}
+        assert not ack_events(client, headers)
+    with TestClient(create_app(db)) as client:
+        rest = structured_answer((("call-1", 1, "Question?"), ("call-2", 0, "Question?")))
+        post(client, rest, headers)
+        assert active(client, headers) == []
+        assert {e["notification_id"] for e in ack_events(client, headers)} == {first["id"], second["id"]}
+        post(client, rest, headers)
+        post(client, structured_answer(), headers)
+        assert len(ack_events(client, headers)) == 2
+        # A late identical question does not invalidate either exact answer.
+        third = post(client, ask(call="call-3", at=utc_now() - timedelta(minutes=1)), headers)
+        assert [n["id"] for n in active(client, headers)] == [third["id"]]
+
+
+@pytest.mark.parametrize("mode", ["call", "index", "hash", "session", "device", "source", "future_question", "hook"])
+def test_structured_answer_never_falls_back_to_title(tmp_path, mode):
+    with TestClient(create_app(tmp_path / "server.db")) as client:
+        headers = bind(client)
+        other = bind(client, "other")
+        created = post(client, ask(at=utc_now() + timedelta(seconds=30) if mode == "future_question" else None), headers)
+        payload = structured_answer(
+            (("other" if mode == "call" else "call-1", 1 if mode == "index" else 0,
+              "Wrong?" if mode == "hash" else "Question?"),),
+            session="other" if mode == "session" else "session-1",
+        )
+        if mode == "hook":
+            payload["hook_event_name"] = "PostToolUse"
+        post(client, payload, other if mode == "device" else headers, source="claude" if mode == "source" else "codex")
+        assert created["id"] in {n["id"] for n in active(client, headers)}
+        assert not ack_events(client, headers)
+
+
+@pytest.mark.parametrize("order", list(permutations(("first", "second", "answer"))))
+def test_structured_batch_reconciles_out_of_order_after_restarts(tmp_path, order):
+    db = tmp_path / "server.db"
+    now = utc_now() - timedelta(seconds=10)
+    payloads = {
+        "first": ask(("Question?", "Question?"), at=now),
+        "second": ask(call="call-2", at=now),
+        "answer": structured_answer((("call-1", 0, "Question?"), ("call-1", 1, "Question?"),
+                                     ("call-2", 0, "Question?")), at=now + timedelta(seconds=2)),
+    }
+    with TestClient(create_app(db)) as client:
+        headers = bind(client)
+    for kind in order:
+        with TestClient(create_app(db)) as client:
+            post(client, payloads[kind], headers)
+    with TestClient(create_app(db)) as client:
+        assert active(client, headers) == []
+        assert len(ack_events(client, headers)) == 2
+        for payload in payloads.values():
+            post(client, payload, headers)
+        assert len(ack_events(client, headers)) == 2
+
+
+def test_existing_database_keeps_legacy_receipts_when_adding_structured_answers(tmp_path):
+    db = tmp_path / "server.db"
+    app = create_app(db)
+    with TestClient(app) as client:
+        headers = bind(client)
+        post(client, ask(("First?", "Second?")), headers)
+        post(client, answer("First?"), headers)
+        # Simulate the pre-upgrade database, which has only legacy receipts.
+        with app.state.storage._conn:
+            app.state.storage._conn.execute("DROP TABLE codex_async_exact_answers")
+    with TestClient(create_app(db)) as client:
+        assert len(active(client, headers)) == 1
+        post(client, structured_answer((("call-1", 1, "Second?"),)), headers)
+        assert active(client, headers) == []
+        assert len(ack_events(client, headers)) == 1
+
+
+@pytest.mark.parametrize("index", [-1, 100, 0.5, True, "0"])
+def test_structured_answer_rejects_invalid_question_index(tmp_path, index):
+    with TestClient(create_app(tmp_path / "server.db")) as client:
+        headers = bind(client)
+        payload = structured_answer()
+        payload["codex_async"]["answers"][0]["question_index"] = index
+        assert client.post("/api/v1/hooks/codex", json=payload, headers=headers).status_code == 422
