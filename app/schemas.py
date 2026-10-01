@@ -27,6 +27,7 @@ class DevicePlatform(StrEnum):
 class DeviceRole(StrEnum):
     admin = "admin"
     member = "member"
+    guest = "guest"
 
 
 class DeviceSessionState(StrEnum):

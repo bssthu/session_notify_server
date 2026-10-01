@@ -32,7 +32,7 @@ paths:
                 $ref: "#/components/schemas/DeviceBindResponse"
   /api/v1/devices/pair/issue:
     post:
-      description: Administrator only. The selected role is stored with the one-time code and cannot be changed by the joining device.
+      description: Administrator only. Select admin, member (default), or guest (local device only). The selected role is stored with the one-time code and cannot be changed by the joining device.
       requestBody:
         required: false
         content:
@@ -88,7 +88,7 @@ paths:
     get:
       responses:
         "200":
-          description: Bound devices.
+          description: Bound devices. Guests receive only their own device.
           content:
             application/json:
               schema:
@@ -99,7 +99,7 @@ paths:
     get:
       responses:
         "200":
-          description: Effective Windows session presence after stale reports are downgraded to unknown.
+          description: Effective Windows presence. For guests, devices and aggregate counts are restricted to their own device.
           content:
             application/json:
               schema:
@@ -114,7 +114,7 @@ paths:
               $ref: "#/components/schemas/DevicePresenceUpdateRequest"
       responses:
         "200":
-          description: Updated effective Windows presence summary.
+          description: Updated Windows presence summary, scoped to the requesting device for guests.
           content:
             application/json:
               schema:
@@ -123,7 +123,7 @@ paths:
           description: Only a bound Windows device can report desktop session state.
   /api/v1/devices/{device_id}:
     patch:
-      description: Administrators may modify any device and its role. Members may only rename themselves or change their own notification setting. The last active administrator cannot be demoted.
+      description: Administrators may modify any device and its role. Members and guests may only rename themselves or change their own notification setting; neither may change their own role. Role updates reconnect the target WebSocket with code 1012 so clients reload their active snapshot. The last active administrator cannot be demoted.
       parameters:
         - name: device_id
           in: path
@@ -148,7 +148,7 @@ paths:
         "409":
           description: At least one active administrator must remain.
     delete:
-      description: Administrators may revoke other devices. Members may only revoke themselves. The last active administrator cannot be revoked through the API.
+      description: Administrators may revoke other devices. Members and guests may only revoke themselves. The last active administrator cannot be revoked through the API.
       parameters:
         - name: device_id
           in: path
@@ -184,7 +184,7 @@ paths:
                 $ref: "#/components/schemas/AccessTokenResponse"
   /api/v1/notifications:
     get:
-      description: Returns matching notifications created within the server-enforced latest 30-day window. Defaults to active notifications.
+      description: Returns matching notifications created within the server-enforced latest 30-day window. Defaults to active notifications. Guests only receive notifications whose authenticated origin_device_id is their own device; unknown origins are excluded.
       parameters:
         - name: status
           in: query
@@ -218,7 +218,7 @@ paths:
                 $ref: "#/components/schemas/Notification"
   /api/v1/notifications/recent:
     get:
-      description: Returns a newest-first cursor page. Requested ranges above 30 days are clamped to 30 days.
+      description: Guest scope is applied before filtering, pagination, counts, and filter suggestions; only the requesting device origin is visible. Returns a newest-first cursor page. Requested ranges above 30 days are clamped to 30 days.
       parameters:
         - name: status
           in: query
@@ -296,6 +296,7 @@ paths:
                 $ref: "#/components/schemas/NotificationPage"
   /api/v1/notifications/{notification_id}/ack:
     post:
+      description: Guests may only acknowledge their own origin notifications; inaccessible IDs return 404 without mutation.
       parameters:
         - name: notification_id
           in: path
@@ -317,6 +318,7 @@ paths:
                 $ref: "#/components/schemas/AckResponse"
   /api/v1/events:
     get:
+      description: Guests receive only events for their own origin notifications, including acknowledgement and expiry. Pagination and cursors use the same scope. Remote acknowledgement identity and reason are omitted.
       parameters:
         - name: since_event_id
           in: query
@@ -362,6 +364,7 @@ paths:
   /api/v1/ws:
     get:
       summary: WebSocket endpoint.
+      description: Guest delivery is limited to notifications from the authenticated device, including acknowledgements and expiry. Other device presence is not sent. Roles are checked on every broadcast; role updates close the target connection with code 1012 and clients reload their active snapshot.
       parameters:
         - name: token
           in: query
@@ -495,7 +498,7 @@ components:
           const: bearer
     DeviceRole:
       type: string
-      enum: [admin, member]
+      enum: [admin, member, guest]
     PairStatusRequest:
       type: object
       required: [code]

@@ -25,6 +25,18 @@ class WebSocketHub:
         async with self._lock:
             self._connections.pop(websocket, None)
 
+    async def reconnect_device(self, device_id: str) -> None:
+        """Role changes require an authoritative snapshot on the new connection."""
+        async with self._lock:
+            sockets = [ws for ws, (target, _) in self._connections.items() if target == device_id]
+            for websocket in sockets:
+                self._connections.pop(websocket, None)
+        for websocket in sockets:
+            try:
+                await asyncio.wait_for(websocket.close(code=1012, reason="Device role changed"), timeout=1.0)
+            except (WebSocketDisconnect, RuntimeError, OSError, asyncio.TimeoutError):
+                pass
+
     async def broadcast(
         self,
         event: SyncEvent,

@@ -699,16 +699,17 @@ class Storage:
             self._conn.execute("DELETE FROM pair_codes")
         return cursor.rowcount
 
-    def list_devices(self) -> list[DevicePublic]:
+    def list_devices(self, viewer_device_id: str | None = None) -> list[DevicePublic]:
+        scope, values = self._viewer_scope_sql(viewer_device_id, "devices.id")
         with self._lock:
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
                        notification_pause_until, session_state, session_state_updated_at
                 FROM devices
-                WHERE revoked_at IS NULL
+                WHERE revoked_at IS NULL AND {scope}
                 ORDER BY created_at ASC
-                """
+                """, values,
             ).fetchall()
         return [self._device_from_row(row) for row in rows]
 
@@ -751,7 +752,7 @@ class Storage:
             ).fetchone()
             if row is None:
                 raise KeyError(device_id)
-            if role == DeviceRole.member and row["role"] == DeviceRole.admin.value:
+            if role is not None and role != DeviceRole.admin and row["role"] == DeviceRole.admin.value:
                 if actor_id is not None:
                     self._require_another_admin_locked(device_id)
                 self._conn.execute("DELETE FROM pair_codes WHERE issued_by_device_id = ?", (device_id,))
@@ -919,19 +920,21 @@ class Storage:
         stale_after: timedelta,
         *,
         now: datetime | None = None,
+        viewer_device_id: str | None = None,
     ) -> DevicePresenceSummary:
         evaluated_at = now or utc_now()
         stale_before = evaluated_at - stale_after
+        scope, values = self._viewer_scope_sql(viewer_device_id, "devices.id")
         with self._lock:
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT id, name, notification_pause_until, session_state, session_state_updated_at,
                        suppress_codex_permission_requests
                 FROM devices
-                WHERE platform = ? AND revoked_at IS NULL
+                WHERE platform = ? AND revoked_at IS NULL AND {scope}
                 ORDER BY created_at ASC
                 """,
-                (DevicePlatform.windows.value,),
+                (DevicePlatform.windows.value, *values),
             ).fetchall()
 
         windows_devices: list[WindowsDevicePresence] = []
@@ -1094,6 +1097,10 @@ class Storage:
         return self.event_for_device_id(event, device.id)
 
     def event_for_device_id(self, event: SyncEvent, device_id: str) -> SyncEvent:
+        # Acknowledgements of our own notifications may come from another device.
+        # Guests may learn the resulting state, but not that device's identity or text.
+        if self._is_guest(device_id) and event.ack_by_device_id != device_id:
+            event = event.model_copy(update={"ack_by_device_id": None, "reason": None})
         return redact_event_for_device(event, device_id)
 
     def notification_for_device(
@@ -1106,9 +1113,48 @@ class Storage:
     def should_deliver_event_to_device(self, event: SyncEvent, device_id: str) -> bool:
         with self._lock:
             row = self._conn.execute(
-                "SELECT notifications_enabled FROM devices WHERE id = ? AND revoked_at IS NULL", (device_id,),
+                "SELECT notifications_enabled, role FROM devices WHERE id = ? AND revoked_at IS NULL", (device_id,),
             ).fetchone()
+            if row and row["role"] == DeviceRole.guest.value:
+                if event.event_type == EventType.device_presence_changed:
+                    # Presence broadcasts contain account-wide aggregate state.
+                    return False
+                notification_id = event.notification.id if event.notification else event.notification_id
+                origin = self._conn.execute(
+                    "SELECT origin_device_id FROM notifications WHERE id = ?", (notification_id,),
+                ).fetchone()
+                if origin is None or origin["origin_device_id"] != device_id:
+                    return False
         return bool(row) and (event.event_type != EventType.notification_created or bool(row["notifications_enabled"]))
+
+    def _is_guest(self, device_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute("SELECT role FROM devices WHERE id = ?", (device_id,)).fetchone()
+        return bool(row and row["role"] == DeviceRole.guest.value)
+
+    @staticmethod
+    def _viewer_scope_sql(viewer_device_id: str | None, origin_column: str) -> tuple[str, tuple]:
+        """Scope before pagination/counts/search; read the current role in the query.
+
+        None is reserved for trusted internal maintenance, never an HTTP viewer.
+        origin_column is an internal SQL expression, never request input.
+        """
+        if viewer_device_id is None:
+            return "1 = 1", ()
+        return (
+            "EXISTS (SELECT 1 FROM devices AS viewer WHERE viewer.id = ? "
+            "AND viewer.revoked_at IS NULL "
+            f"AND (viewer.role != 'guest' OR {origin_column} = viewer.id))",
+            (viewer_device_id,),
+        )
+
+    def _event_scope_sql(self, device: DevicePublic | None) -> tuple[str, tuple]:
+        return self._viewer_scope_sql(
+            device.id if device else None,
+            "(SELECT n.origin_device_id FROM notifications AS n WHERE n.id = "
+            "COALESCE(json_extract(events.payload, '$.notification.id'), "
+            "json_extract(events.payload, '$.notification_id')))",
+        )
 
     def access_token_is_valid(self, token_hash: str) -> bool:
         # Read-only check for long-lived transports (does not renew last_seen_at).
@@ -1205,6 +1251,15 @@ class Storage:
                 if correlated is not None:
                     return self._merge_correlated_claude_approval(correlated, notification)
             if dedupe_key:
+                # Delivery IDs and session/turn IDs are client supplied. Namespace
+                # by the authenticated origin, including when retrying older keys.
+                legacy = self._conn.execute(
+                    "SELECT * FROM notifications WHERE dedupe_key = ? AND origin_device_id IS ?",
+                    (dedupe_key, notification.origin_device_id),
+                ).fetchone()
+                if legacy is not None:
+                    return self._merge_duplicate_notification(legacy, notification), None
+                dedupe_key = json.dumps(["origin", notification.origin_device_id, dedupe_key])
                 existing = self._conn.execute(
                     "SELECT * FROM notifications WHERE dedupe_key = ?",
                     (dedupe_key,),
@@ -1373,11 +1428,13 @@ class Storage:
         self,
         statuses: Iterable[NotificationStatus] | None = None,
         created_since: datetime | None = None,
+        viewer_device_id: str | None = None,
     ) -> list[NotificationPublic]:
         self.expire_due_notifications()
         query = "SELECT * FROM notifications"
-        values: list[Any] = []
-        conditions: list[str] = []
+        scope, scope_values = self._viewer_scope_sql(viewer_device_id, "origin_device_id")
+        values: list[Any] = list(scope_values)
+        conditions: list[str] = [scope]
         if statuses:
             status_values = [status.value for status in statuses]
             conditions.append(f"status IN ({','.join('?' for _ in status_values)})")
@@ -1412,6 +1469,9 @@ class Storage:
         self.expire_due_notifications()
         conditions = ["created_at >= ?"]
         values: list[Any] = [_dt(created_since)]
+        scope, scope_values = self._viewer_scope_sql(viewer_device_id, "origin_device_id")
+        conditions.append(scope)
+        values.extend(scope_values)
         if statuses:
             status_values = [status.value for status in statuses]
             conditions.append(f"status IN ({','.join('?' for _ in status_values)})")
@@ -1596,9 +1656,11 @@ class Storage:
     ) -> tuple[AckResponse, SyncEvent | None]:
         now = utc_now()
         with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            scope, scope_values = self._viewer_scope_sql(device_id, "origin_device_id")
             row = self._conn.execute(
-                "SELECT * FROM notifications WHERE id = ?",
-                (notification_id,),
+                f"SELECT * FROM notifications WHERE id = ? AND {scope}",
+                (notification_id, *scope_values),
             ).fetchone()
             if row is None:
                 raise KeyError(notification_id)
@@ -1740,9 +1802,10 @@ class Storage:
         incoming_turn_id = _hook_turn_id(metadata)
         now = utc_now()
         with self._lock, self._conn:
+            scope, scope_values = self._viewer_scope_sql(device_id, "origin_device_id")
             rows = self._conn.execute(
-                "SELECT * FROM notifications WHERE status = ? ORDER BY created_at DESC",
-                (NotificationStatus.active.value,),
+                f"SELECT * FROM notifications WHERE status = ? AND {scope} ORDER BY created_at DESC",
+                (NotificationStatus.active.value, *scope_values),
             ).fetchall()
             candidates: list[tuple[NotificationPublic, str]] = []
             for row in rows:
@@ -1967,12 +2030,13 @@ class Storage:
         target_session = session_id or "local"
         events: list[SyncEvent] = []
         with self._lock, self._conn:
+            scope, scope_values = self._viewer_scope_sql(device_id, "origin_device_id")
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT * FROM notifications
-                WHERE status = ? AND source = ?
+                WHERE status = ? AND source = ? AND {scope}
                 """,
-                (NotificationStatus.active.value, source),
+                (NotificationStatus.active.value, source, *scope_values),
             ).fetchall()
             for row in rows:
                 notification = self._notification_from_row(row)
@@ -2021,12 +2085,13 @@ class Storage:
 
     def events_after(self, since_event_id: str | None, device: DevicePublic | None = None) -> list[SyncEvent]:
         values: tuple[Any, ...]
+        scope, scope_values = self._event_scope_sql(device)
         where = ""
         if since_event_id:
             with self._lock:
                 row = self._conn.execute(
-                    "SELECT seq FROM events WHERE id = ?",
-                    (since_event_id,),
+                    f"SELECT seq FROM events WHERE id = ? AND {scope}",
+                    (since_event_id, *scope_values),
                 ).fetchone()
             if row is None:
                 where = ""
@@ -2038,8 +2103,8 @@ class Storage:
             values = ()
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT payload FROM events {where} ORDER BY seq ASC",
-                values,
+                f"SELECT payload FROM events {where + ' AND' if where else 'WHERE'} {scope} ORDER BY seq ASC",
+                (*values, *scope_values),
             ).fetchall()
         events = [SyncEvent.model_validate_json(row["payload"]) for row in rows]
         if device is None:
@@ -2060,9 +2125,10 @@ class Storage:
         false so the client can reload that snapshot and jump to ``latest_event_id``.
         """
         bounded_limit = max(1, int(limit))
+        scope, scope_values = self._event_scope_sql(device)
         with self._lock:
             latest = self._conn.execute(
-                "SELECT id FROM events ORDER BY seq DESC LIMIT 1"
+                f"SELECT id FROM events WHERE {scope} ORDER BY seq DESC LIMIT 1", scope_values,
             ).fetchone()
             latest_event_id = latest["id"] if latest is not None else None
 
@@ -2070,15 +2136,15 @@ class Storage:
                 return [], latest_event_id, None, False
 
             cursor = self._conn.execute(
-                "SELECT seq FROM events WHERE id = ?",
-                (since_event_id,),
+                f"SELECT seq FROM events WHERE id = ? AND {scope}",
+                (since_event_id, *scope_values),
             ).fetchone()
             if cursor is None:
                 return [], latest_event_id, False, False
 
             rows = self._conn.execute(
-                "SELECT payload FROM events WHERE seq > ? ORDER BY seq ASC LIMIT ?",
-                (cursor["seq"], bounded_limit + 1),
+                f"SELECT payload FROM events WHERE seq > ? AND {scope} ORDER BY seq ASC LIMIT ?",
+                (cursor["seq"], *scope_values, bounded_limit + 1),
             ).fetchall()
 
         has_more = len(rows) > bounded_limit

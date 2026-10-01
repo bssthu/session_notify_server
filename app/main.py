@@ -310,7 +310,8 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     ) -> None:
         await hub.broadcast(
             event,
-            storage.should_deliver_event_to_device if should_deliver is None else should_deliver,
+            lambda event, device_id: storage.should_deliver_event_to_device(event, device_id)
+            and (should_deliver is None or should_deliver(event, device_id)),
             storage.event_for_device_id,
         )
 
@@ -450,13 +451,13 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     def list_devices(
         device: DevicePublic = Depends(current_device),
     ) -> list[DevicePublic]:
-        return storage.list_devices()
+        return storage.list_devices(viewer_device_id=device.id)
 
     @app.get("/api/v1/devices/presence", response_model=DevicePresenceSummary)
     def get_device_presence(
         device: DevicePublic = Depends(current_device),
     ) -> DevicePresenceSummary:
-        return storage.device_presence_summary(DEVICE_PRESENCE_TTL)
+        return storage.device_presence_summary(DEVICE_PRESENCE_TTL, viewer_device_id=device.id)
 
     @app.post("/api/v1/devices/me/presence", response_model=DevicePresenceSummary)
     async def update_current_device_presence(
@@ -490,22 +491,25 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 any_unlocked_unpaused_windows=summary.any_unlocked_unpaused_windows,
             )
             await publish(event, lambda _event, device_id: storage.is_android_device(device_id))
-        return summary
+        return storage.device_presence_summary(DEVICE_PRESENCE_TTL, viewer_device_id=device.id)
 
     @app.patch("/api/v1/devices/{device_id}", response_model=DevicePublic)
-    def update_device(
+    async def update_device(
         device_id: str,
         request: DeviceUpdateRequest,
         device: DevicePublic = Depends(current_device),
     ) -> DevicePublic:
         try:
-            return storage.update_device(
+            updated = storage.update_device(
                 device_id,
                 name=request.name,
                 notifications_enabled=request.notifications_enabled,
                 role=request.role,
                 actor_id=device.id,
             )
+            if request.role is not None:
+                await hub.reconnect_device(device_id)
+            return updated
         except PermissionError as error:
             raise HTTPException(status_code=403, detail=str(error)) from None
         except LastAdministratorError as error:
@@ -648,6 +652,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             for item in storage.list_notifications(
                 status_filter or [NotificationStatus.active],
                 created_since=utc_now() - timedelta(days=NOTIFICATION_HISTORY_MAX_DAYS),
+                viewer_device_id=device.id,
             )
         ]
 
