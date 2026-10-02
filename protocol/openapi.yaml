@@ -227,6 +227,14 @@ paths:
             type: array
             items:
               $ref: "#/components/schemas/NotificationStatus"
+        - name: level
+          in: query
+          required: false
+          description: Return only notifications with one of these message levels. Repeat the parameter to select multiple levels.
+          schema:
+            type: array
+            items:
+              $ref: "#/components/schemas/NotificationLevel"
         - name: days
           in: query
           required: false
@@ -715,7 +723,7 @@ components:
           type: integer
           minimum: 0
         filter_options:
-          description: Candidate values from the current days, status, and visibility scope; independent of machine, agent, tag, and q filters.
+          description: Candidate values from the current days, status, level, and visibility scope; independent of machine, agent, tag, and q filters.
           $ref: "#/components/schemas/NotificationHistoryFilterOptions"
     AckRequest:
       type: object

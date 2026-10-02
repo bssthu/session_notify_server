@@ -1453,6 +1453,7 @@ class Storage:
         self,
         *,
         statuses: Iterable[NotificationStatus] | None,
+        levels: Iterable[NotificationLevel] | None = None,
         created_since: datetime,
         limit: int,
         before_created_at: datetime | None = None,
@@ -1476,6 +1477,10 @@ class Storage:
             status_values = [status.value for status in statuses]
             conditions.append(f"status IN ({','.join('?' for _ in status_values)})")
             values.extend(status_values)
+        if levels:
+            level_values = [level.value for level in levels]
+            conditions.append(f"level IN ({','.join('?' for _ in level_values)})")
+            values.extend(level_values)
         if visible_only:
             conditions.append("notification_visible_for_history(source, title, metadata, ?) = 1")
             values.append(1 if suppress_codex_permission_requests else 0)

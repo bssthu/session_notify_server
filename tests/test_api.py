@@ -225,6 +225,13 @@ def test_recent_notifications_validate_cursor_limit_and_status(tmp_path):
     )
     assert too_large.status_code == 422
 
+    invalid_level = client.get(
+        "/api/v1/notifications/recent",
+        headers=auth(token),
+        params={"level": "warning"},
+    )
+    assert invalid_level.status_code == 422
+
 
 def test_recent_notifications_filter_client_hidden_events_before_counting(tmp_path):
     app = create_app(tmp_path / "server.db")
@@ -306,7 +313,7 @@ def test_recent_notifications_filter_client_hidden_events_before_counting(tmp_pa
     assert unfiltered.json()["total_pages"] == 2
 
 
-def test_recent_notifications_filter_by_machine_agent_tag_and_keyword(tmp_path):
+def test_recent_notifications_filter_by_machine_agent_tag_level_and_keyword(tmp_path):
     client = TestClient(create_app(tmp_path / "server.db"))
     workstation = bind_tokens(client, name="WORKSTATION-01", platform="windows")
     laptop = bind_tokens(client, name="Build-Laptop", platform="windows")
@@ -319,6 +326,7 @@ def test_recent_notifications_filter_by_machine_agent_tag_and_keyword(tmp_path):
                 "session_id": "nightly-build",
                 "title": "Build completed",
                 "body": "All verification jobs passed",
+                "level": "success",
                 "metadata": {"tag": "auto nightly"},
             },
         ),
@@ -329,6 +337,7 @@ def test_recent_notifications_filter_by_machine_agent_tag_and_keyword(tmp_path):
                 "session_id": "review-session",
                 "title": "Review requested",
                 "body": "Please inspect the patch",
+                "level": "important",
                 "metadata": {"tag": "manual_review"},
             },
         ),
@@ -339,6 +348,7 @@ def test_recent_notifications_filter_by_machine_agent_tag_and_keyword(tmp_path):
                 "session_id": "literal-tag",
                 "title": "Coverage is complete",
                 "body": "Reached the target",
+                "level": "info",
                 "metadata": {"tag": "100%"},
             },
         ),
@@ -387,6 +397,9 @@ def test_recent_notifications_filter_by_machine_agent_tag_and_keyword(tmp_path):
     assert titles(machine="workstation") == ["Coverage is complete", "Build completed"]
     assert titles(machine="renamed-workstation") == ["Coverage is complete", "Build completed"]
     assert titles(agent="CLAUDE") == ["Review requested"]
+    assert titles(level="success") == ["Build completed"]
+    assert titles(level="important") == ["Review requested"]
+    assert titles(level=["success", "info"]) == ["Coverage is complete", "Build completed"]
     assert titles(tag="AUTO") == ["Build completed"]
     assert titles(q="verification jobs") == ["Build completed"]
     assert titles(machine="build-lap", agent="claude", tag="review") == ["Review requested"]

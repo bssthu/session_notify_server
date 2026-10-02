@@ -659,6 +659,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     @app.get("/api/v1/notifications/recent", response_model=NotificationPage)
     def list_recent_notifications(
         status_filter: list[NotificationStatus] | None = Query(default=None, alias="status"),
+        level_filter: list[NotificationLevel] | None = Query(default=None, alias="level"),
         days: int = Query(default=1, ge=1),
         limit: int = Query(
             default=NOTIFICATION_HISTORY_DEFAULT_PAGE_SIZE,
@@ -691,6 +692,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             before_created_at, before_id = _decode_notification_cursor(cursor)
         items, has_more, total_count, filter_options = storage.list_recent_notifications(
             statuses=status_filter,
+            levels=level_filter,
             created_since=utc_now() - timedelta(days=effective_days),
             limit=limit,
             before_created_at=before_created_at,
