@@ -12,10 +12,10 @@ paths:
       security: []
       responses:
         "200":
-          description: Service health.
+          description: 服务健康状态。
   /api/v1/devices/bind:
     post:
-      description: In strict mode this endpoint only rebinds an existing device using its refresh token, preserving its role. New devices consume a pairing code issued locally or by an administrator. Bootstrap creates an administrator; subsequent invitations default to member. Clients cannot choose their role when binding.
+      description: strict 模式仅允许使用刷新令牌重新绑定已有设备，保留其角色。新设备须消费本机初始化码或管理员签发的配对码；初始化创建管理员，后续邀请默认 member。客户端不能在绑定时自行选择角色。
       security: []
       requestBody:
         required: true
@@ -25,14 +25,14 @@ paths:
               $ref: "#/components/schemas/DeviceBindRequest"
       responses:
         "200":
-          description: Device credentials.
+          description: 设备凭据。
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceBindResponse"
   /api/v1/devices/pair/issue:
     post:
-      description: Administrator only. Select admin, member (default), or guest (local device only). The selected role is stored with the one-time code and cannot be changed by the joining device.
+      description: 仅管理员可调用。可选择 admin、member（默认）或 guest（仅本机）。角色随一次性配对码保存，加入设备不能覆盖。
       requestBody:
         required: false
         content:
@@ -41,16 +41,16 @@ paths:
               $ref: "#/components/schemas/PairIssueRequest"
       responses:
         "200":
-          description: One-time pairing code issued by an administrator.
+          description: 管理员签发的一次性配对码。
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/PairIssueResponse"
         "403":
-          description: Only administrators may invite devices.
+          description: 仅管理员可邀请设备。
   /api/v1/devices/pair/status:
     post:
-      description: Administrator-only pairing progress lookup. Ordinary devices retain device-list and notification access.
+      description: 仅管理员可查询自己签发的配对码进度。普通设备仍可查看设备列表和通知，游客仅可访问本机范围。
       requestBody:
         required: true
         content:
@@ -59,15 +59,15 @@ paths:
               $ref: "#/components/schemas/PairStatusRequest"
       responses:
         "200":
-          description: Pairing progress.
+          description: 配对进度。
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/PairStatusResponse"
         "403":
-          description: Administrator role required.
+          description: 需要管理员角色。
         "404":
-          description: Pairing code not found.
+          description: 未找到配对码。
   /api/v1/devices/pair/consume:
     post:
       security: []
@@ -79,7 +79,7 @@ paths:
               $ref: "#/components/schemas/PairConsumeRequest"
       responses:
         "200":
-          description: Newly bound device credentials. Bootstrap creates an administrator. Device-issued codes carry the role selected by the administrator and become invalid when the issuer is revoked or demoted.
+          description: 新绑定设备的凭据。初始化码创建管理员；设备签发的配对码携带管理员选择的角色，签发设备被撤销或降级后失效。
           content:
             application/json:
               schema:
@@ -88,7 +88,7 @@ paths:
     get:
       responses:
         "200":
-          description: Bound devices. Guests receive only their own device.
+          description: 已绑定设备；游客仅收到本机设备。
           content:
             application/json:
               schema:
@@ -99,7 +99,7 @@ paths:
     get:
       responses:
         "200":
-          description: Effective Windows presence. For guests, devices and aggregate counts are restricted to their own device.
+          description: 当前有效的 Windows 在线状态；游客的设备列表与汇总计数仅包含本机。
           content:
             application/json:
               schema:
@@ -114,16 +114,16 @@ paths:
               $ref: "#/components/schemas/DevicePresenceUpdateRequest"
       responses:
         "200":
-          description: Updated Windows presence summary, scoped to the requesting device for guests.
+          description: 更新后的 Windows 在线状态汇总；游客仅包含请求设备。
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DevicePresenceSummary"
         "422":
-          description: Only a bound Windows device can report desktop session state.
+          description: 仅已绑定的 Windows 设备可上报桌面会话状态。
   /api/v1/devices/{device_id}:
     patch:
-      description: Administrators may modify any device and its role. Members and guests may only rename themselves or change their own notification setting; neither may change their own role. Role updates reconnect the target WebSocket with code 1012 so clients reload their active snapshot. The last active administrator cannot be demoted.
+      description: 管理员可修改任意设备及其角色。普通设备与游客只能修改本机名称和通知接收设置，不能修改自身角色。角色变更以 WebSocket 1012 断开目标连接，促使客户端重连并刷新活动通知快照。不能降级最后一台有效管理员。
       parameters:
         - name: device_id
           in: path
@@ -138,17 +138,17 @@ paths:
               $ref: "#/components/schemas/DeviceUpdateRequest"
       responses:
         "200":
-          description: Updated device.
+          description: 更新后的设备。
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Device"
         "403":
-          description: Insufficient device management permissions.
+          description: 设备管理权限不足。
         "409":
-          description: At least one active administrator must remain.
+          description: 必须保留至少一台有效管理员设备。
     delete:
-      description: Administrators may revoke other devices. Members and guests may only revoke themselves. The last active administrator cannot be revoked through the API.
+      description: 管理员可撤销其他设备，普通设备和游客只能撤销本机。不能通过 API 撤销最后一台有效管理员。
       parameters:
         - name: device_id
           in: path
@@ -157,15 +157,15 @@ paths:
             type: string
       responses:
         "200":
-          description: Revoked device.
+          description: 已撤销的设备。
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Device"
         "403":
-          description: Insufficient device management permissions.
+          description: 设备管理权限不足。
         "409":
-          description: At least one active administrator must remain.
+          description: 必须保留至少一台有效管理员设备。
   /api/v1/auth/refresh:
     post:
       security: []
@@ -177,14 +177,14 @@ paths:
               $ref: "#/components/schemas/TokenRefreshRequest"
       responses:
         "200":
-          description: New access token for an existing device.
+          description: 已有设备的新访问令牌；普通刷新不轮换刷新令牌。
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AccessTokenResponse"
   /api/v1/notifications:
     get:
-      description: Returns matching notifications created within the server-enforced latest 30-day window. Defaults to active notifications. Guests only receive notifications whose authenticated origin_device_id is their own device; unknown origins are excluded.
+      description: 返回最近 30 天内创建的匹配通知，默认仅查询 active 状态。游客仅收到 origin_device_id 为本机认证设备的通知，不包含来源未知的通知。
       parameters:
         - name: status
           in: query
@@ -195,7 +195,7 @@ paths:
               $ref: "#/components/schemas/NotificationStatus"
       responses:
         "200":
-          description: Notifications.
+          description: 通知列表。
           content:
             application/json:
               schema:
@@ -211,14 +211,14 @@ paths:
               $ref: "#/components/schemas/NotificationCreate"
       responses:
         "200":
-          description: Created notification.
+          description: 已创建的通知。
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Notification"
   /api/v1/notifications/recent:
     get:
-      description: Guest scope is applied before filtering, pagination, counts, and filter suggestions; only the requesting device origin is visible. Returns a newest-first cursor page. Requested ranges above 30 days are clamped to 30 days.
+      description: 先应用游客可见范围，再筛选、分页、计数和生成筛选建议；游客仅能查看来源为本机的通知。按时间从新到旧返回游标分页；请求超过 30 天时限制为 30 天。
       parameters:
         - name: status
           in: query
@@ -230,7 +230,7 @@ paths:
         - name: level
           in: query
           required: false
-          description: Return only notifications with one of these message levels. Repeat the parameter to select multiple levels.
+          description: 仅返回指定消息级别的通知；重复该参数可选择多个级别。
           schema:
             type: array
             items:
@@ -270,14 +270,14 @@ paths:
         - name: machine
           in: query
           required: false
-          description: Case-insensitive literal substring matched against origin device name or ID.
+          description: 大小写不敏感的字面子串，匹配来源设备名称或 ID。
           schema:
             type: string
             maxLength: 120
         - name: agent
           in: query
           required: false
-          description: Case-insensitive literal substring matched against notification source.
+          description: 大小写不敏感的字面子串，匹配通知来源。
           schema:
             type: string
             maxLength: 40
@@ -297,14 +297,14 @@ paths:
             maxLength: 160
       responses:
         "200":
-          description: A page of recent notifications.
+          description: 一页最近通知。
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/NotificationPage"
   /api/v1/notifications/{notification_id}/ack:
     post:
-      description: Guests may only acknowledge their own origin notifications; inaccessible IDs return 404 without mutation.
+      description: 游客只能确认本机发布的通知；不可访问的 ID 返回 404，不修改通知。
       parameters:
         - name: notification_id
           in: path
@@ -319,14 +319,14 @@ paths:
               $ref: "#/components/schemas/AckRequest"
       responses:
         "200":
-          description: Ack result.
+          description: 确认结果。
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AckResponse"
   /api/v1/events:
     get:
-      description: Guests receive only events for their own origin notifications, including acknowledgement and expiry. Pagination and cursors use the same scope. Remote acknowledgement identity and reason are omitted.
+      description: 游客仅收到本机发布通知的事件，包括确认和过期；分页与游标使用相同范围，不下发其他设备的确认身份和自定义原因。
       parameters:
         - name: since_event_id
           in: query
@@ -336,14 +336,14 @@ paths:
         - name: limit
           in: query
           required: false
-          description: Bounds catch-up payloads. Without a cursor, returns only the latest event id for baseline initialization.
+          description: 传入此参数时限制事件补拉数量；不带游标时仅返回最新事件 ID 作为基线。省略 limit 时保留原有事件补拉行为。
           schema:
             type: integer
             minimum: 1
             maximum: 500
       responses:
         "200":
-          description: Event stream catch-up.
+          description: 补拉事件流。
           content:
             application/json:
               schema:
@@ -364,15 +364,17 @@ paths:
               $ref: "#/components/schemas/HookPayload"
       responses:
         "200":
-          description: Notification generated from hook payload.
+          description: Hook 创建的通知，或未创建通知时的 null（如回答关联、完成信号或被策略抑制的事件）。
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Notification"
+                oneOf:
+                  - $ref: "#/components/schemas/Notification"
+                  - type: "null"
   /api/v1/ws:
     get:
-      summary: WebSocket endpoint.
-      description: Guest delivery is limited to notifications from the authenticated device, including acknowledgements and expiry. Other device presence is not sent. Roles are checked on every broadcast; role updates close the target connection with code 1012 and clients reload their active snapshot.
+      summary: WebSocket 连接入口。
+      description: 游客仅收到认证设备发布通知的创建、确认和过期事件，不接收其他设备的在线状态。每次广播均检查角色；角色变更以 1012 关闭目标连接，客户端需重连并刷新活动通知快照。鉴权优先使用 Authorization 请求头中的 Bearer 令牌，其次使用 token 查询参数。
       parameters:
         - name: token
           in: query
@@ -381,7 +383,7 @@ paths:
             type: string
       responses:
         "101":
-          description: WebSocket upgrade. Messages conform to ws-events.schema.json.
+          description: 升级为 WebSocket；消息格式见 ws-events.schema.json。
 components:
   securitySchemes:
     bearerAuth:
@@ -402,7 +404,7 @@ components:
           enum: [windows, android]
         refresh_token:
           type: [string, "null"]
-          description: Optional. Under strict mode, proves local identity for a rebind instead of requiring a pairing code.
+          description: 可选。strict 模式下用于证明已有设备身份并重新绑定，无需再次消费配对码。
     DeviceBindResponse:
       type: object
       required: [device, refresh_token, access_token, token_type]
@@ -431,7 +433,7 @@ components:
           type: boolean
         role:
           $ref: "#/components/schemas/DeviceRole"
-          description: Administrator only, including changes to one's own role.
+          description: 仅管理员可修改，包括自身角色。
     DevicePresenceUpdateRequest:
       type: object
       required: [session_state]
@@ -442,6 +444,10 @@ components:
         notification_pause_until:
           type: [string, "null"]
           format: date-time
+        suppress_codex_permission_requests:
+          type: boolean
+          default: false
+          description: 来源 Windows 设备是否启用 Codex 普通权限审批提醒抑制策略。
     WindowsDevicePresence:
       type: object
       required: [device_id, device_name, reported_session_state, effective_session_state]
@@ -459,6 +465,10 @@ components:
         session_state_updated_at:
           type: [string, "null"]
           format: date-time
+        suppress_codex_permission_requests:
+          type: boolean
+          default: false
+          description: 来源 Windows 设备是否启用 Codex 普通权限审批提醒抑制策略。
     DevicePresenceSummary:
       type: object
       required: [any_unlocked_windows, any_unlocked_unpaused_windows, registered_windows, fresh_windows, evaluated_at, stale_after_seconds, windows_devices]
@@ -467,7 +477,7 @@ components:
           type: boolean
         any_unlocked_unpaused_windows:
           type: boolean
-          description: True when at least one fresh Windows device is unlocked and has not paused notifications.
+          description: 至少一台状态有效的 Windows 设备未锁屏且未暂停通知时为 true。
         registered_windows:
           type: integer
           minimum: 0
@@ -540,10 +550,18 @@ components:
           $ref: "#/components/schemas/DeviceRole"
         code:
           type: string
-          description: One-time human-readable pairing code, e.g. 7Q4K-9XKM.
+          description: 一次性可读配对码，例如 7Q4K-9XKM。
         expires_at:
           type: string
           format: date-time
+        candidate_base_urls:
+          type: array
+          items:
+            type: string
+          description: 服务端提供的候选连接地址；客户端仍需选择新设备实际可达的地址。
+        server_fingerprint:
+          type: [string, "null"]
+          description: 服务端证书的 SHA-256 指纹；未配置或无法读取证书时可能为空。
     PairConsumeRequest:
       type: object
       additionalProperties: false
@@ -646,14 +664,14 @@ components:
               type: string
             origin_device_id:
               type: [string, "null"]
-              description: Device id that created the notification.
+              description: 创建通知的认证设备 ID。
             origin_device_name:
               type: [string, "null"]
-              description: Device display name that created the notification.
+              description: 创建通知的设备显示名称。
             origin_device_platform:
               type: [string, "null"]
               enum: [windows, android, null]
-              description: Platform of the device that created the notification.
+              description: 创建通知的设备平台。
             status:
               $ref: "#/components/schemas/NotificationStatus"
             created_at:
@@ -695,7 +713,7 @@ components:
             maxLength: 120
         truncated:
           type: boolean
-          description: True when at least one candidate list exceeded its server-side limit; free-text filtering remains available.
+          description: 任一候选列表超过服务端上限时为 true；仍可手动输入筛选文字。
     NotificationPage:
       type: object
       required: [items, has_more, requested_days, effective_days, limit, total_count, total_pages, filter_options]
@@ -723,7 +741,7 @@ components:
           type: integer
           minimum: 0
         filter_options:
-          description: Candidate values from the current days, status, level, and visibility scope; independent of machine, agent, tag, and q filters.
+          description: 当前 days、status、level 及可见范围内的候选值，不受 machine、agent、tag 和 q 筛选影响。
           $ref: "#/components/schemas/NotificationHistoryFilterOptions"
     AckRequest:
       type: object
@@ -751,7 +769,7 @@ components:
           type: [string, "null"]
         cursor_found:
           type: [boolean, "null"]
-          description: Null when no cursor was supplied, false when the supplied cursor is unknown.
+          description: 未提供游标时为 null，所提供游标不存在时为 false。
         has_more:
           type: boolean
     CodexAsyncQuestionAsked:
@@ -818,19 +836,39 @@ components:
             $ref: "#/components/schemas/CodexAsyncAnswerItem"
     HookPayload:
       type: object
+      additionalProperties: true
       properties:
+        hook_event_name:
+          type: [string, "null"]
+        hook_status:
+          type: [string, "null"]
+        notification_type:
+          type: [string, "null"]
+        title:
+          type: [string, "null"]
+        last_assistant_message:
+          type: [string, "null"]
+        cwd:
+          type: [string, "null"]
+        transcript_path:
+          type: [string, "null"]
+        tool_name:
+          type: [string, "null"]
+        tool_input:
+          type: [object, "null"]
+          additionalProperties: true
         event_type:
           type: [string, "null"]
         notification_title:
           type: [string, "null"]
           minLength: 1
           maxLength: 120
-          description: Optional explicit title override for external Hook Bridge callers. Installed agent hooks do not set it.
+          description: 外部 Hook Bridge 调用方可选的标题覆盖值；自动安装的 Agent Hook 不设置此字段。
         notification_level:
           oneOf:
             - $ref: "#/components/schemas/NotificationLevel"
             - type: "null"
-          description: Optional explicit level override for external Hook Bridge callers. Installed agent hooks do not set it.
+          description: 外部 Hook Bridge 调用方可选的级别覆盖值；自动安装的 Agent Hook 不设置此字段。
         message:
           type: [string, "null"]
         prompt:
@@ -852,22 +890,19 @@ components:
             - $ref: "#/components/schemas/CodexAsyncQuestionsAnswered"
             - type: "null"
           description: >-
-            Optional Codex async-question correlation, scoped to the authenticated
-            origin device and session_id. SHA-256 covers the full UTF-8 title with
-            CRLF/CR normalized to LF, before summary truncation. The bridge supplies
-            observed_at and metadata.delivery_id before queuing delivery. Asked is
-            accepted only for request_user_input_async PreToolUse; answered and
-            answered_batch only for UserPromptSubmit. answered is the legacy unique
-            title match; answered_batch uses the call_id and zero-based question_index
-            from questionItemId plus the full title hash, without a title-only fallback.
-            Answer text is never included. Batches are persisted atomically and
-            support out-of-order replay. Both formats may cross turn_id; all questions
-            in a call must be answered before notification.acknowledged is emitted
-            with reason async_question_answered. Submission creates no notification.
-            Late delivery that makes a prior match ambiguous retracts only automatic
-            acknowledgements of unexpired notifications, using notification.created
-            as an upsert of the original id with reason async_question_ambiguous.
-            Manual acknowledgements are never retracted.
+            可选的 Codex 异步问题关联，范围限定为认证来源设备和 session_id。
+            将完整题目的 CRLF/CR 归一化为 LF 后，对 UTF-8 文本计算 SHA-256，先于摘要裁剪。
+            Bridge 在入队前写入 observed_at 和 metadata.delivery_id。
+            asked 仅接受 request_user_input_async 的 PreToolUse 事件；
+            answered 和 answered_batch 仅接受 UserPromptSubmit。
+            answered 按旧版完整题目指纹唯一匹配；answered_batch 使用 questionItemId
+            中的 call_id、从 0 开始的 question_index 及完整题目指纹，不回退为仅按题目匹配。
+            回答正文不上传。整批关联原子持久化，支持乱序补发和跨 turn_id 回答。
+            一次调用的全部问题回答完毕后，才发出 reason 为 async_question_answered 的
+            notification.acknowledged；提交回答本身不创建通知。
+            迟到事件使旧匹配出现歧义时，仅撤销未过期通知的自动确认，并以原 ID 发送
+            reason 为 async_question_ambiguous 的 notification.created 更新。
+            手动确认不撤销。
         metadata:
           type: object
           properties:

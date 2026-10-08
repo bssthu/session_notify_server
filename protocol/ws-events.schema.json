@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://session-notify.local/protocol/ws-events.schema.json",
-  "title": "Session Notify WebSocket Event",
+  "title": "Session Notify WebSocket 事件",
   "type": "object",
   "required": ["schema_version", "event_id", "event_type", "created_at"],
   "properties": {
@@ -99,7 +99,7 @@
     },
     "reason": {
       "type": ["string", "null"],
-      "description": "async_question_ambiguous on notification.created restores a previously auto-acknowledged, unexpired question by its original id after late delivery reveals ambiguous title matching. Manual acknowledgements are preserved."
+      "description": "迟到事件使题目匹配出现歧义时，notification.created 的 async_question_ambiguous 原因表示：按原 ID 恢复此前自动确认且尚未过期的问题。手动确认不撤销。"
     },
     "pair_code_hash": {
       "type": ["string", "null"]
