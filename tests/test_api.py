@@ -2726,8 +2726,8 @@ def test_bind_response_includes_access_expiry(tmp_path):
     assert tokens["access_expires_at"] is not None
     expires = datetime.fromisoformat(tokens["access_expires_at"])
     delta = expires - datetime.now(expires.tzinfo)
-    # 默认 access TTL = 1h
-    assert timedelta(minutes=55) < delta < timedelta(hours=1, minutes=5)
+    # 默认 access TTL = 2h，为每小时运行的任务留出调度余量。
+    assert timedelta(hours=1, minutes=55) < delta < timedelta(hours=2, minutes=5)
 
 
 def test_expired_access_token_is_rejected_and_refreshable(tmp_path):
@@ -2749,6 +2749,9 @@ def test_expired_access_token_is_rejected_and_refreshable(tmp_path):
     new_access = refreshed.json()["access_token"]
     assert new_access != old_access
     assert refreshed.json()["access_expires_at"] is not None
+    refreshed_expiry = datetime.fromisoformat(refreshed.json()["access_expires_at"])
+    remaining = refreshed_expiry - utc_now()
+    assert timedelta(hours=1, minutes=55) < remaining < timedelta(hours=2, minutes=5)
     assert client.get("/api/v1/notifications", headers=auth(new_access)).status_code == 200
 
 

@@ -66,8 +66,8 @@ HOOK_PERMISSION_TTL = timedelta(minutes=int(os.getenv("SESSION_NOTIFY_PERMISSION
 # 会话中断且不会有 PostToolUse),触发按会话批量 acknowledge 兜底清理。
 _HOOK_EVENTS_THAT_FINALIZE_SESSION = frozenset({"stop", "taskcompleted", "stopfailure", "subagentstop"})
 # 设备 token 寿命:access 短期(请求凭证,到期靠客户端自动 refresh)、refresh 长期(仅换新 access,
-# 不轮换)。refresh 到期后需重新绑定。默认 access 1h / refresh 90d。
-ACCESS_TOKEN_TTL = timedelta(seconds=int(os.getenv("SESSION_NOTIFY_ACCESS_TTL_SECONDS", "3600")))
+# 不轮换)。refresh 到期后需重新绑定。默认 access 2h / refresh 90d。
+ACCESS_TOKEN_TTL = timedelta(seconds=int(os.getenv("SESSION_NOTIFY_ACCESS_TTL_SECONDS", "7200")))
 REFRESH_TOKEN_TTL = timedelta(days=int(os.getenv("SESSION_NOTIFY_REFRESH_TTL_DAYS", "90")))
 # 配对码有效期:已绑设备签发,新设备扫码/输码消费。一次性,默认 5 分钟。
 PAIR_CODE_TTL = timedelta(seconds=int(os.getenv("SESSION_NOTIFY_PAIR_CODE_TTL_SECONDS", "300")))

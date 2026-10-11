@@ -90,7 +90,7 @@ Compose 使用 HTTPS 监听 8765，挂载 `runtime/secrets/` 中的证书和私�
 | `SESSION_NOTIFY_DB` | `runtime/session_notify.db` | SQLite 数据库路径；Compose 覆盖为 `/data/session_notify.db` |
 | `SESSION_NOTIFY_PAIR_MODE` | `strict` | 新设备配对门禁 |
 | `SESSION_NOTIFY_CERT_FILE` | `runtime/secrets/server.crt` | 配对二维码所需的服务端证书指纹来源 |
-| `SESSION_NOTIFY_ACCESS_TTL_SECONDS` | `3600` | 访问令牌有效秒数 |
+| `SESSION_NOTIFY_ACCESS_TTL_SECONDS` | `7200` | 访问令牌有效秒数，默认 2 小时 |
 | `SESSION_NOTIFY_REFRESH_TTL_DAYS` | `90` | 刷新令牌有效天数 |
 | `SESSION_NOTIFY_PAIR_CODE_TTL_SECONDS` | `300` | 已绑定设备签发的配对码有效秒数；本地初始化脚本使用默认五分钟 |
 | `SESSION_NOTIFY_HOOK_TTL_HOURS` | `24` | 普通 Hook 通知有效小时数 |
@@ -99,6 +99,8 @@ Compose 使用 HTTPS 监听 8765，挂载 `runtime/secrets/` 中的证书和私�
 | `SESSION_NOTIFY_EXPIRE_POLL_SECONDS` | `60` | 后台清理到期通知并广播过期事件的检查间隔 |
 
 监听地址和端口由 `run_dev_server.ps1 -HostAddress ... -Port ...` 或 uvicorn 参数决定，`.env.example` 的 `SESSION_NOTIFY_HOST` 不被应用读取，`SESSION_NOTIFY_PORT` 只作为生成配对候选地址时的备用端口，两者均不控制监听。若通过 `-CertFile` 指定其他证书，还需把 `SESSION_NOTIFY_CERT_FILE` 指向同一文件，保证二维码指纹一致。
+
+两小时 access token 为每小时执行的任务留出调度余量，但任务仍应根据 `access_expires_at` 提前刷新，或在 401 后刷新并重试一次。新默认值只影响后续签发/刷新的 token；已有 token 的到期时间不会被修改。refresh token 仍为 90 天，且每次刷新会立即使该设备的旧 access token 失效，因此自动化调用端必须独立配对。
 
 Linux / macOS 的脚本入口是 `scripts/generate_self_signed_cert.sh` 和 `scripts/run_dev_server.sh`。后者使用 `HOST_ADDRESS`、`PORT`、`CERT_FILE`、`KEY_FILE` 环境变量设置监听与 TLS，与上表的应用配置区分；自定义证书时同样需要设置 `SESSION_NOTIFY_CERT_FILE`。
 

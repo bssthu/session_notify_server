@@ -371,7 +371,7 @@ class Storage:
         self,
         db_path: str | Path,
         *,
-        access_ttl: timedelta = timedelta(hours=1),
+        access_ttl: timedelta = timedelta(hours=2),
         refresh_ttl: timedelta = timedelta(days=90),
         pair_code_ttl: timedelta = timedelta(seconds=300),
     ) -> None:
