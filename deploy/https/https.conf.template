@@ -1,0 +1,58 @@
+map $http_upgrade $session_notify_connection {
+    default upgrade;
+    '' close;
+}
+
+# ACME must remain reachable on public TCP 80 for every renewal.
+server {
+    listen 80 default_server;
+    server_name _;
+    server_tokens off;
+    access_log off;
+    error_log /dev/stderr crit;
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/acme;
+        default_type text/plain;
+        try_files $uri =404;
+    }
+    location / { return 404; }
+}
+
+server {
+    listen 443 ssl default_server;
+    server_name __PUBLIC_IP__;
+    server_tokens off;
+    ssl_certificate /etc/letsencrypt/live/session-notify-public/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/session-notify-public/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_tickets off;
+
+    # Normal/error request logs can leak WebSocket ?token= credentials.
+    access_log off;
+    error_log /dev/stderr crit;
+    client_max_body_size 10m;
+    resolver 127.0.0.11 valid=30s ipv6=off;
+
+    location / {
+        # Re-resolve after a backend container IP change, without touching the app.
+        set $session_notify_backend server:8765;
+        proxy_pass https://$session_notify_backend;
+        proxy_ssl_server_name on;
+        proxy_ssl_name __UPSTREAM_TLS_NAME__;
+        proxy_ssl_trusted_certificate /etc/nginx/upstream/server.crt;
+        proxy_ssl_verify on;
+        proxy_ssl_verify_depth 2;
+        proxy_ssl_protocols TLSv1.2 TLSv1.3;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $session_notify_connection;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+}

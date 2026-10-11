@@ -1,0 +1,3 @@
+deploy/** text eol=lf
+tests/deploy/** text eol=lf
+compose.https.yaml text eol=lf

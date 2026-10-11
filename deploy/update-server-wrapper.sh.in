@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Optional stable entry point outside the checkout; set the path in your local copy.
+set -Eeuo pipefail
+REPO_DIR='REPLACE_WITH_ABSOLUTE_REPOSITORY_PATH'
+exec bash "$REPO_DIR/deploy/update-server.sh" "$@"

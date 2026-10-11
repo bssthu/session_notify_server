@@ -1,0 +1,2 @@
+# Only needed by the standalone Linux HTTPS checks, not the server image.
+PyYAML>=6.0,<7

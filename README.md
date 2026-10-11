@@ -81,6 +81,8 @@ docker compose exec server python scripts/issue_bootstrap_code.py
 
 Compose 使用 HTTPS 监听 8765，挂载 `runtime/secrets/` 中的证书和私钥，数据库保存在 `session_notify_data` 命名卷中。初始化和重置命令应通过 `docker compose exec server` 在容器内执行，使用 `/data/session_notify.db`；宿主机默认的 `runtime/session_notify.db` 是另一个数据库。构建通过 `uv sync --frozen --no-dev` 使用 `uv.lock` 中的应用依赖版本。
 
+Linux 首次部署、日常更新和旧更新脚本迁移见 [部署与更新说明](deploy/README.zh-CN.md)。需要系统受信任证书的调用端，可按 [公网 HTTPS 部署说明](deploy/https/README.zh-CN.md) 增加独立 Nginx/Certbot 入口；对外端口通过 `HTTPS_PUBLIC_PORT` 配置，默认 443，原客户端保留 8765 和原证书指纹。
+
 ## 配置
 
 服务从进程环境读取配置；`.env.example` 不会被启动脚本自动加载。PowerShell 中使用 `$env:变量名 = "值"`，Compose 部署则在 `compose.yaml` 的 `environment` 中配置。
@@ -120,6 +122,8 @@ uv run python scripts/send_test_notification.py --base-url https://127.0.0.1:876
 ```powershell
 uv run pytest
 ```
+
+部署脚本的独立 Linux 离线测试及上线验收见 [部署测试说明](tests/deploy/README.md)。
 
 ## 当前能力
 
