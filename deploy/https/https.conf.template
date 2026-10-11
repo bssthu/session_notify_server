@@ -35,7 +35,7 @@ server {
 
     location / {
         # Re-resolve after a backend container IP change, without touching the app.
-        set $session_notify_backend server:8765;
+        set $session_notify_backend server:__UPSTREAM_PORT__;
         proxy_pass https://$session_notify_backend;
         proxy_ssl_server_name on;
         proxy_ssl_name __UPSTREAM_TLS_NAME__;

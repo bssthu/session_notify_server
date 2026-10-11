@@ -5,7 +5,9 @@ import shutil
 
 
 TEST_INPUTS = (
+    "compose.yaml",
     "compose.https.yaml",
+    "deploy/compose_ports.py",
     "deploy/https/manage.sh",
     "deploy/https/bootstrap.conf",
     "deploy/https/https.conf.template",

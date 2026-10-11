@@ -21,7 +21,7 @@ for argument in "$@"; do
     esac
 done
 [[ $(uname -s) == Linux ]] || fail 'Run on the Linux Docker host.'
-for executable in git docker curl flock; do
+for executable in git docker curl flock python3; do
     command -v "$executable" >/dev/null || fail "Missing prerequisite: $executable"
 done
 [[ $(git rev-parse --show-toplevel) == "$ROOT" ]] || fail 'Run from the server Git checkout.'
@@ -34,10 +34,10 @@ if [[ -f runtime/deploy/update.env ]]; then
     # shellcheck source=/dev/null
     source runtime/deploy/update.env
 fi
-: "${UPDATE_COMPOSE_PROJECT=}" "${UPDATE_HEALTH_URL:=https://127.0.0.1:8765/health}"
+: "${UPDATE_COMPOSE_PROJECT=}" "${UPDATE_HEALTH_URL=}"
 : "${UPDATE_HEALTH_CA_FILE:=runtime/secrets/server.crt}"
 : "${UPDATE_HEALTH_RETRIES:=30}" "${UPDATE_HEALTH_INTERVAL_SECONDS:=2}"
-[[ $UPDATE_HEALTH_URL == https://* ]] || fail 'UPDATE_HEALTH_URL must use HTTPS.'
+[[ -z $UPDATE_HEALTH_URL || $UPDATE_HEALTH_URL == https://* ]] || fail 'UPDATE_HEALTH_URL must use HTTPS.'
 [[ -r $UPDATE_HEALTH_CA_FILE ]] || fail 'Backend CA/certificate file is not readable.'
 [[ $UPDATE_HEALTH_RETRIES =~ ^[0-9]{1,3}$ && $UPDATE_HEALTH_INTERVAL_SECONDS =~ ^[0-9]{1,2}$ ]] || fail 'Invalid health retry settings.'
 UPDATE_HEALTH_RETRIES=$((10#$UPDATE_HEALTH_RETRIES))
@@ -50,6 +50,11 @@ if [[ -n $UPDATE_COMPOSE_PROJECT ]]; then
 fi
 dc() { docker compose "${compose_options[@]}" "$@"; }
 https() { bash "$ROOT/deploy/https/manage.sh" "$@"; }
+if [[ -z $UPDATE_HEALTH_URL ]]; then
+    backend_ports=$(dc config --format json | python3 deploy/compose_ports.py)
+    read -r backend_port backend_host_port <<< "$backend_ports"
+    UPDATE_HEALTH_URL="https://127.0.0.1:$backend_host_port/health"
+fi
 docker compose version >/dev/null
 mkdir -p runtime/deploy
 chmod 700 runtime/deploy

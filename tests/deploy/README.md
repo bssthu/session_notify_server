@@ -10,7 +10,7 @@
 uv run pytest tests/deploy
 ```
 
-这些测试也包含在默认 `uv run pytest` 中，覆盖复制隔离、systemd 模板渲染、路径特殊字符及非法控制字符。不需要 Docker、systemd 服务管理器或公网证书。
+这些测试也包含在默认 `uv run pytest` 中，覆盖复制隔离、Compose 端口解析、非法端口及歧义映射、systemd 模板渲染、路径特殊字符及非法控制字符。不需要 Docker、systemd 服务管理器或公网证书。
 
 ## Linux 离线流程测试
 
@@ -28,7 +28,7 @@ bash -n deploy/update-server-wrapper.sh.in
 
 依赖安装需要网络；测试本身不联网、不接触 Docker daemon、不执行真实 Git 拉取或重建，不安装或启用 systemd unit。`run_*.py` 是独立 Linux 入口，不在默认 pytest 收集范围，避免 Windows 测试触发 Linux 工具。
 
-- HTTPS 流程模拟 Docker、Nginx、curl、ss 和 TLS 网络握手，用真实 OpenSSL 验证证书 DNS SAN、信任链及 IP 身份。覆盖默认/自定义端口、无邮箱配置、首次签发前置条件、staging 隔离、错误证书拒绝、reload 失败恢复、续期重试和无变化不 reload。
+- HTTPS 流程模拟 Docker、Nginx、curl、ss 和 TLS 网络握手，用真实 OpenSSL 验证证书 DNS SAN、信任链及 IP 身份。覆盖默认/自定义公网端口、不同的后端容器/宿主机端口、无邮箱配置、首次签发前置条件、staging 隔离、错误证书拒绝、reload 失败恢复、续期重试和无变化不 reload。
 - 更新流程模拟 Git、Docker、curl 和 HTTPS 管理入口，在带空格的临时仓库中运行真实 Bash 更新脚本。覆盖 fast-forward 后重新进入脚本、自定义项目和健康地址、仅后端/包含 HTTPS、干净工作区、失败中止和不自动签发/安装定时器。
 - systemd 渲染测试只生成临时文件，不等于服务管理器实际加载成功。
 

@@ -2,17 +2,19 @@
 
 此可选部署方案增加 Nginx 入口和一次性 Certbot 容器。首次部署后端和更新流程见[部署总入口](../README.zh-CN.md)。拓扑：
 
-- 新适配器：`https://<HTTPS_PUBLIC_IP>:<HTTPS_PUBLIC_PORT>` → Nginx → **校验证书的** `https://server:8765`
-- 原 Windows / Android：继续 `https://<HTTPS_PUBLIC_IP>:8765`，地址、证书指纹、配对和凭据不变
+- 新适配器：`https://<HTTPS_PUBLIC_IP>:<HTTPS_PUBLIC_PORT>` → Nginx → **校验证书的** `https://server:<后端容器端口>`
+- 原 Windows / Android：继续使用后端发布端口（默认 8765），证书指纹、配对和凭据不变；主动更改发布端口时需协调客户端地址
 - TCP 80：只提供 ACME HTTP-01 challenge，其他请求返回 404，不转发 API
 
-HTTPS overlay 不修改原 `compose.yaml`、数据库卷、原证书或私钥，不启动第二个应用进程，也不迁移数据库。项目目录、部署脚本和配置须由可信操作者管理；启用 root 定时器前，应确保普通不可信用户不能修改这些文件（尤其是会被 source 的 config.env）。目标是 Linux Docker Compose v2；宿主机需要 Bash、OpenSSL、curl、flock、timeout、ss、Python 3 和系统公有根证书包。Python 仅用于生成 systemd 配置，无第三方运行依赖。
+HTTPS overlay 不修改原 `compose.yaml`、数据库卷、原证书或私钥，不启动第二个应用进程，也不迁移数据库。项目目录、部署脚本和配置须由可信操作者管理；启用 root 定时器前，应确保普通不可信用户不能修改这些文件（尤其是会被 source 的 config.env）。目标是 Linux Docker Compose v2；宿主机需要 Bash、OpenSSL、curl、flock、timeout、ss、Python 3 和系统公有根证书包。Python 用于解析 Compose 端口及生成 systemd 配置，无第三方运行依赖。
+
+后端端口统一由仓库根目录 `.env` 的 `SESSION_NOTIFY_PORT` / `SESSION_NOTIFY_HOST_PORT` 配置，见[后端端口说明](../README.zh-CN.md#配置后端端口)。管理脚本解析 `docker compose config --format json`：预检连接 `127.0.0.1:<发布端口>`，Nginx 连接 `server:<容器监听端口>`。不会把端口另存到 HTTPS 配置中。预检证书仍读取仓库内 `runtime/secrets/server.crt`。`HTTPS_PUBLIC_PORT` 只改变新增公网入口；更新工具的健康检查覆盖参数也不会覆盖这些后端配置。HTTPS 工具不加载 `compose.override.yaml`，后端端口应通过共同的 `.env` 配置。
 
 ## 1. 准备与确认
 
 先将服务端仓库更新到包含 `compose.https.yaml` 和本目录的版本。以下命令均从仓库根目录执行；已有后端应正常运行。选择系统级（root）或用户级部署，始终用同一用户管理该入口。下文默认系统级；用户级方式见第 3 节。
 
-先确认你能管理实际配置的固定公网 IP，IP 不属于共享反向代理；云安全组、宿主机防火墙、NAT 需允许公网 TCP **80 和所选 HTTPS 端口** 到这台 Docker 主机。80 以后每次续期都要可达，所选 HTTPS 端口是新客户端入口。Docker 发布端口可能不受 UFW 的常规规则约束，也要核对云安全组。原 8765 保持现状。不要为此停掉已有网站或其他容器；80 或所选 HTTPS 端口若占用，应先决定如何整合现有反向代理，管理脚本会检查本机监听，Docker 仍可能检测到额外的发布端口冲突。
+先确认你能管理实际配置的固定公网 IP，IP 不属于共享反向代理；云安全组、宿主机防火墙、NAT 需允许公网 TCP **80 和所选 HTTPS 端口** 到这台 Docker 主机。80 以后每次续期都要可达，所选 HTTPS 端口是新客户端入口。Docker 发布端口可能不受 UFW 的常规规则约束，也要核对云安全组。原后端入口保持现状。不要为此停掉已有网站或其他容器；80 或所选 HTTPS 端口若占用，应先决定如何整合现有反向代理，管理脚本会检查本机监听，Docker 仍可能检测到额外的发布端口冲突。
 
 查明正在运行的原容器及项目名（只读）：
 
@@ -51,7 +53,7 @@ HTTPS_ACME_REGISTER_WITHOUT_EMAIL=true
 
 `HTTPS_UPSTREAM_TLS_NAME` 必须填写原证书的一个**精确 DNS SAN**。仓库默认生成 `DNS:localhost, IP:127.0.0.1`，此时填 `localhost`，不要填 Docker 服务名 `server`。原脚本若把公网 IP 写入 DNS SAN，填写该 DNS SAN 字符串即可。只有 `IP Address:...` 而没有匹配 DNS SAN 的证书不适用此 Nginx 主机名验证方案，预检会停止。不要用关闭校验、仅看 CN 或重生成原证书来绕过。
 
-预检通过 OpenSSL 检查证书时间/链、DNS SAN、运行中 8765 的实际证书指纹，并只复制原**公有证书**到 `runtime/public-https/upstream/server.crt`。原私钥不复制、不挂载给新容器。若实际使用私有 CA 链或非默认 TLS 部署而预检失败，先人工审查，不要盲目继续。
+预检通过 OpenSSL 检查证书时间/链、DNS SAN、运行中后端发布端口的实际证书指纹，并只复制原**公有证书**到 `runtime/public-https/upstream/server.crt`。原私钥不复制、不挂载给新容器。若实际使用私有 CA 链或非默认 TLS 部署而预检失败，先人工审查，不要盲目继续。
 
 ## 2. 无证书启动、测试与正式签发
 
@@ -82,7 +84,7 @@ sudo bash deploy/https/manage.sh activate
 
 测试使用独立 staging 目录与账户，Nginx 没有挂载该目录。`issue` 明确使用生产 ACME 地址。激活前还会用宿主机公有 CA 包校验生产证书链和 IP，staging、自签、过期、错误 IP 均不会装载。
 
-没有证书时不生成假的临时生产证书；签发失败保持 80 challenge 和原 8765 可用。`bootstrap` 拒绝覆盖已有前门配置。若 bootstrap 因端口占用失败，先解决冲突，再运行：
+没有证书时不生成假的临时生产证书；签发失败保持 80 challenge 和原后端入口可用。`bootstrap` 拒绝覆盖已有前门配置。若 bootstrap 因端口占用失败，先解决冲突，再运行：
 
 ```sh
 sudo bash deploy/https/manage.sh compose up -d --no-deps public-https
@@ -149,9 +151,9 @@ sudo bash deploy/https/manage.sh compose run --rm --no-deps public-certbot renew
 
 ## 4. 配对与证书固定注意事项
 
-原服务配对响应中的 `server_fingerprint` 仍来自原 8765 的自签证书。它**不是**公网 HTTPS 入口的证书指纹。Windows/Android 的全证书指纹固定也无法透明承受每几天自动换证书。
+原服务配对响应中的 `server_fingerprint` 仍来自后端的自签证书。它**不是**公网 HTTPS 入口的证书指纹。Windows/Android 的全证书指纹固定也无法透明承受每几天自动换证书。
 
-因此已有客户端继续使用原 8765，不能只将地址改成公网 HTTPS 入口或把新证书指纹写进旧客户端。新自动化适配器应使用公有 CA 校验，独立保存自己的配对/刷新凭据，不禁用 TLS 校验，不使用其他设备的 token。若未来要让原客户端全面迁到公网 HTTPS 入口，需另行改造配对元数据和客户端信任策略，不在本部署方案范围内。
+因此已有客户端继续使用原后端入口，不能只将地址改成公网 HTTPS 入口或把新证书指纹写进旧客户端。新自动化适配器应使用公有 CA 校验，独立保存自己的配对/刷新凭据，不禁用 TLS 校验，不使用其他设备的 token。若未来要让原客户端全面迁到公网 HTTPS 入口，需另行改造配对元数据和客户端信任策略，不在本部署方案范围内。
 
 ### 自动化客户端的凭据使用
 
@@ -167,7 +169,7 @@ sudo bash deploy/https/manage.sh compose run --rm --no-deps public-certbot renew
 
 ## 5. 回滚
 
-只停新增前门和定时器，原 8765/数据库/证书不动：
+只停新增前门和定时器，原后端服务、数据库和证书不动：
 
 ```sh
 sudo systemctl disable --now session-notify-https-renew.timer

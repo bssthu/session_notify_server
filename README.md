@@ -2,7 +2,7 @@
 
 基于 FastAPI 与 SQLite，将 Codex、Claude Code、Cursor、DeepSeek Harness 等工具的通知同步到多台设备。服务端是协议定义、设备权限、通知状态及事件关联的源头；客户端文档见 [Windows](../session_notify_windows/README.md) 和 [Android](../session_notify_android/README.md)。
 
-本文按 2026-10-09 的仓库实现核对。需要 Python 3.11 或以上版本和 uv；应用依赖版本由 `uv.lock` 锁定。
+本文按 2026-10-12 的仓库实现核对。需要 Python 3.11 或以上版本和 uv；应用依赖版本由 `uv.lock` 锁定。
 
 ## 升级兼容性
 
@@ -79,17 +79,19 @@ docker compose up -d --build
 docker compose exec server python scripts/issue_bootstrap_code.py
 ```
 
-Compose 使用 HTTPS 监听 8765，挂载 `runtime/secrets/` 中的证书和私钥，数据库保存在 `session_notify_data` 命名卷中。初始化和重置命令应通过 `docker compose exec server` 在容器内执行，使用 `/data/session_notify.db`；宿主机默认的 `runtime/session_notify.db` 是另一个数据库。构建通过 `uv sync --frozen --no-dev` 使用 `uv.lock` 中的应用依赖版本。
+Compose 默认使用 HTTPS 监听并发布 8765。在仓库根目录的 `.env` 中设置 `SESSION_NOTIFY_PORT` 可改变容器监听端口；`SESSION_NOTIFY_HOST_PORT` 可独立设置宿主机发布端口，省略时跟随监听端口。HTTPS 工具和更新脚本会读取 Compose 渲染后的端口配置，详见[部署与更新说明](deploy/README.zh-CN.md#配置后端端口)。Compose 挂载 `runtime/secrets/` 中的证书和私钥，数据库保存在 `session_notify_data` 命名卷中。初始化和重置命令应通过 `docker compose exec server` 在容器内执行，使用 `/data/session_notify.db`；宿主机默认的 `runtime/session_notify.db` 是另一个数据库。构建通过 `uv sync --frozen --no-dev` 使用 `uv.lock` 中的应用依赖版本。
 
-Linux 首次部署、日常更新和旧更新脚本迁移见 [部署与更新说明](deploy/README.zh-CN.md)。需要系统受信任证书的调用端，可按 [公网 HTTPS 部署说明](deploy/https/README.zh-CN.md) 增加独立 Nginx/Certbot 入口；对外端口通过 `HTTPS_PUBLIC_PORT` 配置，默认 443，原客户端保留 8765 和原证书指纹。
+Linux 首次部署、日常更新和旧更新脚本迁移见 [部署与更新说明](deploy/README.zh-CN.md)。需要系统受信任证书的调用端，可按 [公网 HTTPS 部署说明](deploy/https/README.zh-CN.md) 增加独立 Nginx/Certbot 入口；对外端口通过 `HTTPS_PUBLIC_PORT` 配置，默认 443，原客户端保留已有后端地址和原证书指纹。
 
 ## 配置
 
-服务从进程环境读取配置；`.env.example` 不会被启动脚本自动加载。PowerShell 中使用 `$env:变量名 = "值"`，Compose 部署则在 `compose.yaml` 的 `environment` 中配置。
+服务从进程环境读取应用配置；`.env.example` 不会被启动脚本自动加载。PowerShell 中使用 `$env:变量名 = "值"`，Compose 部署则在 `compose.yaml` 的 `environment` 或本机 override 中配置。Compose 会自动读取仓库根目录的 `.env` 用于配置插值，后端端口在此设置；其他变量只有被 Compose 的 `environment` 引用或显式传入容器时才成为应用配置。
 
 | 环境变量 | 默认值 | 用途 |
 | --- | --- | --- |
 | `SESSION_NOTIFY_DB` | `runtime/session_notify.db` | SQLite 数据库路径；Compose 覆盖为 `/data/session_notify.db` |
+| `SESSION_NOTIFY_PORT` | `8765` | Compose 容器监听端口；直接启动应用时仅作为配对候选地址的备用端口 |
+| `SESSION_NOTIFY_HOST_PORT` | 跟随 `SESSION_NOTIFY_PORT` | Compose 宿主机发布端口 |
 | `SESSION_NOTIFY_PAIR_MODE` | `strict` | 新设备配对门禁 |
 | `SESSION_NOTIFY_CERT_FILE` | `runtime/secrets/server.crt` | 配对二维码所需的服务端证书指纹来源 |
 | `SESSION_NOTIFY_ACCESS_TTL_SECONDS` | `7200` | 访问令牌有效秒数，默认 2 小时 |
@@ -100,11 +102,11 @@ Linux 首次部署、日常更新和旧更新脚本迁移见 [部署与更新说
 | `SESSION_NOTIFY_DEVICE_PRESENCE_TTL_SECONDS` | `90` | Windows 在线状态有效秒数 |
 | `SESSION_NOTIFY_EXPIRE_POLL_SECONDS` | `60` | 后台清理到期通知并广播过期事件的检查间隔 |
 
-监听地址和端口由 `run_dev_server.ps1 -HostAddress ... -Port ...` 或 uvicorn 参数决定，`.env.example` 的 `SESSION_NOTIFY_HOST` 不被应用读取，`SESSION_NOTIFY_PORT` 只作为生成配对候选地址时的备用端口，两者均不控制监听。若通过 `-CertFile` 指定其他证书，还需把 `SESSION_NOTIFY_CERT_FILE` 指向同一文件，保证二维码指纹一致。
+直接启动时，监听地址和端口由 `run_dev_server.ps1 -HostAddress ... -Port ...` 或 uvicorn 参数决定；`SESSION_NOTIFY_HOST` 不被应用读取，`SESSION_NOTIFY_PORT` 不替代这些启动参数。Compose 则通过上述端口变量配置 uvicorn 和端口映射。若通过 `-CertFile` 指定其他证书，还需把 `SESSION_NOTIFY_CERT_FILE` 指向同一文件，保证二维码指纹一致。
 
 两小时 access token 为每小时执行的任务留出调度余量，但任务仍应根据 `access_expires_at` 提前刷新，或在 401 后刷新并重试一次。新默认值只影响后续签发/刷新的 token；已有 token 的到期时间不会被修改。refresh token 仍为 90 天，且每次刷新会立即使该设备的旧 access token 失效，因此自动化调用端必须独立配对。
 
-Linux / macOS 的脚本入口是 `scripts/generate_self_signed_cert.sh` 和 `scripts/run_dev_server.sh`。后者使用 `HOST_ADDRESS`、`PORT`、`CERT_FILE`、`KEY_FILE` 环境变量设置监听与 TLS，与上表的应用配置区分；自定义证书时同样需要设置 `SESSION_NOTIFY_CERT_FILE`。
+Linux / macOS 的脚本入口是 `scripts/generate_self_signed_cert.sh` 和 `scripts/run_dev_server.sh`。后者使用 `HOST_ADDRESS`、`PORT`、`CERT_FILE`、`KEY_FILE` 环境变量设置监听与 TLS，与上表的应用配置区分；自定义证书时同样需要设置 `SESSION_NOTIFY_CERT_FILE`。Shell 证书生成器需要支持 `req -addext` 的 OpenSSL，默认 SAN 为 `DNS:localhost, IP:127.0.0.1`；PowerShell 生成器另外包含 `IP:10.0.2.2`。两个生成器都会写入指定输出目录，不能用重新运行生成器代替已有证书的检查。
 
 ## 手动发送测试通知
 
@@ -148,6 +150,6 @@ uv run pytest
 
 `GET /api/v1/events` 有两种兼容行为：不传 `limit` 时使用原有事件补拉；传入 `limit=1..500` 时使用有界窗口，不传游标只返回最新事件 ID 作为基线。`cursor_found=false` 表示游标已不存在；客户端应结合最新活动通知快照恢复，而不是假定收到全部旧事件。
 
-Hook 接口可能返回通知对象或 `null`。回答关联、工具完成信号、被策略抑制的事件不一定创建新通知；请求成功不等于一定出现弹窗。普通 Hook 通知默认 24 小时过期，确认类 Hook 默认使用 30 分钟有效期，具体判断以服务端映射为准。
+Hook 接口可能返回通知对象或 `null`。回答关联、工具完成信号、被策略抑制的事件不一定创建新通知；请求成功不等于一定出现弹窗。当前 Hook 有效期按最终标题判断：标题包含区分大小写的 `needs confirmation` 时默认 30 分钟，否则默认 24 小时，分别由 `SESSION_NOTIFY_PERMISSION_TTL_MINUTES` 和 `SESSION_NOTIFY_HOOK_TTL_HOURS` 覆盖。因此自定义标题也会影响有效期，不能只根据消息等级或原始事件类型推断。
 
 修改协议时先核对路由、模型和相关测试，再更新本仓库 `protocol/`，并将两个协议文件同步到 Windows 与 Android 的同名目录，保持三份内容一致。说明文字使用中文，路径、字段名、枚举和实际生成的英文字符串保留原文。静态快照不直接参与运行时校验，不能仅改文档就宣称接口行为已改变。

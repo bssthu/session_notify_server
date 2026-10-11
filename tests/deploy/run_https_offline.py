@@ -23,6 +23,7 @@ HTTPS_CA_BUNDLE={fixtures}/public.crt
     (b/'docker').write_text('''#!/usr/bin/env bash
 printf 'port=%s %s\\n' "$HTTPS_PUBLIC_PORT" "$*" >> "$TEST_ROOT/docker.log"
 case "$*" in
+  *'config --format json') printf '{"services":{"server":{"command":["uvicorn","--port","%s"],"ports":[{"target":%s,"published":"%s","protocol":"tcp"}]}}}\\n' "${TEST_BACKEND_PORT:-8765}" "${TEST_BACKEND_PORT:-8765}" "${TEST_BACKEND_HOST_PORT:-8765}";;
   *'ps --status running -q server') echo fixture-server;;
   *'public-https nginx -t') [[ ! -f "$TEST_ROOT/fail-nginx" ]];;
   *'public-https nginx -s reload') touch "$TEST_ROOT/reloaded";;
@@ -39,8 +40,9 @@ if [[ -f "$TEST_ROOT/occupied" ]]; then
 fi
 ''')
     (b/'openssl').write_text(f'''#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$TEST_ROOT/openssl.log"
 case "$*" in
-  's_client -connect 127.0.0.1:8765 '*) cat "$TEST_ROOT/runtime/secrets/server.crt"; exit 0;;
+  "s_client -connect 127.0.0.1:${{TEST_BACKEND_HOST_PORT:-8765}} "*) cat "$TEST_ROOT/runtime/secrets/server.crt"; exit 0;;
   "s_client -connect 127.0.0.1:$HTTPS_PUBLIC_PORT "*)
      [[ -f "$TEST_ROOT/reloaded" ]] || exit 1
      cat "$TEST_ROOT/fixtures/public.crt"; exit 0;;
@@ -56,6 +58,9 @@ exec {real_openssl} "$@"
         print('PASS:',name)
     check('upstream DNS SAN plus certificate preflight',['preflight'])
     assert (state/'upstream/server.crt').read_bytes()==(secrets/'server.crt').read_bytes()
+    env.update(TEST_BACKEND_PORT='9876', TEST_BACKEND_HOST_PORT='19876')
+    check('preflight uses configured backend host port',['preflight'])
+    assert 's_client -connect 127.0.0.1:19876 ' in (r/'openssl.log').read_text()
     for invalid_port in ['0', '80', '65536', '-1', 'abc', '8443;false']:
         (state/'config.env').write_text(config.replace('HTTPS_PUBLIC_PORT=8443', f'HTTPS_PUBLIC_PORT={invalid_port!r}'))
         check(f'invalid HTTPS port {invalid_port!r} rejected',['preflight'],False,'HTTPS_PUBLIC_PORT')
@@ -101,6 +106,8 @@ exec {real_openssl} "$@"
     (r/'fail-nginx').unlink()
     check('activation verifies loaded certificate and health',['activate'],True,'loaded certificate and /health verified')
     assert 'proxy_ssl_verify on;' in (state/'nginx/default.conf').read_text()
+    assert 'set $session_notify_backend server:9876;' in (state/'nginx/default.conf').read_text()
+    assert '__UPSTREAM_PORT__' not in (state/'nginx/default.conf').read_text()
     curl_args=(r/'curl.log').read_text()
     assert '--connect-to 203.0.113.10:8443:127.0.0.1:8443' in curl_args
     assert 'https://203.0.113.10:8443/health' in curl_args

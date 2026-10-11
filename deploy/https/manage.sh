@@ -33,7 +33,7 @@ IFS=. read -r -a octets <<< "$HTTPS_PUBLIC_IP"
 for octet in "${octets[@]}"; do (( 10#$octet <= 255 )) || fail 'Invalid IPv4 address.'; done
 [[ $HTTPS_UPSTREAM_TLS_NAME =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] || fail 'Use an exact, non-wildcard DNS SAN for HTTPS_UPSTREAM_TLS_NAME.'
 [[ $HTTPS_COMPOSE_PROJECT =~ ^[a-z0-9][a-z0-9_-]*$ ]] || fail 'Set the EXISTING Compose project name.'
-for executable in docker openssl curl flock timeout ss; do
+for executable in docker openssl curl flock timeout ss python3; do
     command -v "$executable" >/dev/null || fail "Missing prerequisite: $executable"
 done
 [[ -r "$HTTPS_CA_BUNDLE" ]] || fail 'Public system CA bundle is missing.'
@@ -46,6 +46,8 @@ TMP=$(mktemp -d "$STATE/check.XXXXXX")
 trap 'rm -rf -- "$TMP"' EXIT
 
 dc() { docker compose --project-name "$HTTPS_COMPOSE_PROJECT" -f compose.yaml -f compose.https.yaml "$@"; }
+backend_ports=$(dc config --format json | python3 deploy/compose_ports.py)
+read -r HTTPS_UPSTREAM_PORT HTTPS_UPSTREAM_HOST_PORT <<< "$backend_ports"
 fp() { openssl x509 -in "$1" -noout -fingerprint -sha256; }
 require_server() {
     [[ -n $(dc ps --status running -q server) ]] || fail 'No running server in this project. Check project name; do not create a new server/database.'
@@ -59,7 +61,7 @@ preflight() {
         grep -Fxiq "DNS:$HTTPS_UPSTREAM_TLS_NAME" || fail 'Configured name is not an exact DNS SAN. IP-only SAN is unsupported by this Nginx path; stop, do not disable verification.'
     openssl verify -CAfile "$original" -purpose sslserver \
         -verify_hostname "$HTTPS_UPSTREAM_TLS_NAME" "$original" >/dev/null
-    timeout 15 openssl s_client -connect 127.0.0.1:8765 \
+    timeout 15 openssl s_client -connect "127.0.0.1:$HTTPS_UPSTREAM_HOST_PORT" \
         -servername "$HTTPS_UPSTREAM_TLS_NAME" -verify_hostname "$HTTPS_UPSTREAM_TLS_NAME" \
         -CAfile "$original" -verify_return_error -showcerts \
         </dev/null > "$TMP/upstream.pem" 2> "$TMP/upstream.log" || {
@@ -109,6 +111,7 @@ activate() {
     cp "$STATE/nginx/default.conf" "$TMP/previous.conf"
     sed -e "s/__PUBLIC_IP__/$HTTPS_PUBLIC_IP/g" \
         -e "s/__UPSTREAM_TLS_NAME__/$HTTPS_UPSTREAM_TLS_NAME/g" \
+        -e "s/__UPSTREAM_PORT__/$HTTPS_UPSTREAM_PORT/g" \
         deploy/https/https.conf.template > "$STATE/nginx/default.conf.new"
     chmod 644 "$STATE/nginx/default.conf.new"
     mv "$STATE/nginx/default.conf.new" "$STATE/nginx/default.conf"

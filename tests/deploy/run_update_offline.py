@@ -18,6 +18,7 @@ class UpdateFlow(unittest.TestCase):
         self.root = Path(self.temporary.name) / "checkout with spaces"
         (self.root / "deploy/https").mkdir(parents=True)
         shutil.copyfile(SOURCE / "deploy/update-server.sh", self.root / "deploy/update-server.sh")
+        shutil.copyfile(SOURCE / "deploy/compose_ports.py", self.root / "deploy/compose_ports.py")
         (self.root / "runtime/secrets").mkdir(parents=True)
         (self.root / "runtime/secrets/server.crt").write_text("synthetic certificate")
         (self.root / "runtime/deploy").mkdir()
@@ -39,6 +40,7 @@ esac
             "docker": r'''#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$TEST_ROOT/docker.log"
 case "$*" in
+  *'config --format json') printf '{"services":{"server":{"command":["uvicorn","--port","%s"],"ports":[{"target":%s,"published":"%s","protocol":"tcp"}]}}}\n' "${TEST_BACKEND_PORT:-8765}" "${TEST_BACKEND_PORT:-8765}" "${TEST_BACKEND_HOST_PORT:-8765}";;
   *'ps --all -q server') [[ ! -f "$TEST_ROOT/missing-server" ]] || exit 0; echo existing-server;;
   *'config --quiet') [[ ! -f "$TEST_ROOT/bad-compose" ]];;
   *'up -d --build server') [[ ! -f "$TEST_ROOT/build-fails" ]];;
@@ -109,6 +111,17 @@ esac
         self.assertIn("--project-name custom-project up -d --build server", self.log("docker"))
         self.assertIn("https://127.0.0.1:9876/health", self.log("curl"))
         self.assertNotIn("pull", self.log("git"))
+
+    def test_default_health_follows_compose_published_port(self):
+        self.env.update(TEST_BACKEND_PORT="9876", TEST_BACKEND_HOST_PORT="19876")
+        self.invoke("--no-pull")
+        self.assertIn("https://127.0.0.1:19876/health", self.log("curl"))
+        self.assertNotIn("https://127.0.0.1:8765/health", self.log("curl"))
+
+    def test_invalid_compose_port_stops_before_rebuild(self):
+        self.env.update(TEST_BACKEND_HOST_PORT="0")
+        self.invoke("--no-pull", success=False)
+        self.assertNotIn("up -d --build", self.log("docker"))
 
     def test_preflight_failures_never_rebuild(self):
         for marker in ("dirty", "missing-server", "detached", "no-upstream", "pull-fails", "bad-compose"):
