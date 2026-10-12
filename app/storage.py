@@ -77,7 +77,19 @@ def _is_posttooluse_resolvable_notification(notification: NotificationPublic) ->
     if "needs confirmation" not in (notification.title or "").lower():
         return False
     event_name = _metadata_text(metadata, "hook_event_name", "hookEventName").lower()
-    return event_name in {"permissionrequest", "pretooluse"}
+    if event_name in {"permissionrequest", "pretooluse"}:
+        return True
+    # Older merges selected the generic Notification body and overwrote the
+    # PermissionRequest event name. Only accept records with evidence of that
+    # merge; a standalone permission_prompt has no tool identity to resolve.
+    correlated = metadata.get("correlated_hook_events")
+    return (
+        _claude_approval_transport(notification) == "permission_prompt"
+        and metadata.get("event_family") == "claude_permission_prompt"
+        and isinstance(correlated, list)
+        and "permission_request" in correlated
+        and bool(_metadata_text(metadata, "tool_name", "toolName"))
+    )
 
 
 def _dt(value: datetime) -> str:
@@ -350,18 +362,12 @@ def _approval_detail_score(notification: NotificationPublic) -> tuple[int, int]:
         "session event received.",
         "session event received",
     } or body.lower().endswith(" needs your permission")
-    tool_name = _metadata_text(notification.metadata, "tool_name", "toolName")
-    normalized_tool = "".join(
-        character
-        for character in tool_name.lower()
-        if character.isalpha() or character == "_"
-    )
-    interactive_permission = (
-        _claude_approval_transport(notification) == "permission_request"
-        and normalized_tool in {"askuserquestion", "request_user_input", "exitplanmode"}
-    )
+    # PermissionRequest carries the tool/input used by PostToolUse matching.
+    # Keep it canonical even when Read/Edit/Grep have no displayable body and
+    # the later generic permission_prompt happens to contain more characters.
+    permission_request = _claude_approval_transport(notification) == "permission_request"
     return (
-        1 if interactive_permission else 0,
+        1 if permission_request else 0,
         len(notification.title) + len(body) - (1000 if generic else 0),
     )
 

@@ -1497,6 +1497,122 @@ def test_claude_plan_permission_remains_the_canonical_transport(tmp_path):
     assert len(created_events) == 1
 
 
+@pytest.mark.parametrize(
+    "tool_name,tool_input",
+    [
+        ("Read", {"file_path": "C:/Users/tester/.claude/settings.json"}),
+        ("Edit", {"file_path": "C:/Users/tester/.claude/settings.json", "old_string": "a", "new_string": "b"}),
+        ("Grep", {"path": "C:/Users/tester/.claude", "pattern": "hooks"}),
+    ],
+)
+@pytest.mark.parametrize(
+    "event_order",
+    [
+        ("PermissionRequest", "Notification", "PostToolUse"),
+        ("Notification", "PermissionRequest", "PostToolUse"),
+        ("PermissionRequest", "PostToolUse", "Notification"),
+    ],
+)
+def test_claude_tool_permission_auto_resolves_with_generic_prompt(
+    tmp_path, tool_name, tool_input, event_order,
+):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+    base = {
+        "session_id": "s-file-permission",
+        "cwd": "R:/",
+        "transcript_path": "C:/Users/tester/.claude/projects/R--/s-file-permission.jsonl",
+    }
+    notification_id = None
+    for event_name in event_order:
+        raw = {**base, "hook_event_name": event_name}
+        if event_name == "Notification":
+            raw.update(notification_type="permission_prompt", message="Claude needs your permission")
+        else:
+            raw.update(tool_name=tool_name, tool_input=tool_input)
+        if event_name == "PostToolUse":
+            raw["tool_use_id"] = "toolu-file-permission"
+        response = client.post(
+            "/api/v1/hooks/claude",
+            headers=auth(token),
+            json={
+                **raw,
+                "event_type": "completed" if event_name == "PostToolUse" else "approval_requested",
+                "metadata": {"raw": raw},
+            },
+        )
+        assert response.status_code == 200, response.text
+        if event_name == "PostToolUse":
+            assert response.json() is None
+        else:
+            notification = response.json()
+            notification_id = notification_id or notification["id"]
+            assert notification["id"] == notification_id
+
+    assert client.get("/api/v1/notifications", headers=auth(token)).json() == []
+    recent = client.get("/api/v1/notifications/recent", headers=auth(token)).json()["items"]
+    stored = next(item for item in recent if item["id"] == notification_id)
+    assert stored["status"] == "acknowledged"
+    assert stored["metadata"]["hook_event_name"] == "PermissionRequest"
+    assert stored["metadata"]["raw"]["tool_input"] == tool_input
+    events = client.get("/api/v1/events", headers=auth(token)).json()["events"]
+    resolved = [
+        event for event in events
+        if event["event_type"] == "notification.acknowledged"
+        and event["notification_id"] == notification_id
+    ]
+    assert len(resolved) == 1
+    assert resolved[0]["reason"] == "auto_resolved"
+
+
+@pytest.mark.parametrize("merged", [True, False])
+@pytest.mark.parametrize("turn_matches", [True, False])
+def test_claude_legacy_generic_tool_prompt_only_resolves_with_merge_evidence(
+    tmp_path, merged, turn_matches,
+):
+    client = TestClient(create_app(tmp_path / "server.db"))
+    token = bind(client)
+    metadata = {
+        "hook_event_name": "Notification",
+        "notification_type": "permission_prompt",
+        "tool_name": "Read",
+        "cwd": "R:/",
+        "turn_id": "turn-file",
+    }
+    if merged:
+        metadata.update(
+            event_family="claude_permission_prompt",
+            correlated_hook_events=["permission_prompt", "permission_request"],
+        )
+    created = client.post(
+        "/api/v1/notifications",
+        headers=auth(token),
+        json={
+            "source": "claude",
+            "session_id": "s-legacy-file",
+            "title": "claude needs confirmation",
+            "body": "Claude needs your permission",
+            "level": "important",
+            "metadata": metadata,
+        },
+    )
+    assert created.status_code == 200, created.text
+    post = client.post(
+        "/api/v1/hooks/claude",
+        headers=auth(token),
+        json=_hook_payload(
+            "PostToolUse", "s-legacy-file", None,
+            cwd="R:/", tool_name="Read",
+            turn_id="turn-file" if turn_matches else "another-turn",
+        ),
+    )
+    assert post.status_code == 200, post.text
+    active = client.get("/api/v1/notifications", headers=auth(token)).json()
+    assert [item["id"] for item in active] == (
+        [] if merged and turn_matches else [created.json()["id"]]
+    )
+
+
 def test_claude_interactive_detail_upserts_an_earlier_generic_prompt(tmp_path):
     client = TestClient(create_app(tmp_path / "server.db"))
     token = bind(client)
