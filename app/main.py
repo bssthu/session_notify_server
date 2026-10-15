@@ -135,14 +135,20 @@ def _hook_metadata(payload: HookPayload, body_generated: bool) -> dict[str, obje
         or extra.get("turnId")
         or extra.get("generation_id")
         or extra.get("generationId")
+        or extra.get("prompt_id")
+        or extra.get("promptId")
         or payload.metadata.get("turn_id")
         or payload.metadata.get("turnId")
         or payload.metadata.get("generation_id")
         or payload.metadata.get("generationId")
+        or payload.metadata.get("prompt_id")
+        or payload.metadata.get("promptId")
         or raw.get("turn_id")
         or raw.get("turnId")
         or raw.get("generation_id")
         or raw.get("generationId")
+        or raw.get("prompt_id")
+        or raw.get("promptId")
     )
     metadata: dict[str, object] = {
         "hook_event_type": payload.event_type,
@@ -270,7 +276,7 @@ def _should_suppress_hook_notification(
     """
     source_lower = (source or "").lower()
     is_hook_source = (
-        source_lower in ("claude", "codex", "cursor", "dsh")
+        source_lower in ("claude", "codex", "cursor", "devin", "dsh")
         or bool(payload.hook_event_name)
         or bool(payload.event_type)
         or bool(payload.hook_status)

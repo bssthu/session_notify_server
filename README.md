@@ -1,6 +1,6 @@
 # Session Notify 服务端
 
-基于 FastAPI 与 SQLite，将 Codex、Claude Code、Cursor、DeepSeek Harness 等工具的通知同步到多台设备。服务端是协议定义、设备权限、通知状态及事件关联的源头；客户端文档见 [Windows](../session_notify_windows/README.md) 和 [Android](../session_notify_android/README.md)。
+基于 FastAPI 与 SQLite，将 Codex、Claude Code、Cursor、Devin、DeepSeek Harness 等工具的通知同步到多台设备。服务端是协议定义、设备权限、通知状态及事件关联的源头；客户端文档见 [Windows](../session_notify_windows/README.md) 和 [Android](../session_notify_android/README.md)。
 
 本文按 2026-10-12 的仓库实现核对。需要 Python 3.11 或以上版本和 uv；应用依赖版本由 `uv.lock` 锁定。
 
@@ -135,7 +135,7 @@ uv run pytest
 - WebSocket 推送 `notification.created`、`notification.acknowledged`、`notification.expired`、`device.presence_changed`，配对成功通过 `pair.consumed` 仅通知签发设备；支持查询参数 `token` 或 `Authorization` 请求头，后者优先。
 - 汇总 Windows 锁屏与通知暂停状态；Android 可按“未锁屏且未暂停”的电脑可用性决定是否展示提醒。
 - 幂等确认：任一设备确认后，通知状态以服务端为准。
-- Codex / Claude Code / Cursor / DeepSeek Harness Hook 载荷到统一通知的基础映射。
+- Codex / Claude Code / Cursor / Devin / DeepSeek Harness Hook 载荷到统一通知的基础映射。
 - `SESSION_NOTIFY_TAG` 作为 `metadata.tag` 随通知保存，供客户端展示和历史筛选。
 - `SESSION_NOTIFY_PRIVACY_TAG`：`hide` 时所有设备下发的正文替换为 `***`；`local` 时仅来源设备看到明文。正文不可见时，元数据仅保留展示与关联控制字段，移除原始载荷、工具输入和自由文本诊断。服务端存储保持明文；不可见的正文不会进入历史关键词搜索。当前 Windows Hook bundle 15 已包含此能力。
 - Codex 异步提问按来源设备、会话和完整题目指纹匹配回答，支持跨回合、逐题回答、重复投递和乱序补发；全部回答后持久确认并广播 `notification.acknowledged`。同题歧义时保留；迟到题目使原匹配产生歧义时，撤销未过期通知的自动确认，并通过原 ID 的 `notification.created` 更新两端，手动确认始终保留。Stop 和启动清理不消除未回答的异步问题。旧版引用回答按完整题目指纹唯一匹配；Hook bundle 15 的结构化回答进一步校验调用 ID 与题目序号，错误 ID 不回退为文本猜测。应先更新服务端，再更新 Hook。

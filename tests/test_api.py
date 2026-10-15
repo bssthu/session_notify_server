@@ -1297,6 +1297,104 @@ def test_cursor_generation_id_promoted_to_turn_id(tmp_path):
     assert question.json()["metadata"]["turn_id"] == "cursor-gen-99"
 
 
+def test_devin_hook_event_mapping_and_prompt_id_resolution(tmp_path):
+    app = create_app(tmp_path / "server.db")
+    client = TestClient(app)
+    token = bind(client)
+
+    completed = client.post(
+        "/api/v1/hooks/devin",
+        headers=auth(token),
+        json={
+            "event_type": "completed",
+            "hook_event_name": "Stop",
+            "hook_status": "completed",
+            "session_id": "devin-session",
+            "last_assistant_message": "Implemented Devin hook support.",
+            "metadata": {"raw": {"prompt_id": "devin-prompt-1"}},
+        },
+    )
+    assert completed.status_code == 200, completed.text
+    assert completed.json()["level"] == "success"
+    assert completed.json()["title"] == "devin completed"
+    assert completed.json()["body"] == "Implemented Devin hook support."
+    assert completed.json()["source"] == "devin"
+    assert completed.json()["metadata"]["turn_id"] == "devin-prompt-1"
+
+    question = client.post(
+        "/api/v1/hooks/devin",
+        headers=auth(token),
+        json={
+            "event_type": "approval_requested",
+            "hook_event_name": "PreToolUse",
+            "hook_status": "approval_requested",
+            "tool_name": "ask_user_question",
+            "prompt": "Which environment?",
+            "session_id": "devin-question",
+            "cwd": "I:/Projects/session_notify",
+            "metadata": {"raw": {"prompt_id": "devin-prompt-2"}},
+        },
+    )
+    assert question.status_code == 200, question.text
+    assert question.json()["level"] == "important"
+    assert question.json()["title"] == "devin needs confirmation"
+    assert question.json()["body"] == "Which environment?"
+    assert question.json()["metadata"]["turn_id"] == "devin-prompt-2"
+    question_id = question.json()["id"]
+
+    resolve = client.post(
+        "/api/v1/hooks/devin",
+        headers=auth(token),
+        json={
+            "event_type": "completed",
+            "hook_event_name": "PostToolUse",
+            "hook_status": "completed",
+            "tool_name": "ask_user_question",
+            "session_id": "devin-question",
+            "cwd": "I:/Projects/session_notify",
+            "metadata": {"raw": {"prompt_id": "devin-prompt-2"}},
+        },
+    )
+    assert resolve.status_code == 200, resolve.text
+    assert resolve.json() is None
+    _assert_auto_resolved(client, token, question_id)
+
+    permission = client.post(
+        "/api/v1/hooks/devin",
+        headers=auth(token),
+        json={
+            "event_type": "approval_requested",
+            "hook_event_name": "PermissionRequest",
+            "hook_status": "approval_requested",
+            "tool_name": "exit_plan_mode",
+            "prompt": "Ship Devin hook integration.",
+            "session_id": "devin-plan",
+            "cwd": "I:/Projects/session_notify",
+            "metadata": {"raw": {"prompt_id": "devin-prompt-3"}},
+        },
+    )
+    assert permission.status_code == 200, permission.text
+    assert permission.json()["title"] == "devin needs confirmation"
+    permission_id = permission.json()["id"]
+
+    resolve_plan = client.post(
+        "/api/v1/hooks/devin",
+        headers=auth(token),
+        json={
+            "event_type": "completed",
+            "hook_event_name": "PostToolUse",
+            "hook_status": "completed",
+            "tool_name": "exit_plan_mode",
+            "session_id": "devin-plan",
+            "cwd": "I:/Projects/session_notify",
+            "metadata": {"raw": {"prompt_id": "devin-prompt-3"}},
+        },
+    )
+    assert resolve_plan.status_code == 200, resolve_plan.text
+    assert resolve_plan.json() is None
+    _assert_auto_resolved(client, token, permission_id)
+
+
 def test_requires_authorization(tmp_path):
     client = TestClient(create_app(tmp_path / "server.db"))
     response = client.get("/api/v1/notifications")

@@ -143,7 +143,7 @@ def _notification_visible_for_history(
         metadata.get("raw_event_type") or metadata.get("rawEventType") or ""
     ).lower()
     is_hook = (
-        source_lower in ("claude", "codex")
+        source_lower in ("claude", "codex", "cursor", "devin", "dsh")
         or bool(event_name)
         or bool(notification_type)
         or bool(hook_status)
@@ -283,10 +283,14 @@ def _hook_turn_id(metadata: Any) -> str:
         or meta.get("turnId")
         or meta.get("generation_id")
         or meta.get("generationId")
+        or meta.get("prompt_id")
+        or meta.get("promptId")
         or raw.get("turn_id")
         or raw.get("turnId")
         or raw.get("generation_id")
         or raw.get("generationId")
+        or raw.get("prompt_id")
+        or raw.get("promptId")
     )
     # turn_id 是不透明标识符，只去除边缘空白，不做大小写归一化。
     return str(value or "").strip()
