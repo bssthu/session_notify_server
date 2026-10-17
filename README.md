@@ -83,6 +83,15 @@ Compose 默认使用 HTTPS 监听并发布 8765。在仓库根目录的 `.env` �
 
 Linux 首次部署、日常更新和旧更新脚本迁移见 [部署与更新说明](deploy/README.zh-CN.md)。需要系统受信任证书的调用端，可按 [公网 HTTPS 部署说明](deploy/https/README.zh-CN.md) 增加独立 Nginx/Certbot 入口；对外端口通过 `HTTPS_PUBLIC_PORT` 配置，默认 443，原客户端保留已有后端地址和原证书指纹。
 
+## 刷新令牌有效期与恢复
+
+- 首台管理员永久有效；其他新绑定默认 90 天。管理员签发配对码或修改设备时可选择 `refresh_ttl_days`（1–36500 天）或带时区的 `refresh_expires_at`，二者不能同时提供；任意字段显式 `null` 表示永久。邀请省略则默认，PATCH 省略则不变。相对邀请期限从成功绑定时计算；绝对日期已到期的码不能消费。
+- 只有当前有效管理员能修改任意设备的刷新期限，包括为已到期但未撤销的设备延期。普通设备/游客不能修改自己的期限；自助重绑轮换凭据但保留原期限，过期凭据不能自助续期。撤销设备不可通过延期恢复。
+- 绑定、刷新、设备列表及修改响应均返回 `refresh_expires_at`、`access_expires_at`；绑定和刷新还返回 `server_time`。新 access 不晚于 refresh 到期；缩短 refresh 立即收紧现有 access，延长 refresh 不延长旧 access。
+- 只剩一台可用管理员时，其 refresh 自动变为永久。多台有限期管理员允许共存；在倒数第二台到期时保护最后存活者。服务闲置跨过多个期限或同时到期时，以最晚期限、创建时间、设备 ID 确定唯一存活者；只保护该未撤销管理员，其他过期设备不恢复。启动迁移、身份检查、管理事务与定期检查均执行此规则。设置最后可用管理员为有限期返回 409 / `last_admin_must_be_permanent`。降级、撤销和并发期限修改使用同一 SQLite 写事务复核。
+- HTTP 401 的 `detail` 为 `{code,message,server_time}`。`access_token_expired` 可刷新后重试一次；业务请求的 `invalid_token` 也可能只是旧 access 被轮换，先尝试一次共享刷新。refresh 返回 `refresh_token_expired` 时保留凭据，停止普通请求和业务 WebSocket，每小时只重试一次 refresh；管理员延期后同一 refresh 可恢复。refresh 返回 `invalid_token` 或 `device_revoked` 才进入重新配对流程。
+- WebSocket 在连接、广播和空闲检查中复核两类期限；授权失效关闭 1008（reason 尽可能为上述 code）。角色/期限更新关闭 1012，客户端应重新检查凭据和期限后再连接。
+
 ## 配置
 
 服务从进程环境读取应用配置；`.env.example` 不会被启动脚本自动加载。PowerShell 中使用 `$env:变量名 = "值"`，Compose 部署则在 `compose.yaml` 的 `environment` 或本机 override 中配置。Compose 会自动读取仓库根目录的 `.env` 用于配置插值，后端端口在此设置；其他变量只有被 Compose 的 `environment` 引用或显式传入容器时才成为应用配置。
@@ -95,7 +104,7 @@ Linux 首次部署、日常更新和旧更新脚本迁移见 [部署与更新说
 | `SESSION_NOTIFY_PAIR_MODE` | `strict` | 新设备配对门禁 |
 | `SESSION_NOTIFY_CERT_FILE` | `runtime/secrets/server.crt` | 配对二维码所需的服务端证书指纹来源 |
 | `SESSION_NOTIFY_ACCESS_TTL_SECONDS` | `7200` | 访问令牌有效秒数，默认 2 小时 |
-| `SESSION_NOTIFY_REFRESH_TTL_DAYS` | `90` | 刷新令牌有效天数 |
+| `SESSION_NOTIFY_REFRESH_TTL_DAYS` | `90` | 默认新设备刷新令牌有效天数（管理员可覆盖） |
 | `SESSION_NOTIFY_PAIR_CODE_TTL_SECONDS` | `300` | 已绑定设备签发的配对码有效秒数；本地初始化脚本使用默认五分钟 |
 | `SESSION_NOTIFY_HOOK_TTL_HOURS` | `24` | 普通 Hook 通知有效小时数 |
 | `SESSION_NOTIFY_PERMISSION_TTL_MINUTES` | `30` | 普通工具权限审批通知有效分钟数 |
@@ -104,7 +113,7 @@ Linux 首次部署、日常更新和旧更新脚本迁移见 [部署与更新说
 
 直接启动时，监听地址和端口由 `run_dev_server.ps1 -HostAddress ... -Port ...` 或 uvicorn 参数决定；`SESSION_NOTIFY_HOST` 不被应用读取，`SESSION_NOTIFY_PORT` 不替代这些启动参数。Compose 则通过上述端口变量配置 uvicorn 和端口映射。若通过 `-CertFile` 指定其他证书，还需把 `SESSION_NOTIFY_CERT_FILE` 指向同一文件，保证二维码指纹一致。
 
-两小时 access token 为每小时执行的任务留出调度余量，但任务仍应根据 `access_expires_at` 提前刷新，或在 401 后刷新并重试一次。新默认值只影响后续签发/刷新的 token；已有 token 的到期时间不会被修改。refresh token 仍为 90 天，且每次刷新会立即使该设备的旧 access token 失效，因此自动化调用端必须独立配对。
+两小时 access token 为每小时执行的任务留出调度余量，但任务仍应根据 `access_expires_at` 提前刷新，或在 401 后刷新并重试一次。新默认值只影响后续签发/刷新的 token；已有 token 的到期时间不会被修改。refresh 默认 90 天，由管理员管理；首台及最后可用管理员永久。每次刷新会立即使该设备的旧 access token 失效，因此自动化调用端应独立配对。
 
 Linux / macOS 的脚本入口是 `scripts/generate_self_signed_cert.sh` 和 `scripts/run_dev_server.sh`。后者使用 `HOST_ADDRESS`、`PORT`、`CERT_FILE`、`KEY_FILE` 环境变量设置监听与 TLS，与上表的应用配置区分；自定义证书时同样需要设置 `SESSION_NOTIFY_CERT_FILE`。Shell 证书生成器需要支持 `req -addext` 的 OpenSSL，默认 SAN 为 `DNS:localhost, IP:127.0.0.1`；PowerShell 生成器另外包含 `IP:10.0.2.2`。两个生成器都会写入指定输出目录，不能用重新运行生成器代替已有证书的检查。
 

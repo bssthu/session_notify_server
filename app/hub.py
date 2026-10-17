@@ -17,7 +17,13 @@ class WebSocketHub:
         self, websocket: WebSocket, device_id: str,
         authorized: Callable[[], bool],
     ) -> None:
+        if not authorized():
+            await websocket.close(code=1008)
+            return
         await websocket.accept()
+        if not authorized():
+            await websocket.close(code=1008)
+            return
         async with self._lock:
             self._connections[websocket] = (device_id, authorized)
 
@@ -25,7 +31,7 @@ class WebSocketHub:
         async with self._lock:
             self._connections.pop(websocket, None)
 
-    async def reconnect_device(self, device_id: str) -> None:
+    async def reconnect_device(self, device_id: str, *, code: int = 1012, reason: str = "Device role changed") -> None:
         """Role changes require an authoritative snapshot on the new connection."""
         async with self._lock:
             sockets = [ws for ws, (target, _) in self._connections.items() if target == device_id]
@@ -33,7 +39,7 @@ class WebSocketHub:
                 self._connections.pop(websocket, None)
         for websocket in sockets:
             try:
-                await asyncio.wait_for(websocket.close(code=1012, reason="Device role changed"), timeout=1.0)
+                await asyncio.wait_for(websocket.close(code=code, reason=reason), timeout=1.0)
             except (WebSocketDisconnect, RuntimeError, OSError, asyncio.TimeoutError):
                 pass
 

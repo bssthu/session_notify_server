@@ -2969,13 +2969,14 @@ def test_expired_access_token_is_rejected_and_refreshable(tmp_path):
     assert client.get("/api/v1/notifications", headers=auth(new_access)).status_code == 200
 
 
-def test_expired_refresh_token_requires_rebind(tmp_path):
+def test_expired_member_refresh_token_requires_admin_extension(tmp_path):
     app = create_app(tmp_path / "server.db")
     client = TestClient(app)
-    tokens = bind_tokens(client)
+    bind_tokens(client, name="Administrator")
+    tokens = bind_tokens(client, name="Member")
     _expire_field(app, tokens["device"]["id"], "refresh_expires_at")
 
-    # refresh token 到期 → refresh 端点拒绝,需重新绑定
+    # A member must wait for administrator extension; self-refresh cannot extend it.
     refresh = client.post("/api/v1/auth/refresh", json={"refresh_token": tokens["refresh_token"]})
     assert refresh.status_code == 401
 

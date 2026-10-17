@@ -15,7 +15,7 @@ paths:
           description: 服务健康状态。
   /api/v1/devices/bind:
     post:
-      description: strict 模式仅允许使用刷新令牌重新绑定已有设备，保留其角色。新设备须消费本机初始化码或管理员签发的配对码；初始化创建管理员，后续邀请默认 member。客户端不能在绑定时自行选择角色。
+      description: strict 模式仅允许使用未到期且未撤销的刷新令牌重新绑定已有设备，保留角色和原刷新到期时间，不能自行续期。新设备须消费本机初始化码或管理员签发的配对码；初始化创建管理员，后续邀请默认 member。客户端不能在绑定时自行选择角色。
       security: []
       requestBody:
         required: true
@@ -24,6 +24,8 @@ paths:
             schema:
               $ref: "#/components/schemas/DeviceBindRequest"
       responses:
+        "401":
+          $ref: "#/components/responses/AuthenticationRequired"
         "200":
           description: 设备凭据。
           content:
@@ -32,7 +34,7 @@ paths:
                 $ref: "#/components/schemas/DeviceBindResponse"
   /api/v1/devices/pair/issue:
     post:
-      description: 仅管理员可调用。可选择 admin、member（默认）或 guest（仅本机）。角色随一次性配对码保存，加入设备不能覆盖。
+      description: 仅当前有效管理员可调用。可选择 admin、member（默认）或 guest（仅本机）。角色和刷新有效期随一次性配对码保存，加入设备不能覆盖。省略有效期默认绑定后 90 天（可由服务端配置覆盖）；可设相对天数、绝对日期或永久。
       requestBody:
         required: false
         content:
@@ -40,6 +42,8 @@ paths:
             schema:
               $ref: "#/components/schemas/PairIssueRequest"
       responses:
+        "401":
+          $ref: "#/components/responses/AuthenticationRequired"
         "200":
           description: 管理员签发的一次性配对码。
           content:
@@ -87,6 +91,8 @@ paths:
   /api/v1/devices:
     get:
       responses:
+        "401":
+          $ref: "#/components/responses/AuthenticationRequired"
         "200":
           description: 已绑定设备；游客仅收到本机设备。
           content:
@@ -176,8 +182,10 @@ paths:
             schema:
               $ref: "#/components/schemas/TokenRefreshRequest"
       responses:
+        "401":
+          $ref: "#/components/responses/AuthenticationRequired"
         "200":
-          description: 已有设备的新访问令牌；普通刷新不轮换刷新令牌。
+          description: 已有设备的新访问令牌；普通刷新不轮换刷新令牌，也不延长刷新有效期。到期设备可保留凭据，等待管理员延期后用同一刷新令牌恢复。
           content:
             application/json:
               schema:
@@ -374,7 +382,12 @@ paths:
   /api/v1/ws:
     get:
       summary: WebSocket 连接入口。
-      description: 游客仅收到认证设备发布通知的创建、确认和过期事件，不接收其他设备的在线状态。每次广播均检查角色；角色变更以 1012 关闭目标连接，客户端需重连并刷新活动通知快照。鉴权优先使用 Authorization 请求头中的 Bearer 令牌，其次使用 token 查询参数。
+      description: >-
+        游客仅收到本机范围事件。鉴权优先使用 Authorization Bearer，其次使用 token 查询参数。
+        连接前、广播前及空闲期间检查 access 和 refresh 到期时间；失效关闭 1008，
+        reason 尽可能为 access_token_expired、refresh_token_expired、device_revoked 或 invalid_token，广播关闭时 reason 可能为空。
+        角色或有效期修改以 1012 关闭目标连接，客户端先更新授权状态再重连并刷新快照。
+        refresh 到期期间不得维持或重连业务 WebSocket，只允许每小时一次 refresh 恢复检查。
       parameters:
         - name: token
           in: query
@@ -385,11 +398,36 @@ paths:
         "101":
           description: 升级为 WebSocket；消息格式见 ws-events.schema.json。
 components:
+  responses:
+    AuthenticationRequired:
+      description: >-
+        结构化鉴权错误。业务请求 invalid_token 也可能是 access 已被另一调用端轮换，
+        可尝试一次共享 refresh；只有 refresh 端点的 invalid_token 才代表绑定凭据无效。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AuthenticationErrorResponse"
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
   schemas:
+    AuthenticationErrorResponse:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          type: object
+          required: [code, message, server_time]
+          properties:
+            code:
+              type: string
+              enum: [access_token_expired, refresh_token_expired, device_revoked, invalid_token]
+            message:
+              type: string
+            server_time:
+              type: string
+              format: date-time
     DeviceBindRequest:
       type: object
       additionalProperties: false
@@ -404,10 +442,10 @@ components:
           enum: [windows, android]
         refresh_token:
           type: [string, "null"]
-          description: 可选。strict 模式下用于证明已有设备身份并重新绑定，无需再次消费配对码。
+          description: 可选。证明已有设备身份并轮换凭据，保留原角色与刷新到期时间。已到期或撤销的凭据不能自助重绑。
     DeviceBindResponse:
       type: object
-      required: [device, refresh_token, access_token, token_type]
+      required: [device, refresh_token, access_token, token_type, access_expires_at, refresh_expires_at, server_time]
       properties:
         device:
           $ref: "#/components/schemas/Device"
@@ -418,13 +456,32 @@ components:
         access_expires_at:
           type: [string, "null"]
           format: date-time
+        refresh_expires_at:
+          type: [string, "null"]
+          format: date-time
+          description: 刷新到期时间；null 表示永久。与 device 内字段一致。
+        server_time:
+          type: string
+          format: date-time
         token_type:
           type: string
           const: bearer
     DeviceUpdateRequest:
       type: object
+      description: 有效期字段省略则保持原值。相对天数从本次修改计算。不能将最后可用管理员改为有限期限（409 / last_admin_must_be_permanent）。
+      not:
+        required: [refresh_ttl_days, refresh_expires_at]
       additionalProperties: false
       properties:
+        refresh_ttl_days:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 36500
+          description: 仅管理员可设。相对天数，null 为永久；不能与 refresh_expires_at 同时提供。
+        refresh_expires_at:
+          type: [string, "null"]
+          format: date-time
+          description: 仅管理员可设。带时区的未来绝对到期时间，null 为永久；不能与 refresh_ttl_days 同时提供。
         name:
           type: string
           minLength: 1
@@ -502,7 +559,7 @@ components:
           type: string
     AccessTokenResponse:
       type: object
-      required: [device, access_token, token_type]
+      required: [device, access_token, token_type, access_expires_at, refresh_expires_at, server_time]
       properties:
         device:
           $ref: "#/components/schemas/Device"
@@ -510,6 +567,13 @@ components:
           type: string
         access_expires_at:
           type: [string, "null"]
+          format: date-time
+        refresh_expires_at:
+          type: [string, "null"]
+          format: date-time
+          description: 刷新到期时间；null 表示永久。与 device 内字段一致。
+        server_time:
+          type: string
           format: date-time
         token_type:
           type: string
@@ -537,8 +601,20 @@ components:
           type: [string, "null"]
     PairIssueRequest:
       type: object
+      description: 有效期字段省略则默认绑定后 90 天（可由服务端配置覆盖）。相对天数从配对消费成功时计算，绝对日期在消费时已过期则配对失败。
+      not:
+        required: [refresh_ttl_days, refresh_expires_at]
       additionalProperties: false
       properties:
+        refresh_ttl_days:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 36500
+          description: 仅管理员可设。相对天数，null 为永久；不能与 refresh_expires_at 同时提供。
+        refresh_expires_at:
+          type: [string, "null"]
+          format: date-time
+          description: 仅管理员可设。带时区的未来绝对到期时间，null 为永久；不能与 refresh_ttl_days 同时提供。
         role:
           $ref: "#/components/schemas/DeviceRole"
           default: member
@@ -578,7 +654,7 @@ components:
           enum: [windows, android]
     Device:
       type: object
-      required: [id, name, platform, role, created_at, notifications_enabled, notification_pause_until, session_state]
+      required: [id, name, platform, role, created_at, notifications_enabled, notification_pause_until, session_state, refresh_expires_at, access_expires_at]
       properties:
         id:
           type: string
@@ -598,6 +674,14 @@ components:
         revoked_at:
           type: [string, "null"]
           format: date-time
+        refresh_expires_at:
+          type: [string, "null"]
+          format: date-time
+          description: null 表示永久；有限期限到期后等待管理员延期，撤销设备不能恢复。
+        access_expires_at:
+          type: [string, "null"]
+          format: date-time
+          description: 当前访问令牌到期时间；新签发值不晚于 refresh_expires_at。null 仅兼容旧数据。
         notifications_enabled:
           type: boolean
         notification_pause_until:

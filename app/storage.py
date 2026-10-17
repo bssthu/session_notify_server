@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import sqlite3
 import threading
@@ -45,7 +46,26 @@ from .security import new_token, sha256_text
 
 
 class LastAdministratorError(ValueError):
-    pass
+    code = "last_administrator_required"
+
+
+class LastAdministratorExpiryError(LastAdministratorError):
+    code = "last_admin_must_be_permanent"
+
+
+class AuthenticationError(ValueError):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__({
+            "invalid_token": "Invalid token",
+            "device_revoked": "Device has been revoked",
+            "access_token_expired": "Access token has expired",
+            "refresh_token_expired": "Refresh token has expired; ask an administrator to extend it",
+        }[code])
+
+
+_UNSET = object()
+_LOG = logging.getLogger(__name__)
 
 # 配对码字符集:去掉易混淆的 I/L/O/U/0/1,生成形如 7Q4K-9XKM 的人类可读码。
 _PAIR_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -390,6 +410,8 @@ class Storage:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
         # access 短期、refresh 长期;bind/refresh 时写入 *_expires_at,authenticate/refresh
         # 时校验。老库 migration 后该列为 NULL → 视为不过期(向后兼容,不强制存量重绑)。
+        if access_ttl <= timedelta(0) or refresh_ttl <= timedelta(0):
+            raise ValueError("Token lifetimes must be positive")
         self.access_ttl = access_ttl
         self.refresh_ttl = refresh_ttl
         # 配对码有效期:已绑设备签发,新设备消费后绑定。一次性,过期失效。
@@ -549,6 +571,9 @@ class Storage:
             self._ensure_device_columns()
             self._ensure_notification_origin_columns()
             self._ensure_notification_dedupe_column()
+            self._ensure_pair_expiry_columns()
+            self._ensure_admin_invariant_locked(utc_now())
+            self._cap_access_expiries_locked()
 
     def _ensure_device_role_columns(self) -> None:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(devices)")}
@@ -597,19 +622,111 @@ class Storage:
             "ON notifications(dedupe_key)"
         )
 
+    def _ensure_pair_expiry_columns(self) -> None:
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(pair_codes)")}
+        if "refresh_ttl_days" not in columns:
+            # Existing unconsumed invitations retain the default 90-day policy.
+            self._conn.execute("ALTER TABLE pair_codes ADD COLUMN refresh_ttl_days INTEGER DEFAULT 90")
+        if "refresh_expires_at" not in columns:
+            self._conn.execute("ALTER TABLE pair_codes ADD COLUMN refresh_expires_at TEXT")
+
+    def _ensure_admin_invariant_locked(self, now: datetime) -> None:
+        """Protect the temporal last administrator before evaluating any credential.
+
+        Multiple finite administrators are allowed. At the penultimate expiry the
+        latest-deadline survivor becomes permanent. A late sweep/clock jump applies
+        the same transition retrospectively, with stable created_at/id tie breaks.
+        No revoked or demoted device is eligible; all other expired devices stay so.
+        """
+        rows = self._conn.execute(
+            "SELECT id, created_at, refresh_expires_at FROM devices "
+            "WHERE role = 'admin' AND revoked_at IS NULL"
+        ).fetchall()
+        if not rows or any(row["refresh_expires_at"] is None for row in rows):
+            return
+        usable = [row for row in rows if _parse_dt(row["refresh_expires_at"]) > now]
+        if len(usable) > 1:
+            return
+        survivor = max(rows, key=lambda row: (
+            _parse_dt(row["refresh_expires_at"]), _parse_dt(row["created_at"]), row["id"],
+        ))
+        self._conn.execute("UPDATE devices SET refresh_expires_at = NULL WHERE id = ?", (survivor["id"],))
+        # Audit only the identity and policy reason, never tokens or their hashes.
+        _LOG.info("Device %s refresh expiry made permanent: last usable administrator", survivor["id"])
+
+    def _cap_access_expiries_locked(self) -> None:
+        self._conn.execute(
+            "UPDATE devices SET access_expires_at = refresh_expires_at "
+            "WHERE refresh_expires_at IS NOT NULL AND "
+            "(access_expires_at IS NULL OR access_expires_at > refresh_expires_at)"
+        )
+
+    def enforce_admin_expiry_invariant(self) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._ensure_admin_invariant_locked(utc_now())
+
+    def _resolve_expiry(self, now: datetime, *, refresh_ttl_days=_UNSET, refresh_expires_at=_UNSET):
+        if refresh_ttl_days is not _UNSET and refresh_expires_at is not _UNSET:
+            raise ValueError("Supply refresh_ttl_days or refresh_expires_at, never both")
+        if refresh_ttl_days is not _UNSET:
+            if refresh_ttl_days is None:
+                return None
+            if type(refresh_ttl_days) is not int or not 1 <= refresh_ttl_days <= 36500:
+                raise ValueError("refresh_ttl_days must be an integer from 1 to 36500, or null")
+            return now + timedelta(days=refresh_ttl_days)
+        if refresh_expires_at is not _UNSET:
+            if refresh_expires_at is None:
+                return None
+            if not isinstance(refresh_expires_at, datetime) or refresh_expires_at.tzinfo is None:
+                raise ValueError("refresh_expires_at must include a timezone")
+            expiry = refresh_expires_at.astimezone(timezone.utc)
+            if expiry <= now:
+                raise ValueError("refresh_expires_at must be in the future")
+            return expiry
+        return now + self.refresh_ttl
+
+    def _access_expiry(self, now: datetime, refresh_expires_at: datetime | None) -> datetime:
+        expiry = now + self.access_ttl
+        return min(expiry, refresh_expires_at) if refresh_expires_at is not None else expiry
+
+    @staticmethod
+    def _credential_error(row, now: datetime, *, access: bool = False) -> str | None:
+        if row is None:
+            return "invalid_token"
+        if row["revoked_at"] is not None:
+            return "device_revoked"
+        refresh_expiry = _parse_dt(row["refresh_expires_at"])
+        if refresh_expiry is not None and refresh_expiry <= now:
+            return "refresh_token_expired"
+        access_expiry = _parse_dt(row["access_expires_at"])
+        if access and access_expiry is not None and access_expiry <= now:
+            return "access_token_expired"
+        return None
+
     def bind_device(self, name: str, platform: DevicePlatform) -> DeviceBindResponse:
         with self._lock, self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
+            self._ensure_admin_invariant_locked(utc_now())
             role = DeviceRole.member if self.has_any_device() else DeviceRole.admin
             return self._bind_device_locked(name, platform, role)
 
-    def _bind_device_locked(self, name: str, platform: DevicePlatform, role: DeviceRole) -> DeviceBindResponse:
-        created_at = utc_now()
+    def _bind_device_locked(
+        self, name: str, platform: DevicePlatform, role: DeviceRole,
+        *, refresh_ttl_days=_UNSET, refresh_expires_at=_UNSET, now: datetime | None = None,
+    ) -> DeviceBindResponse:
+        created_at = now or utc_now()
         device_id = new_id()
         refresh_token = new_token("sn_refresh")
         access_token = new_token("sn_access")
-        access_expires_at = created_at + self.access_ttl
-        refresh_expires_at = created_at + self.refresh_ttl
+        refresh_expiry = self._resolve_expiry(created_at, refresh_ttl_days=refresh_ttl_days,
+                                              refresh_expires_at=refresh_expires_at)
+        # The first administrator is permanent from the very first response.
+        if role == DeviceRole.admin and not self._conn.execute(
+            "SELECT 1 FROM devices WHERE role = 'admin' AND revoked_at IS NULL"
+        ).fetchone():
+            refresh_expiry = None
+        access_expiry = self._access_expiry(created_at, refresh_expiry)
         self._conn.execute(
             """
             INSERT INTO devices (
@@ -618,85 +735,53 @@ class Storage:
                 access_expires_at, refresh_expires_at, role
             ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?, ?)
             """,
-            (
-                device_id,
-                name,
-                platform.value,
-                sha256_text(refresh_token),
-                sha256_text(access_token),
-                _dt(created_at),
-                _dt(created_at),
-                _dt(access_expires_at),
-                _dt(refresh_expires_at),
-                role.value,
-            ),
+            (device_id, name, platform.value, sha256_text(refresh_token), sha256_text(access_token),
+             _dt(created_at), _dt(created_at), _dt(access_expiry),
+             _dt(refresh_expiry) if refresh_expiry else None, role.value),
         )
+        self._ensure_admin_invariant_locked(created_at)
+        row = self._conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
         return DeviceBindResponse(
-            device=DevicePublic(
-                id=device_id,
-                name=name,
-                platform=platform,
-                role=role,
-                created_at=created_at,
-                last_seen_at=created_at,
-                notifications_enabled=True,
-            ),
-            refresh_token=refresh_token,
-            access_token=access_token,
-            access_expires_at=access_expires_at,
+            device=self._device_from_row(row), refresh_token=refresh_token, access_token=access_token,
+            access_expires_at=_parse_dt(row["access_expires_at"]),
+            refresh_expires_at=_parse_dt(row["refresh_expires_at"]), server_time=created_at,
         )
 
-    def rebind_device(self, refresh_token: str, name: str, platform: DevicePlatform) -> DeviceBindResponse | None:
-        """strict 模式下本机重新绑定:用旧 refresh_token 证明身份,换发全新 token(轮换 refresh)。
-        保留 device_id(同一台设备)、原 notifications_enabled 与 created_at,更新 name/platform/过期。
-        旧 token 无效/过期/已撤销返回 None(调用方回退到配对码/重置)。"""
-        token_hash = sha256_text(refresh_token)
-        now = utc_now()
-        new_refresh = new_token("sn_refresh")
-        new_access = new_token("sn_access")
-        access_expires_at = now + self.access_ttl
-        refresh_expires_at = now + self.refresh_ttl
+    def rebind_device(
+        self, refresh_token: str, name: str, platform: DevicePlatform, *, raise_errors: bool = False,
+    ) -> DeviceBindResponse | None:
+        """Rotate credentials without extending the administrator-controlled deadline."""
         with self._lock, self._conn:
-            row = self._conn.execute(
-                """
-                SELECT id, created_at, notifications_enabled, role FROM devices
-                WHERE refresh_token_hash = ? AND revoked_at IS NULL
-                  AND (refresh_expires_at IS NULL OR refresh_expires_at > ?)
-                """,
-                (token_hash, _dt(now)),
-            ).fetchone()
-            if row is None:
+            self._conn.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            self._ensure_admin_invariant_locked(now)
+            row = self._conn.execute("SELECT * FROM devices WHERE refresh_token_hash = ?",
+                                     (sha256_text(refresh_token),)).fetchone()
+            error = self._credential_error(row, now)
+            if error:
+                if raise_errors:
+                    raise AuthenticationError(error)
                 return None
-            device_id = row["id"]
-            created_at = _parse_dt(row["created_at"]) or now
-            notifications_enabled = bool(row["notifications_enabled"])
+            new_refresh, new_access = new_token("sn_refresh"), new_token("sn_access")
+            refresh_expiry = _parse_dt(row["refresh_expires_at"])
+            access_expiry = self._access_expiry(now, refresh_expiry)
             self._conn.execute(
                 """
                 UPDATE devices
                 SET name = ?, platform = ?, refresh_token_hash = ?, access_token_hash = ?,
-                    access_expires_at = ?, refresh_expires_at = ?, last_seen_at = ?,
+                    access_expires_at = ?, last_seen_at = ?,
                     session_state = 'unknown', session_state_updated_at = NULL,
-                    notification_pause_until = NULL,
-                    suppress_codex_permission_requests = 0
+                    notification_pause_until = NULL, suppress_codex_permission_requests = 0
                 WHERE id = ?
                 """,
                 (name, platform.value, sha256_text(new_refresh), sha256_text(new_access),
-                 _dt(access_expires_at), _dt(refresh_expires_at), _dt(now), device_id),
+                 _dt(access_expiry), _dt(now), row["id"]),
             )
-        return DeviceBindResponse(
-            device=DevicePublic(
-                id=device_id,
-                name=name,
-                platform=platform,
-                created_at=created_at,
-                last_seen_at=now,
-                notifications_enabled=notifications_enabled,
-                role=DeviceRole(row["role"]),
-            ),
-            refresh_token=new_refresh,
-            access_token=new_access,
-            access_expires_at=access_expires_at,
-        )
+            updated = self._conn.execute("SELECT * FROM devices WHERE id = ?", (row["id"],)).fetchone()
+            return DeviceBindResponse(
+                device=self._device_from_row(updated), refresh_token=new_refresh, access_token=new_access,
+                access_expires_at=access_expiry, refresh_expires_at=refresh_expiry, server_time=now,
+            )
 
     def revoke_all_devices(self) -> int:
         """撤销所有未撤销设备,回到 bootstrap 态。仅供服务端本地管理脚本使用。返回撤销数。"""
@@ -711,129 +796,111 @@ class Storage:
 
     def list_devices(self, viewer_device_id: str | None = None) -> list[DevicePublic]:
         scope, values = self._viewer_scope_sql(viewer_device_id, "devices.id")
-        with self._lock:
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._ensure_admin_invariant_locked(utc_now())
             rows = self._conn.execute(
-                f"""
-                SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
-                       notification_pause_until, session_state, session_state_updated_at
-                FROM devices
-                WHERE revoked_at IS NULL AND {scope}
-                ORDER BY created_at ASC
-                """, values,
+                f"SELECT * FROM devices WHERE revoked_at IS NULL AND {scope} ORDER BY created_at ASC", values,
             ).fetchall()
         return [self._device_from_row(row) for row in rows]
 
     def update_device(
-        self,
-        device_id: str,
-        *,
-        name: str | None = None,
-        notifications_enabled: bool | None = None,
-        role: DeviceRole | None = None,
-        actor_id: str | None = None,
+        self, device_id: str, *, name: str | None = None,
+        notifications_enabled: bool | None = None, role: DeviceRole | None = None,
+        actor_id: str | None = None, refresh_ttl_days=_UNSET, refresh_expires_at=_UNSET,
     ) -> DevicePublic:
-        values: list[Any] = []
-        assignments: list[str] = []
-        if name is not None:
-            cleaned = name.strip()
-            if not cleaned:
-                raise ValueError("Device name is required.")
-            assignments.append("name = ?")
-            values.append(cleaned)
-        if notifications_enabled is not None:
-            assignments.append("notifications_enabled = ?")
-            values.append(1 if notifications_enabled else 0)
-        if role is not None:
-            role = DeviceRole(role)
-            assignments.append("role = ?")
-            values.append(role.value)
-
+        changing_expiry = refresh_ttl_days is not _UNSET or refresh_expires_at is not _UNSET
         with self._lock, self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
-            self._authorize_device_change_locked(actor_id, device_id, changing_role=role is not None)
-            row = self._conn.execute(
-                """
-                SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
-                       notification_pause_until, session_state, session_state_updated_at
-                FROM devices
-                WHERE id = ? AND revoked_at IS NULL
-                """,
-                (device_id,),
-            ).fetchone()
+            now = utc_now()
+            self._ensure_admin_invariant_locked(now)
+            self._authorize_device_change_locked(actor_id, device_id,
+                changing_role=role is not None, changing_expiry=changing_expiry)
+            row = self._conn.execute("SELECT * FROM devices WHERE id = ? AND revoked_at IS NULL",
+                                     (device_id,)).fetchone()
             if row is None:
                 raise KeyError(device_id)
-            if role is not None and role != DeviceRole.admin and row["role"] == DeviceRole.admin.value:
-                if actor_id is not None:
-                    self._require_another_admin_locked(device_id)
-                self._conn.execute("DELETE FROM pair_codes WHERE issued_by_device_id = ?", (device_id,))
+            assignments, values = [], []
+            if name is not None:
+                cleaned = name.strip()
+                if not cleaned:
+                    raise ValueError("Device name is required.")
+                assignments.append("name = ?")
+                values.append(cleaned)
+            if notifications_enabled is not None:
+                assignments.append("notifications_enabled = ?")
+                values.append(int(notifications_enabled))
+            new_role = DeviceRole(role) if role is not None else DeviceRole(row["role"])
+            if role is not None:
+                if new_role != DeviceRole.admin and row["role"] == DeviceRole.admin.value:
+                    if actor_id is not None:
+                        self._require_another_admin_locked(device_id)
+                    self._conn.execute("DELETE FROM pair_codes WHERE issued_by_device_id = ?", (device_id,))
+                assignments.append("role = ?")
+                values.append(new_role.value)
+            if changing_expiry:
+                expiry = self._resolve_expiry(now, refresh_ttl_days=refresh_ttl_days,
+                                             refresh_expires_at=refresh_expires_at)
+                if new_role == DeviceRole.admin and expiry is not None and not self._another_usable_admin_locked(device_id, now):
+                    raise LastAdministratorExpiryError("The last usable administrator must remain permanent")
+                assignments.append("refresh_expires_at = ?")
+                values.append(_dt(expiry) if expiry else None)
+                # Shortening takes effect for already-issued access tokens immediately;
+                # extension never prolongs an old access credential.
+                access_expiry = _parse_dt(row["access_expires_at"])
+                if expiry is not None and (access_expiry is None or access_expiry > expiry):
+                    assignments.append("access_expires_at = ?")
+                    values.append(_dt(expiry))
             if assignments:
-                self._conn.execute(
-                    f"UPDATE devices SET {', '.join(assignments)} WHERE id = ?",
-                    (*values, device_id),
-                )
-                row = self._conn.execute(
-                    """
-                    SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
-                           notification_pause_until, session_state, session_state_updated_at
-                    FROM devices
-                    WHERE id = ?
-                    """,
-                    (device_id,),
-                ).fetchone()
-        return self._device_from_row(row)
+                self._conn.execute(f"UPDATE devices SET {', '.join(assignments)} WHERE id = ?", (*values, device_id))
+            self._ensure_admin_invariant_locked(now)
+            updated = self._conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+            if changing_expiry:
+                _LOG.info("Device %s refresh expiry changed by administrator %s", device_id, actor_id or "local")
+            return self._device_from_row(updated)
 
     def revoke_device(self, device_id: str, *, actor_id: str | None = None) -> DevicePublic:
-        revoked_at = utc_now()
         with self._lock, self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            self._ensure_admin_invariant_locked(now)
             self._authorize_device_change_locked(actor_id, device_id)
-            row = self._conn.execute(
-                """
-                SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
-                       notification_pause_until, session_state, session_state_updated_at
-                FROM devices
-                WHERE id = ?
-                """,
-                (device_id,),
-            ).fetchone()
+            row = self._conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
             if row is None or row["revoked_at"] is not None:
                 raise KeyError(device_id)
             if actor_id is not None and row["role"] == DeviceRole.admin.value:
                 self._require_another_admin_locked(device_id)
-            self._conn.execute(
-                "UPDATE devices SET revoked_at = ? WHERE id = ?",
-                (_dt(revoked_at), device_id),
-            )
+            self._conn.execute("UPDATE devices SET revoked_at = ? WHERE id = ?", (_dt(now), device_id))
             self._conn.execute("DELETE FROM pair_codes WHERE issued_by_device_id = ?", (device_id,))
-            row = self._conn.execute(
-                """
-                SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
-                       notification_pause_until, session_state, session_state_updated_at
-                FROM devices
-                WHERE id = ?
-                """,
-                (device_id,),
-            ).fetchone()
-        return self._device_from_row(row)
+            self._ensure_admin_invariant_locked(now)
+            updated = self._conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+            return self._device_from_row(updated)
 
     def _authorize_device_change_locked(
-        self, actor_id: str | None, target_id: str, *, changing_role: bool = False
+        self, actor_id: str | None, target_id: str, *, changing_role: bool = False,
+        changing_expiry: bool = False,
     ) -> None:
         # No actor is reserved for trusted server-local maintenance, never HTTP handlers.
         if actor_id is None:
             return
-        actor = self._conn.execute(
-            "SELECT role FROM devices WHERE id = ? AND revoked_at IS NULL", (actor_id,)
-        ).fetchone()
-        if actor is None or (actor["role"] != DeviceRole.admin.value and (actor_id != target_id or changing_role)):
-            raise PermissionError("Only administrators may manage other devices or change device roles")
+        now = utc_now()
+        self._ensure_admin_invariant_locked(now)
+        actor = self._conn.execute("SELECT * FROM devices WHERE id = ?", (actor_id,)).fetchone()
+        error = self._credential_error(actor, now, access=True)
+        if error:
+            raise AuthenticationError(error)
+        if actor["role"] != DeviceRole.admin.value and (actor_id != target_id or changing_role or changing_expiry):
+            raise PermissionError("Only administrators may manage other devices, roles, or refresh expiry")
+
+    def _another_usable_admin_locked(self, device_id: str, now: datetime) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM devices WHERE role = 'admin' AND revoked_at IS NULL AND id != ? "
+            "AND (refresh_expires_at IS NULL OR refresh_expires_at > ?) LIMIT 1", (device_id, _dt(now)),
+        ).fetchone() is not None
 
     def _require_another_admin_locked(self, device_id: str) -> None:
-        if not self._conn.execute(
-            "SELECT 1 FROM devices WHERE role = 'admin' AND revoked_at IS NULL AND id != ? LIMIT 1",
-            (device_id,),
-        ).fetchone():
-            raise LastAdministratorError("Keep at least one administrator; promote another device first")
+        if not self._another_usable_admin_locked(device_id, utc_now()):
+            raise LastAdministratorError("Keep at least one usable administrator; promote or extend another device first")
 
     def has_any_device(self) -> bool:
         """是否存在未撤销的已绑设备。strict 模式下据此判断:已有设备时裸 bind 被拒。"""
@@ -853,14 +920,16 @@ class Storage:
         stale_after: timedelta,
     ) -> tuple[DevicePublic, bool]:
         """Store a Windows heartbeat and indicate whether effective availability changed."""
-        now = utc_now()
-        stale_before = now - stale_after
         with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            stale_before = now - stale_after
+            self._ensure_admin_invariant_locked(now)
             row = self._conn.execute(
                 """
                 SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
                        notification_pause_until, session_state, session_state_updated_at,
-                       suppress_codex_permission_requests
+                       suppress_codex_permission_requests, refresh_expires_at, access_expires_at
                 FROM devices
                 WHERE id = ? AND revoked_at IS NULL
                 """,
@@ -868,6 +937,9 @@ class Storage:
             ).fetchone()
             if row is None:
                 raise KeyError(device_id)
+            error = self._credential_error(row, now, access=True)
+            if error:
+                raise AuthenticationError(error)
             if DevicePlatform(row["platform"]) is not DevicePlatform.windows:
                 raise ValueError("Only Windows devices can report a desktop session state")
 
@@ -906,7 +978,7 @@ class Storage:
             row = self._conn.execute(
                 """
                 SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
-                       notification_pause_until, session_state, session_state_updated_at
+                       notification_pause_until, session_state, session_state_updated_at, access_expires_at, refresh_expires_at
                 FROM devices
                 WHERE id = ?
                 """,
@@ -935,11 +1007,13 @@ class Storage:
         evaluated_at = now or utc_now()
         stale_before = evaluated_at - stale_after
         scope, values = self._viewer_scope_sql(viewer_device_id, "devices.id")
-        with self._lock:
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._ensure_admin_invariant_locked(utc_now())
             rows = self._conn.execute(
                 f"""
                 SELECT id, name, notification_pause_until, session_state, session_state_updated_at,
-                       suppress_codex_permission_requests
+                       suppress_codex_permission_requests, refresh_expires_at
                 FROM devices
                 WHERE platform = ? AND revoked_at IS NULL AND {scope}
                 ORDER BY created_at ASC
@@ -954,7 +1028,9 @@ class Storage:
         for row in rows:
             reported = DeviceSessionState(row["session_state"] or DeviceSessionState.unknown.value)
             updated_at = _parse_dt(row["session_state_updated_at"])
-            fresh = updated_at is not None and updated_at >= stale_before
+            refresh_expiry = _parse_dt(row["refresh_expires_at"])
+            authorized = refresh_expiry is None or refresh_expiry > evaluated_at
+            fresh = authorized and updated_at is not None and updated_at >= stale_before
             effective = reported if fresh else DeviceSessionState.unknown
             if fresh:
                 fresh_windows += 1
@@ -993,74 +1069,89 @@ class Storage:
             ).fetchone()
         return bool(row and row["platform"] == DevicePlatform.android.value)
 
-    def issue_pair_code(self, device: DevicePublic, role: DeviceRole = DeviceRole.member) -> tuple[str, datetime]:
+    def issue_pair_code(
+        self, device: DevicePublic, role: DeviceRole = DeviceRole.member,
+        *, refresh_ttl_days=_UNSET, refresh_expires_at=_UNSET,
+    ) -> tuple[str, datetime]:
         with self._lock, self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
-            issuer = self._conn.execute(
-                "SELECT role FROM devices WHERE id = ? AND revoked_at IS NULL", (device.id,),
-            ).fetchone()
-            if issuer is None:
-                raise ValueError("Pairing issuer is no longer active")
+            now = utc_now()
+            self._ensure_admin_invariant_locked(now)
+            issuer = self._conn.execute("SELECT * FROM devices WHERE id = ?", (device.id,)).fetchone()
+            error = self._credential_error(issuer, now, access=True)
+            if error:
+                raise AuthenticationError(error)
             if issuer["role"] != DeviceRole.admin.value:
                 raise PermissionError("Only administrators may invite devices")
-            return self._issue_pair_code_locked(device.id, DeviceRole(role))
+            return self._issue_pair_code_locked(device.id, DeviceRole(role),
+                refresh_ttl_days=refresh_ttl_days, refresh_expires_at=refresh_expires_at)
 
     def issue_bootstrap_code(self) -> tuple[str, datetime]:
         """Local administrator operation; deliberately has no HTTP endpoint."""
         with self._lock, self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
+            self._ensure_admin_invariant_locked(utc_now())
             if self.has_any_device():
                 raise ValueError("An active device already exists; issue a code from that device")
             self._conn.execute("DELETE FROM pair_codes WHERE issued_by_device_id = '@bootstrap'")
-            return self._issue_pair_code_locked("@bootstrap", DeviceRole.admin)
+            return self._issue_pair_code_locked("@bootstrap", DeviceRole.admin, refresh_ttl_days=None)
 
-    def _issue_pair_code_locked(self, issuer: str, role: DeviceRole) -> tuple[str, datetime]:
+    def _issue_pair_code_locked(
+        self, issuer: str, role: DeviceRole, *, refresh_ttl_days=_UNSET, refresh_expires_at=_UNSET,
+    ) -> tuple[str, datetime]:
         now = utc_now()
+        self._resolve_expiry(now, refresh_ttl_days=refresh_ttl_days, refresh_expires_at=refresh_expires_at)
+        if refresh_expires_at is not _UNSET:
+            policy_days = None
+            policy_date = _dt(refresh_expires_at) if refresh_expires_at is not None else None
+        else:
+            policy_days = self.refresh_ttl.days if refresh_ttl_days is _UNSET else refresh_ttl_days
+            policy_date = None
         expires_at = now + self.pair_code_ttl
         code = secrets.token_hex(16).upper() if issuer == "@bootstrap" else "{}-{}".format(
             "".join(secrets.choice(_PAIR_ALPHABET) for _ in range(4)),
             "".join(secrets.choice(_PAIR_ALPHABET) for _ in range(4)),
         )
         self._conn.execute(
-            "INSERT INTO pair_codes (code_hash, issued_by_device_id, created_at, expires_at, role) VALUES (?, ?, ?, ?, ?)",
-            (sha256_text(code), issuer, _dt(now), _dt(expires_at), role.value),
+            "INSERT INTO pair_codes (code_hash, issued_by_device_id, created_at, expires_at, role, "
+            "refresh_ttl_days, refresh_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (sha256_text(code), issuer, _dt(now), _dt(expires_at), role.value, policy_days, policy_date),
         )
         return code, expires_at
 
     def consume_pair_code(
-        self, code: str, name: str, platform: DevicePlatform
+        self, code: str, name: str, platform: DevicePlatform,
     ) -> tuple[DeviceBindResponse, dict] | None:
         code_hash = sha256_text(code)
-        now = utc_now()
-        # Serialize against other processes as well as threads. The issuer check,
-        # code consumption and device insert are committed as one transaction.
+        # Serialize across server workers. Identity, policy and consume are atomic.
         with self._lock, self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
-            row = self._conn.execute(
-                "SELECT code_hash, expires_at, consumed_at, issued_by_device_id, role FROM pair_codes WHERE code_hash = ?",
-                (code_hash,),
-            ).fetchone()
+            now = utc_now()
+            self._ensure_admin_invariant_locked(now)
+            row = self._conn.execute("SELECT * FROM pair_codes WHERE code_hash = ?", (code_hash,)).fetchone()
             if row is None or row["consumed_at"] is not None or (_parse_dt(row["expires_at"]) or now) <= now:
                 return None
             issuer = row["issued_by_device_id"]
             if issuer == "@bootstrap":
                 if self.has_any_device():
                     return None
-            elif not self._conn.execute(
-                "SELECT 1 FROM devices WHERE id = ? AND revoked_at IS NULL AND role = 'admin'", (issuer,),
-            ).fetchone():
-                return None
+            else:
+                issuer_row = self._conn.execute("SELECT * FROM devices WHERE id = ?", (issuer,)).fetchone()
+                if self._credential_error(issuer_row, now) or issuer_row["role"] != DeviceRole.admin.value:
+                    return None
             role = DeviceRole.admin if issuer == "@bootstrap" else DeviceRole(row["role"])
-            response = self._bind_device_locked(name, platform, role)
-            self._conn.execute(
-                "UPDATE pair_codes SET consumed_at = ?, consumed_device_id = ? WHERE code_hash = ?",
-                (_dt(now), response.device.id, code_hash),
-            )
-            return response, {
-                "code_hash": code_hash,
-                "issued_by_device_id": issuer,
-                "consumed_device_name": response.device.name,
-            }
+            if row["refresh_expires_at"] is not None:
+                expiry = _parse_dt(row["refresh_expires_at"])
+                if expiry <= now:
+                    return None
+                policy = {"refresh_expires_at": expiry}
+            else:
+                policy = {"refresh_ttl_days": row["refresh_ttl_days"]}
+            response = self._bind_device_locked(name, platform, role, now=now, **policy)
+            self._conn.execute("UPDATE pair_codes SET consumed_at = ?, consumed_device_id = ? WHERE code_hash = ?",
+                               (_dt(now), response.device.id, code_hash))
+            return response, {"code_hash": code_hash, "issued_by_device_id": issuer,
+                              "consumed_device_name": response.device.name}
 
     def pair_code_status(self, code: str) -> dict | None:
         """按明文码查询配对状态(只读,不消费)。查不到返回 None;
@@ -1166,67 +1257,58 @@ class Storage:
             "json_extract(events.payload, '$.notification_id')))",
         )
 
-    def access_token_is_valid(self, token_hash: str) -> bool:
-        # Read-only check for long-lived transports (does not renew last_seen_at).
-        with self._lock:
-            return self._conn.execute(
-                "SELECT 1 FROM devices WHERE access_token_hash = ? AND revoked_at IS NULL "
-                "AND (access_expires_at IS NULL OR access_expires_at > ?)",
-                (token_hash, _dt(utc_now())),
-            ).fetchone() is not None
-
-    def authenticate(self, access_token: str) -> DevicePublic | None:
-        token_hash = sha256_text(access_token)
-        now = utc_now()
+    def access_token_error(self, token_hash: str) -> str | None:
+        """Current authorization for long-lived transports; never renew last_seen_at."""
         with self._lock, self._conn:
-            row = self._conn.execute(
-                """
-                SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
-                       notification_pause_until, session_state, session_state_updated_at
-                FROM devices
-                WHERE access_token_hash = ? AND revoked_at IS NULL
-                  AND (access_expires_at IS NULL OR access_expires_at > ?)
-                """,
-                (token_hash, _dt(now)),
-            ).fetchone()
-            if row is None:
-                return None
-            self._conn.execute(
-                "UPDATE devices SET last_seen_at = ? WHERE id = ?",
-                (_dt(now), row["id"]),
-            )
+            self._conn.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            self._ensure_admin_invariant_locked(now)
+            row = self._conn.execute("SELECT * FROM devices WHERE access_token_hash = ?", (token_hash,)).fetchone()
+            return self._credential_error(row, now, access=True)
+
+    def access_token_is_valid(self, token_hash: str) -> bool:
+        return self.access_token_error(token_hash) is None
+
+    def authenticate(self, access_token: str, *, raise_errors: bool = False) -> DevicePublic | None:
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            self._ensure_admin_invariant_locked(now)
+            row = self._conn.execute("SELECT * FROM devices WHERE access_token_hash = ?",
+                                     (sha256_text(access_token),)).fetchone()
+            error = self._credential_error(row, now, access=True)
+            if not error:
+                self._conn.execute("UPDATE devices SET last_seen_at = ? WHERE id = ?", (_dt(now), row["id"]))
+        if error:
+            if raise_errors:
+                raise AuthenticationError(error)
+            return None
         return self._device_from_row(row, last_seen_at=now)
 
-    def refresh_access_token(self, refresh_token: str) -> AccessTokenResponse | None:
-        token_hash = sha256_text(refresh_token)
-        now = utc_now()
-        access_token = new_token("sn_access")
-        access_expires_at = now + self.access_ttl
+    def refresh_access_token(self, refresh_token: str, *, raise_errors: bool = False) -> AccessTokenResponse | None:
         with self._lock, self._conn:
-            row = self._conn.execute(
-                """
-                SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
-                       notification_pause_until, session_state, session_state_updated_at
-                FROM devices
-                WHERE refresh_token_hash = ? AND revoked_at IS NULL
-                  AND (refresh_expires_at IS NULL OR refresh_expires_at > ?)
-                """,
-                (token_hash, _dt(now)),
-            ).fetchone()
-            if row is None:
-                return None
-            self._conn.execute(
-                """
-                UPDATE devices
-                SET access_token_hash = ?, access_expires_at = ?, last_seen_at = ?
-                WHERE id = ?
-                """,
-                (sha256_text(access_token), _dt(access_expires_at), _dt(now), row["id"]),
-            )
+            self._conn.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            self._ensure_admin_invariant_locked(now)
+            row = self._conn.execute("SELECT * FROM devices WHERE refresh_token_hash = ?",
+                                     (sha256_text(refresh_token),)).fetchone()
+            error = self._credential_error(row, now)
+            if not error:
+                access_token = new_token("sn_access")
+                refresh_expiry = _parse_dt(row["refresh_expires_at"])
+                access_expiry = self._access_expiry(now, refresh_expiry)
+                self._conn.execute(
+                    "UPDATE devices SET access_token_hash = ?, access_expires_at = ?, last_seen_at = ? WHERE id = ?",
+                    (sha256_text(access_token), _dt(access_expiry), _dt(now), row["id"]),
+                )
+                updated = self._conn.execute("SELECT * FROM devices WHERE id = ?", (row["id"],)).fetchone()
+        if error:
+            if raise_errors:
+                raise AuthenticationError(error)
+            return None
         return AccessTokenResponse(
-            device=self._device_from_row(row, last_seen_at=now),
-            access_token=access_token,
-            access_expires_at=access_expires_at,
+            device=self._device_from_row(updated), access_token=access_token,
+            access_expires_at=access_expiry, refresh_expires_at=refresh_expiry, server_time=now,
         )
 
     def create_notification(
@@ -2422,6 +2504,8 @@ class Storage:
             created_at=_parse_dt(row["created_at"]) or utc_now(),
             last_seen_at=last_seen_at or _parse_dt(row["last_seen_at"]),
             revoked_at=_parse_dt(row["revoked_at"]),
+            access_expires_at=_parse_dt(row["access_expires_at"]),
+            refresh_expires_at=_parse_dt(row["refresh_expires_at"]),
             notifications_enabled=bool(row["notifications_enabled"]),
             notification_pause_until=_parse_dt(row["notification_pause_until"]),
             session_state=DeviceSessionState(row["session_state"] or DeviceSessionState.unknown.value),

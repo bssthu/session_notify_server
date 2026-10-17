@@ -13,6 +13,8 @@ from typing import Annotated, Any, Callable, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 
+from fastapi.responses import JSONResponse
+
 from .hub import WebSocketHub
 from .certs import server_certificate_fingerprint
 from .network import list_local_ipv4_addresses
@@ -50,7 +52,7 @@ from .schemas import (
     utc_now,
 )
 from .hook_policy import is_noise_hook_event
-from .storage import LastAdministratorError, Storage
+from .storage import AuthenticationError, LastAdministratorError, Storage
 from .security import sha256_text
 
 configure_server_logging()
@@ -66,7 +68,7 @@ HOOK_PERMISSION_TTL = timedelta(minutes=int(os.getenv("SESSION_NOTIFY_PERMISSION
 # 会话中断且不会有 PostToolUse),触发按会话批量 acknowledge 兜底清理。
 _HOOK_EVENTS_THAT_FINALIZE_SESSION = frozenset({"stop", "taskcompleted", "stopfailure", "subagentstop"})
 # 设备 token 寿命:access 短期(请求凭证,到期靠客户端自动 refresh)、refresh 长期(仅换新 access,
-# 不轮换)。refresh 到期后需重新绑定。默认 access 2h / refresh 90d。
+# 不轮换)。refresh 到期后等待管理员延期，客户端保留凭据每小时重试。默认 access 2h / refresh 90d。
 ACCESS_TOKEN_TTL = timedelta(seconds=int(os.getenv("SESSION_NOTIFY_ACCESS_TTL_SECONDS", "7200")))
 REFRESH_TOKEN_TTL = timedelta(days=int(os.getenv("SESSION_NOTIFY_REFRESH_TTL_DAYS", "90")))
 # 配对码有效期:已绑设备签发,新设备扫码/输码消费。一次性,默认 5 分钟。
@@ -338,6 +340,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         # reload/轮询立即干净,不必等 24h TTL。幂等:只动 active。
         for event in storage.acknowledge_legacy_noise_notifications():
             await publish(event)
+        storage.enforce_admin_expiry_invariant()
         for event in storage.expire_due_notifications():
             await publish(event)
         expire_task = asyncio.create_task(_expire_due_loop(storage, hub))
@@ -357,43 +360,39 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     app.state.storage = storage
     app.state.hub = hub
 
+    @app.exception_handler(AuthenticationError)
+    async def authentication_error_handler(_request: Request, error: AuthenticationError):
+        return JSONResponse(status_code=401, content={"detail": {
+            "code": error.code, "message": str(error), "server_time": utc_now().isoformat(),
+        }})
+
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
     @app.post("/api/v1/devices/bind", response_model=DeviceBindResponse)
     def bind_device(request: DeviceBindRequest) -> DeviceBindResponse:
-        # Every new device requires a pairing code, including the first device.
-        # A refresh token may rebind an existing device.
-        # easy 模式:bind 永远放行,配对码仅作免填地址的便捷入口。
+        # An explicitly supplied credential always means rebind, even in easy mode.
+        if request.refresh_token is not None:
+            return storage.rebind_device(request.refresh_token, request.name, request.platform, raise_errors=True)
         if pair_mode == "strict":
-            if request.refresh_token:
-                rebound = storage.rebind_device(request.refresh_token, request.name, request.platform)
-                if rebound is not None:
-                    return rebound
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Pairing code required; use POST /api/v1/devices/pair/consume or rebind with refresh_token",
-            )
+            raise HTTPException(status_code=401, detail={
+                "code": "invalid_token", "message": "Pairing code required for a new device",
+                "server_time": utc_now().isoformat(),
+            })
         return storage.bind_device(request.name, request.platform)
 
     @app.post("/api/v1/auth/refresh", response_model=AccessTokenResponse)
     def refresh_access_token(request: TokenRefreshRequest) -> AccessTokenResponse:
-        response = storage.refresh_access_token(request.refresh_token)
-        if response is None:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
-        return response
+        return storage.refresh_access_token(request.refresh_token, raise_errors=True)
 
     def current_device(
         authorization: Annotated[str | None, Header(alias="Authorization")] = None,
     ) -> DevicePublic:
         if not authorization or not authorization.lower().startswith("bearer "):
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
+            raise AuthenticationError("invalid_token")
         token = authorization.split(" ", 1)[1].strip()
-        device = storage.authenticate(token)
-        if device is None:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
-        return device
+        return storage.authenticate(token, raise_errors=True)
 
     @app.post("/api/v1/devices/pair/issue", response_model=PairIssueResponse)
     def issue_pair_code(
@@ -403,11 +402,14 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     ) -> PairIssueResponse:
         try:
             role = payload.role if payload else DeviceRole.member
-            code, expires_at = storage.issue_pair_code(device, role)
+            policy = payload.model_dump(include={"refresh_ttl_days", "refresh_expires_at"}, exclude_unset=True) if payload else {}
+            code, expires_at = storage.issue_pair_code(device, role, **policy)
+        except AuthenticationError:
+            raise
         except PermissionError as error:
             raise HTTPException(status_code=403, detail=str(error)) from None
-        except ValueError:
-            raise HTTPException(status_code=401, detail="Pairing issuer is no longer active") from None
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
         scheme = request.url.scheme or "https"
         port = request.url.port or int(os.getenv("SESSION_NOTIFY_PORT", "8765"))
         candidate_base_urls = [f"{scheme}://{ip}:{port}" for ip in list_local_ipv4_addresses()]
@@ -480,6 +482,8 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             )
         except KeyError:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found") from None
+        except AuthenticationError:
+            raise
         except ValueError as error:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error)) from None
 
@@ -512,30 +516,37 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 notifications_enabled=request.notifications_enabled,
                 role=request.role,
                 actor_id=device.id,
+                **request.model_dump(include={"refresh_ttl_days", "refresh_expires_at"}, exclude_unset=True),
             )
-            if request.role is not None:
-                await hub.reconnect_device(device_id)
+            if request.role is not None or {"refresh_ttl_days", "refresh_expires_at"} & request.model_fields_set:
+                await hub.reconnect_device(device_id, reason="Device authorization changed")
             return updated
+        except AuthenticationError:
+            raise
         except PermissionError as error:
             raise HTTPException(status_code=403, detail=str(error)) from None
         except LastAdministratorError as error:
-            raise HTTPException(status_code=409, detail=str(error)) from None
+            raise HTTPException(status_code=409, detail={"code": error.code, "message": str(error)}) from None
         except KeyError:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found") from None
         except ValueError as error:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error)) from None
 
     @app.delete("/api/v1/devices/{device_id}", response_model=DevicePublic)
-    def revoke_device(
+    async def revoke_device(
         device_id: str,
         device: DevicePublic = Depends(current_device),
     ) -> DevicePublic:
         try:
-            return storage.revoke_device(device_id, actor_id=device.id)
+            revoked = storage.revoke_device(device_id, actor_id=device.id)
+            await hub.reconnect_device(device_id, code=1008, reason="device_revoked")
+            return revoked
+        except AuthenticationError:
+            raise
         except PermissionError as error:
             raise HTTPException(status_code=403, detail=str(error)) from None
         except LastAdministratorError as error:
-            raise HTTPException(status_code=409, detail=str(error)) from None
+            raise HTTPException(status_code=409, detail={"code": error.code, "message": str(error)}) from None
         except KeyError:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found") from None
 
@@ -781,17 +792,19 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         if auth_header and auth_header.lower().startswith("bearer "):
             header_token = auth_header.split(" ", 1)[1].strip()
         access_token = header_token or token or ""
-        device = storage.authenticate(access_token)
-        if device is None:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        try:
+            device = storage.authenticate(access_token, raise_errors=True)
+        except AuthenticationError as error:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=error.code)
             return
         token_hash = sha256_text(access_token)
         authorized = lambda: storage.access_token_is_valid(token_hash)
         await hub.connect(websocket, device.id, authorized)
         try:
             while True:
-                if not authorized():
-                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                error = storage.access_token_error(token_hash)
+                if error:
+                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=error)
                     break
                 try:
                     await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
@@ -812,6 +825,7 @@ async def _expire_due_loop(storage: Storage, hub: WebSocketHub) -> None:
     while True:
         await asyncio.sleep(_EXPIRE_POLL_INTERVAL_SECONDS)
         try:
+            storage.enforce_admin_expiry_invariant()
             for event in storage.expire_due_notifications():
                 await hub.broadcast(
                     event,

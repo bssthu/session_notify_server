@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 SCHEMA_VERSION = 1
@@ -75,14 +75,33 @@ class DevicePublic(BaseModel):
     created_at: datetime
     last_seen_at: datetime | None = None
     revoked_at: datetime | None = None
+    refresh_expires_at: datetime | None = None
+    access_expires_at: datetime | None = None
     notifications_enabled: bool = True
     notification_pause_until: datetime | None = None
     session_state: DeviceSessionState = DeviceSessionState.unknown
     session_state_updated_at: datetime | None = None
 
 
-class DeviceUpdateRequest(BaseModel):
+class RefreshExpiryPolicy(BaseModel):
+    """Omission means default on invitation, unchanged on update; null means permanent."""
     model_config = ConfigDict(extra="forbid")
+    refresh_ttl_days: int | None = Field(default=None, strict=True, ge=1, le=36500)
+    refresh_expires_at: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def exclusive_expiry_policy(self):
+        if {"refresh_ttl_days", "refresh_expires_at"} <= self.model_fields_set:
+            raise ValueError("Supply refresh_ttl_days or refresh_expires_at, never both")
+        return self
+
+    @field_validator("refresh_expires_at")
+    @classmethod
+    def normalize_expiry(cls, value: datetime | None) -> datetime | None:
+        return value.astimezone(timezone.utc) if value is not None else None
+
+
+class DeviceUpdateRequest(RefreshExpiryPolicy):
     name: str | None = Field(default=None, min_length=1, max_length=80)
     notifications_enabled: bool | None = None
     role: DeviceRole | None = None
@@ -125,6 +144,8 @@ class DeviceBindResponse(BaseModel):
     refresh_token: str
     access_token: str
     access_expires_at: datetime | None = None
+    refresh_expires_at: datetime | None = None
+    server_time: datetime = Field(default_factory=utc_now)
     token_type: Literal["bearer"] = "bearer"
 
 
@@ -136,11 +157,12 @@ class AccessTokenResponse(BaseModel):
     device: DevicePublic
     access_token: str
     access_expires_at: datetime | None = None
+    refresh_expires_at: datetime | None = None
+    server_time: datetime = Field(default_factory=utc_now)
     token_type: Literal["bearer"] = "bearer"
 
 
-class PairIssueRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class PairIssueRequest(RefreshExpiryPolicy):
     role: DeviceRole = DeviceRole.member
 
 
