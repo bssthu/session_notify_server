@@ -61,7 +61,7 @@ printf '%s\n' "$*" >> "$TEST_ROOT/https.log"
 case "$*" in
   'compose ps --all -q server') if [[ -f "$TEST_ROOT/wrong-project" ]]; then echo wrong-server; else echo existing-server; fi;;
   'compose ps --all -q public-https') [[ ! -f "$TEST_ROOT/missing-frontend" ]] || exit 0; echo existing-frontend;;
-  'compose pull public-https public-certbot') [[ ! -f "$TEST_ROOT/image-pull-fails" ]];;
+  'compose build --pull public-https') [[ ! -f "$TEST_ROOT/image-pull-fails" ]];;
   'activate') [[ ! -f "$TEST_ROOT/activation-fails" ]];;
 esac
 ''')
@@ -168,7 +168,7 @@ esac
         self.activate_fixture()
         self.invoke("--https")
         commands = self.log("https")
-        self.assertIn("compose pull public-https public-certbot", commands)
+        self.assertIn("compose build --pull public-https", commands)
         self.assertIn("compose up -d --no-deps public-https", commands)
         self.assertIn("activate\n", commands)
         for forbidden in ("issue", "bootstrap", "renew", "systemctl", "443"):

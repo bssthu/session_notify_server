@@ -21,12 +21,9 @@ source "$STATE/config.env"
 HTTPS_PUBLIC_PORT=$((10#$HTTPS_PUBLIC_PORT))
 (( HTTPS_PUBLIC_PORT >= 1 && HTTPS_PUBLIC_PORT <= 65535 && HTTPS_PUBLIC_PORT != 80 )) || fail 'HTTPS_PUBLIC_PORT must be an integer from 1 to 65535, excluding ACME port 80.'
 [[ $HTTPS_ACME_REGISTER_WITHOUT_EMAIL == true || $HTTPS_ACME_REGISTER_WITHOUT_EMAIL == false ]] || fail 'HTTPS_ACME_REGISTER_WITHOUT_EMAIL must be true or false.'
-# Compose interpolation must use this same value, including under sudo/systemd.
-export HTTPS_PUBLIC_PORT
-# Certbot writes bind-mounted state as the operator, so user timers need no sudo.
-HTTPS_ACME_UID=$(id -u)
-HTTPS_ACME_GID=$(id -g)
-export HTTPS_ACME_UID HTTPS_ACME_GID
+# Gateway identity is fixed inside its image/Compose service, never inferred from
+# the SSH operator's effective group (which may have been changed by sg docker).
+export HTTPS_PUBLIC_IP HTTPS_PUBLIC_PORT
 PUBLIC_URL="https://$HTTPS_PUBLIC_IP:$HTTPS_PUBLIC_PORT"
 [[ $HTTPS_PUBLIC_IP =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail 'Configure one public IPv4 address for this deployment.'
 IFS=. read -r -a octets <<< "$HTTPS_PUBLIC_IP"
@@ -150,7 +147,7 @@ issue() {
     else
         extra=(--server "$PRODUCTION")
     fi
-    dc run --rm --no-deps public-certbot certonly --non-interactive --agree-tos \
+    dc exec -T public-https python /opt/gateway/gateway.py certbot certonly --non-interactive --agree-tos \
         "${account[@]}" --webroot --webroot-path /var/www/acme \
         --preferred-challenges http --required-profile shortlived \
         --ip-address "$HTTPS_PUBLIC_IP" --cert-name "$CERT_NAME" "${extra[@]}"
@@ -158,7 +155,7 @@ issue() {
         log 'Staging challenge succeeded; no staging certificate was activated.'
     else
         validate_public
-        log 'Production certificate obtained. Next: activate, external verification, then enable renewal timer.'
+        log 'Production certificate obtained. Next: activate and verify externally. Renewal already runs inside the gateway.'
     fi
 }
 case "${1:-}" in
@@ -170,7 +167,7 @@ case "${1:-}" in
         [[ ! -s "$TMP/listeners" ]] || { cat "$TMP/listeners" >&2; fail "TCP 80 or $HTTPS_PUBLIC_PORT already in use; do not stop the existing service blindly."; }
         install -m 644 deploy/https/bootstrap.conf "$STATE/nginx/default.conf"
         dc config --quiet
-        dc up -d --no-deps public-https
+        dc up -d --build --no-deps public-https
         dc exec -T public-https nginx -t
         log "ACME-only port 80 is ready; HTTPS port $HTTPS_PUBLIC_PORT intentionally has no TLS listener yet."
         ;;
@@ -180,18 +177,7 @@ case "${1:-}" in
     verify) verify_frontend ;;
     renew)
         [[ -f "$LIVE/cert.pem" ]] || fail 'Complete initial production issuance first.'
-        rm -f "$STATE/work/renewed"
-        dc run --rm --no-deps public-certbot renew --non-interactive \
-            --cert-name "$CERT_NAME" --server "$PRODUCTION" --no-random-sleep-on-renew \
-            --deploy-hook 'touch /var/lib/letsencrypt/renewed'
-        validate_public
-        got=$(loaded_fp) || got=''
-        if [[ -f "$STATE/work/renewed" || $got != "$(fp "$LIVE/cert.pem")" ]]; then
-            # Also retries a previously successful renewal whose reload failed.
-            activate
-        else
-            verify_frontend
-        fi
+        dc exec -T public-https python /opt/gateway/gateway.py renew
         ;;
     compose) shift; dc "$@" ;;
     *) fail 'Usage: manage.sh preflight|bootstrap|test-issuance --accept-le-terms|issue --accept-le-terms|activate|verify|renew|compose ...' ;;

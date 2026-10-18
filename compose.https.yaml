@@ -1,32 +1,27 @@
 # Additive overlay: the original server, ports, certificate and database are untouched.
 services:
   public-https:
-    image: nginx:1.30.5-alpine
+    build: ./deploy/https/gateway
+    user: "0:0"
     restart: unless-stopped
+    environment:
+      HTTPS_PUBLIC_IP: "${HTTPS_PUBLIC_IP:?Use deploy/https/manage.sh with the gateway configuration}"
+      HTTPS_PUBLIC_PORT: "${HTTPS_PUBLIC_PORT:-443}"
     ports:
       - "80:80"
       # Host port is exported from runtime/public-https/config.env by manage.sh.
       - "${HTTPS_PUBLIC_PORT:-443}:443"
     volumes:
       - ./runtime/public-https/nginx:/etc/nginx/conf.d:ro
-      - ./runtime/public-https/webroot:/var/www/acme:ro
-      - ./runtime/public-https/acme/live:/etc/letsencrypt/live:ro
-      - ./runtime/public-https/acme/archive:/etc/letsencrypt/archive:ro
+      - ./runtime/public-https/webroot:/var/www/acme
+      - ./runtime/public-https/acme:/etc/letsencrypt
+      - ./runtime/public-https/work:/var/lib/letsencrypt
+      - ./runtime/public-https/logs:/var/log/letsencrypt
       - ./runtime/public-https/upstream:/etc/nginx/upstream:ro
+    # 9080 is internal certificate metadata only, never published on the host.
     # Docker's default project network also contains the existing `server` service.
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-
-  public-certbot:
-    image: certbot/certbot:v5.8.0
-    user: "${HTTPS_ACME_UID:-0}:${HTTPS_ACME_GID:-0}"
-    profiles: [https-tools]
-    volumes:
-      - ./runtime/public-https/acme:/etc/letsencrypt
-      - ./runtime/public-https/webroot:/var/www/acme
-      - ./runtime/public-https/work:/var/lib/letsencrypt
-      - ./runtime/public-https/logs:/var/log/letsencrypt
-    # One-shot only; the host systemd timer schedules renewal. No Docker socket.

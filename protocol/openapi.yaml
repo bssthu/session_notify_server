@@ -7,6 +7,20 @@ servers:
 security:
   - bearerAuth: []
 paths:
+  /api/v1/server/certificates:
+    get:
+      description: 仅管理员可读取。返回后端启动时的证书元数据和 HTTPS 网关实际加载的公网证书，不包含私钥或 ACME 账户。gateway_state 为 unavailable 时不能据此认定此前的证书过期已恢复；客户端按 server_time 判断不足 48 小时并本地提醒。
+      responses:
+        "200":
+          description: 证书有效期和观测状态。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CertificateStatus"
+        "401":
+          $ref: "#/components/responses/AuthenticationRequired"
+        "403":
+          description: 仅管理员可读取证书状态。
   /health:
     get:
       security: []
@@ -412,6 +426,36 @@ components:
       type: http
       scheme: bearer
   schemas:
+    CertificateStatus:
+      type: object
+      required: [server_time, certificates, gateway_state]
+      properties:
+        server_time:
+          type: string
+          format: date-time
+        gateway_state:
+          type: string
+          enum: [available, unavailable, disabled]
+        certificates:
+          type: array
+          items:
+            type: object
+            required: [id, endpoint, fingerprint, not_after, observed_at]
+            properties:
+              id:
+                type: string
+                enum: [backend, public-https]
+              endpoint:
+                type: string
+              fingerprint:
+                type: string
+                description: 整张 DER 证书的 SHA-256，64 位十六进制。
+              not_after:
+                type: string
+                format: date-time
+              observed_at:
+                type: string
+                format: date-time
     AuthenticationErrorResponse:
       type: object
       required: [detail]

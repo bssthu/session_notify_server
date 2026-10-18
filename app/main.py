@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 
 from .hub import WebSocketHub
 from .certs import server_certificate_fingerprint
+from .certificate_status import backend_certificate, certificate_status
 from .network import list_local_ipv4_addresses
 from .logging_setup import configure_server_logging
 from .schemas import (
@@ -301,6 +302,9 @@ def _should_suppress_hook_notification(
 
 
 def create_app(db_path: str | Path | None = None) -> FastAPI:
+    # Snapshot the certificate used when this server process starts. A later file
+    # replacement must not silently advertise a certificate the process did not load.
+    loaded_backend_certificate = backend_certificate()
     pair_mode = os.getenv("SESSION_NOTIFY_PAIR_MODE", "strict").strip().lower()
     if pair_mode not in {"strict", "easy"}:
         raise ValueError("SESSION_NOTIFY_PAIR_MODE must be strict or easy")
@@ -454,6 +458,12 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         if status_info is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pairing code not found")
         return PairStatusResponse(**status_info)
+
+    @app.get("/api/v1/server/certificates")
+    def get_certificate_status(device: DevicePublic = Depends(current_device)) -> dict:
+        if device.role != DeviceRole.admin:
+            raise HTTPException(status_code=403, detail="Only administrators can inspect server certificates")
+        return certificate_status(loaded_backend_certificate)
 
     @app.get("/api/v1/devices", response_model=list[DevicePublic])
     def list_devices(

@@ -83,6 +83,8 @@ Compose 默认使用 HTTPS 监听并发布 8765。在仓库根目录的 `.env` �
 
 Linux 首次部署、日常更新和旧更新脚本迁移见 [部署与更新说明](deploy/README.zh-CN.md)。需要系统受信任证书的调用端，可按 [公网 HTTPS 部署说明](deploy/https/README.zh-CN.md) 增加独立 Nginx/Certbot 入口；对外端口通过 `HTTPS_PUBLIC_PORT` 配置，默认 443，原客户端保留已有后端地址和原证书指纹。
 
+公网 HTTPS 网关内置续期进程，首次签发和续期使用固定容器身份，无需额外 systemd timer；CA 限流截止时间跨容器重启保留。失败只写网关日志。管理员客户端通过 `GET /api/v1/server/certificates` 检查网关实际加载证书及后端证书的有效期，严格不足 48 小时或已过期时显示本地 WARNING；接口对普通设备和游客返回 403。
+
 ## 刷新令牌有效期与恢复
 
 - 首台管理员永久有效；其他新绑定默认 90 天。管理员签发配对码或修改设备时可选择 `refresh_ttl_days`（1–36500 天）或带时区的 `refresh_expires_at`，二者不能同时提供；任意字段显式 `null` 表示永久。邀请省略则默认，PATCH 省略则不变。相对邀请期限从成功绑定时计算；绝对日期已到期的码不能消费。

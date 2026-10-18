@@ -11,6 +11,9 @@ TEST_INPUTS = (
     "deploy/https/manage.sh",
     "deploy/https/bootstrap.conf",
     "deploy/https/https.conf.template",
+    "deploy/https/gateway/Dockerfile",
+    "deploy/https/gateway/gateway.py",
+    "deploy/https/gateway/certbot_runner.py",
 )
 
 

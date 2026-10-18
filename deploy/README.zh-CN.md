@@ -6,13 +6,12 @@
 
 | 内容 | 位置 | Git 管理 |
 | --- | --- | --- |
-| 通用脚本、配置样例、systemd 模板 | `deploy/` | 是 |
+| 通用脚本、配置样例、HTTPS 网关镜像与续期进程 | `deploy/` | 是 |
 | 基础服务及可选 HTTPS 服务定义 | `compose.yaml`、`compose.https.yaml` | 是 |
 | 本机更新参数 | `runtime/deploy/update.env` | 否 |
 | Compose 后端端口与项目插值参数 | 根目录 `.env` | 否 |
 | HTTPS 参数、证书、ACME 账户、生成配置 | `runtime/public-https/` | 否 |
 | 已有后端证书及私钥 | `runtime/secrets/` | 否 |
-| 安装后的定时器 | 系统或用户 systemd 目录 | 否 |
 | 部署测试和测试依赖 | `tests/deploy/` | 是 |
 
 机器参数只填写在样例的运行副本中，不修改仓库里的样例。运行目录包含凭据，需要限制权限并纳入自己的备份方案；Git 和 Docker 构建上下文都排除它。`compose.override.yaml` 也被忽略，可用于基础 Compose 的本机覆盖。HTTPS 管理脚本显式合并两个仓库 Compose 文件；它不会自动加载此 override，若自定义网络、卷或后端端口，须先审查与 HTTPS 入口的兼容性。
@@ -74,9 +73,9 @@ install -m 600 deploy/update.env.example runtime/deploy/update.env
 bash deploy/update-server.sh --https
 ```
 
-此选项先确认两套配置指向同一个已有后端和前门，再拉取 HTTPS 镜像、更新后端、重建前门以应用镜像/端口变化，并重新生成 Nginx 配置、校验和 reload。公网端口来自 `runtime/public-https/config.env`。它不会执行首次签发、接受 CA 条款或安装定时器。还需从外部网络检查实际 HTTPS 地址。
+此选项先确认两套配置指向同一个已有后端和网关，再构建 HTTPS 网关镜像、更新后端、重建网关以应用镜像/端口变化，并重新生成 Nginx 配置、校验和 reload。公网端口来自 `runtime/public-https/config.env`。续期进程随网关运行，无需额外安装定时器；此更新步骤不会执行首次签发或接受 CA 条款。还需从外部网络检查实际 HTTPS 地址。
 
-不传 `--https` 只更新应用；已部署的前门和续期定时器继续独立运行。service/timer 模板改变后，应按 HTTPS 文档重新生成、安装并重新加载，Git 更新不会修改已安装的 unit。
+不传 `--https` 只更新应用，已有网关继续管理续期。由旧定时器方案升级时，按 HTTPS 文档停用原 timer/service 后重建网关，保留原 ACME 状态与证书。
 
 已手动拉取并审阅代码，或有意使用 detached HEAD 时：
 
@@ -86,7 +85,7 @@ bash deploy/update-server.sh --no-pull
 bash deploy/update-server.sh --no-pull --https
 ```
 
-`--no-pull` 只跳过 Git 拉取；应用镜像构建仍可能下载基础镜像及 Python 依赖，`--https` 还会显式拉取 Nginx/Certbot 镜像。它不保证完全离线更新；隔离网络部署需预先准备所需镜像和构建依赖。
+`--no-pull` 只跳过 Git 拉取；应用镜像构建仍可能下载基础镜像及 Python 依赖，`--https` 还会拉取网关基础镜像并安装固定版本 Certbot。它不保证完全离线更新；隔离网络部署需预先准备所需镜像和构建依赖。
 
 失败后根据退出信息检查 `docker compose ps server` 和本机日志。回滚前确认旧代码与现有数据库兼容并保留备份；切到经过审核的旧版本后使用 `--no-pull` 重建。如果旧版本没有此脚本，使用该版本的 Compose 部署说明。不要使用 `down -v` 或重新生成证书来解决更新失败。
 

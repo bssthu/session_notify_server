@@ -15,7 +15,7 @@ for argument in "$@"; do
             printf '%s\n' 'Usage: bash deploy/update-server.sh [--no-pull] [--https]' \
                 'Default: fast-forward the current branch, rebuild server, verify backend TLS/health.' \
                 '--no-pull: rebuild the current clean checkout without fetching (also allows detached HEAD).' \
-                '--https: also update an already activated HTTPS entry point; never issue certificates or install timers.'
+                '--https: also build/update the HTTPS gateway with its managed renewal process; never perform initial issuance.'
             exit 0 ;;
         *) fail "Unknown argument: $argument" ;;
     esac
@@ -84,7 +84,7 @@ log "Deploying $(git rev-parse --short HEAD)."
 dc config --quiet
 if $update_https; then
     https compose config --quiet
-    https compose pull public-https public-certbot
+    https compose build --pull public-https
 fi
 dc up -d --build server
 healthy=false

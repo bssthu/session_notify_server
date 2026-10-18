@@ -7,6 +7,7 @@ services:
       SESSION_NOTIFY_DB: /data/session_notify.db
       SESSION_NOTIFY_CERT_FILE: /run/secrets/server.crt
       SESSION_NOTIFY_KEY_FILE: /run/secrets/server.key
+      SESSION_NOTIFY_GATEWAY_STATUS_URL: "${SESSION_NOTIFY_GATEWAY_STATUS_URL:-http://public-https:9080/status}"
     volumes:
       - session_notify_data:/data
       - ./runtime/secrets:/run/secrets:ro
