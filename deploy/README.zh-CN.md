@@ -9,7 +9,7 @@
 | 通用脚本、配置样例、HTTPS 网关镜像与续期进程 | `deploy/` | 是 |
 | 基础服务及可选 HTTPS 服务定义 | `compose.yaml`、`compose.https.yaml` | 是 |
 | 本机更新参数 | `runtime/deploy/update.env` | 否 |
-| Compose 后端端口与项目插值参数 | 根目录 `.env` | 否 |
+| Compose 后端端口、发布限额与项目插值参数 | 根目录 `.env` | 否 |
 | HTTPS 参数、证书、ACME 账户、生成配置 | `runtime/public-https/` | 否 |
 | 已有后端证书及私钥 | `runtime/secrets/` | 否 |
 | 部署测试和测试依赖 | `tests/deploy/` | 是 |
@@ -46,6 +46,12 @@ SESSION_NOTIFY_HOST_PORT=19876
 本例容器内 uvicorn 监听 `9876`，宿主机发布 `19876`；省略 `SESSION_NOTIFY_HOST_PORT` 时跟随容器端口，两者均省略时继续使用 `8765`。HTTPS 预检连接 `127.0.0.1:19876`，Nginx 访问 `server:9876`，更新脚本的默认健康检查自动使用宿主机端口。端口须为 1–65535 内的整数，并保持一个 IPv4 回环可访问的 TCP 发布端口。`HTTPS_PUBLIC_PORT` 独立配置公网入口，不会改变后端端口。
 
 修改前保留原 `.env`，确认防火墙及客户端地址同步调整；端口更改须重建后端容器，不能仅 reload Nginx。先检查 `docker compose config --quiet`，再按下节更新；已有公网 HTTPS 入口时使用 `--https` 同时重新生成 Nginx 上游配置。此前若在 `runtime/deploy/update.env` 显式固定了 `UPDATE_HEALTH_URL`，应同步修改，或置空以启用自动读取。
+
+## 配置发布限额
+
+根目录 `.env` 中可设置 `SESSION_NOTIFY_PUBLISH_PER_MINUTE=600` 和 `SESSION_NOTIFY_PUBLISH_BYTES_PER_DAY=67108864`，分别是每台认证设备的分钟请求数和 UTC 日载荷字节预算，必须为正整数。这两个变量已由基础 Compose 显式传入容器；不要写到 HTTPS 的 `config.env` 或更新脚本的 `update.env` 中。
+
+修改后用 `docker compose config --quiet` 检查，再运行 `docker compose up -d server` 重新创建后端容器；若同时更新代码，使用下节的更新脚本。容器重建或更换 access token 不清空 SQLite 中的现有计数。请求体 256 KiB、metadata / Hook 输入 64 KiB 及结构限制是应用固定约束，不由这两个额度变量调整。错误码、重试和计数规则见[主 README](../README.md#通知输入与发布限额)。
 
 ## 更新现有部署
 

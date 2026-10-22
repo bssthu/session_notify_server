@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: Session Notify API
   version: 0.1.0
-  description: POST / PUT / PATCH / DELETE 请求体上限 256 KiB，读取期限 15 秒；限制在应用层生效，直连后端同样受限。
+  description: POST / PUT / PATCH / DELETE 请求体上限 256 KiB，应用读取期限 15 秒（超时返回 408）；限制在应用层生效，直连后端同样受限。前置网关可能先返回自身的错误格式。
 servers:
   - url: https://localhost:8765
 security:
@@ -226,7 +226,7 @@ paths:
                 items:
                   $ref: "#/components/schemas/Notification"
     post:
-      description: 与 Hook 共享每设备发布额度，默认每个 UTC 分钟 600 次、每个 UTC 日 64 MiB 模型 JSON 载荷。重试同样计入；查询与确认不受此发布额度影响。
+      description: 与 Hook 共享每设备发布额度，默认每个 UTC 自然分钟 600 次、每个 UTC 日 64 MiB 模型 JSON 载荷。通过入口校验、鉴权及额度检查的重试同样计入，后续业务失败不退还；额度拒绝的请求不增加计数。查询与确认不受此发布额度影响。
       requestBody:
         required: true
         content:
@@ -240,6 +240,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Notification"
+        "408":
+          $ref: "#/components/responses/RequestBodyTimeout"
         "413":
           $ref: "#/components/responses/RequestTooLarge"
         "422":
@@ -380,7 +382,7 @@ paths:
                 $ref: "#/components/schemas/EventsResponse"
   /api/v1/hooks/{source}:
     post:
-      description: 与通知发布共享每设备额度，默认每个 UTC 分钟 600 次、每个 UTC 日 64 MiB 模型 JSON 载荷。重试和被策略抑制的事件同样计入；额度可由管理员配置。
+      description: 与通知发布共享每设备额度，默认每个 UTC 自然分钟 600 次、每个 UTC 日 64 MiB 模型 JSON 载荷。通过入口校验、鉴权及额度检查的重试和被策略抑制的事件同样计入，后续业务失败不退还；额度拒绝的请求不增加计数。额度可由管理员配置。
       parameters:
         - name: source
           in: path
@@ -402,6 +404,8 @@ paths:
                 oneOf:
                   - $ref: "#/components/schemas/Notification"
                   - type: "null"
+        "408":
+          $ref: "#/components/responses/RequestBodyTimeout"
         "413":
           $ref: "#/components/responses/RequestTooLarge"
         "422":
@@ -428,12 +432,30 @@ paths:
           description: 升级为 WebSocket；消息格式见 ws-events.schema.json。
 components:
   responses:
+    RequestBodyTimeout:
+      description: 应用读取请求体超过 15 秒，detail 为字符串 Request body timed out。
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [detail]
+            properties:
+              detail:
+                type: string
     RequestTooLarge:
       description: 请求体超过 262144 字节，detail.code 为 request_too_large；缩小载荷后重试。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/PublicationErrorResponse"
     InvalidPublication:
-      description: 字段类型、metadata 或完整 Hook 输入不满足大小 / 深度 / 总值数约束；修正载荷后重试。
+      description: 字段类型、metadata 或完整 Hook 输入不满足大小 / 深度 / 总值数约束；修正载荷后重试。入口模型校验返回 detail 数组，生成或合并 metadata 的校验返回 detail 对象（code 为 invalid_metadata），调用端须兼容两种格式。
     PublicationLimit:
       description: 每设备发布额度耗尽。detail.code 为 publish_rate_limited 或 publish_daily_quota；计数跨重启和多进程保持。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/PublicationErrorResponse"
       headers:
         Retry-After:
           description: 距对应 UTC 分钟或 UTC 日窗口结束的秒数。
@@ -453,6 +475,19 @@ components:
       type: http
       scheme: bearer
   schemas:
+    PublicationErrorResponse:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [request_too_large, invalid_metadata, publish_rate_limited, publish_daily_quota]
+            message:
+              type: string
     CertificateStatus:
       type: object
       required: [server_time, certificates, gateway_state]
@@ -628,6 +663,7 @@ components:
       properties:
         refresh_token:
           type: string
+          minLength: 1
     AccessTokenResponse:
       type: object
       required: [device, access_token, token_type, access_expires_at, refresh_expires_at, server_time]
@@ -716,6 +752,8 @@ components:
       properties:
         code:
           type: string
+          minLength: 1
+          maxLength: 40
         name:
           type: string
           minLength: 1
@@ -776,12 +814,20 @@ components:
       properties:
         source:
           type: string
+          minLength: 1
+          maxLength: 40
         session_id:
           type: string
+          minLength: 1
+          maxLength: 120
         title:
           type: string
+          minLength: 1
+          maxLength: 120
         body:
           type: string
+          minLength: 1
+          maxLength: 2000
         level:
           $ref: "#/components/schemas/NotificationLevel"
         expires_at:
@@ -907,6 +953,8 @@ components:
       properties:
         reason:
           type: string
+          minLength: 1
+          maxLength: 80
           default: user_confirmed
     AckResponse:
       type: object
@@ -1068,8 +1116,7 @@ components:
           properties:
             tag:
               type: string
-              maxLength: 120
-              description: 可选任务标签。Windows Hook Bridge 从 SESSION_NOTIFY_TAG 写入。
+              description: 可选任务标签。Windows Hook Bridge 从 SESSION_NOTIFY_TAG 写入并限制长度；API 对 metadata 执行整体预算和控制字段标量校验。
             privacy_tag:
               type: string
               enum: [hide, local]

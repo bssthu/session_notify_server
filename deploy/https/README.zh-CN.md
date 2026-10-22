@@ -9,6 +9,8 @@ HTTPS 网关把 Nginx、Certbot、续期调度、重试和 reload 放在同一�
 
 HTTPS overlay 不创建第二个后端或数据库，不挂载 Docker socket，也不挂载原后端私钥。网关 master 与 Certbot 固定使用容器 UID:GID `0:0`，Nginx worker 保持非 root；首次签发和续期身份相同，并能继承旧证书文件的组权限。宿主机操作者的 `id -g` 或 `sg docker` 不再决定 Certbot 身份。证书、ACME 账户、重试状态均保留在 `runtime/public-https/`，不得加入 Git 或公开分享。
 
+网关模板的请求体上限为 10 MiB，但转发到应用后仍受更严格的 256 KiB 请求体及 metadata / Hook 输入约束；调高 Nginx 上限不能放宽应用限制。通知发布的 `429` 是设备发布额度，与下文 ACME 证书签发限流分开处理，见[应用限额说明](../../README.md#通知输入与发布限额)。
+
 目标是 Linux Docker Compose v2；宿主机需 Bash、OpenSSL、curl、flock、timeout、ss、Python 3 和公有根证书包。网关镜像从固定 `nginx:1.30.5-alpine` 构建并安装 `certbot==5.8.0`，首次构建需要相应镜像仓库和 Python 包源。升级前应审查依赖并记录镜像 digest。
 
 ## 1. 准备

@@ -2,11 +2,13 @@
 
 基于 FastAPI 与 SQLite，将 Codex、Claude Code、Cursor、Devin、DeepSeek Harness 等工具的通知同步到多台设备。服务端是协议定义、设备权限、通知状态及事件关联的源头；客户端文档见 [Windows](../session_notify_windows/README.md) 和 [Android](../session_notify_android/README.md)。
 
-本文按 2026-10-12 的仓库实现核对。需要 Python 3.11 或以上版本和 uv；应用依赖版本由 `uv.lock` 锁定。
+本文按 2026-10-23 的仓库实现静态核对。需要 Python 3.11 或以上版本和 uv；应用依赖版本由 `uv.lock` 锁定。
 
 ## 升级兼容性
 
 Codex 异步提问回答兼容旧版引用文本和 Hook bundle 15 的新版结构化格式。新版 `answered_batch` 使用调用 ID、题目序号及完整题目指纹关联，支持选项、自由输入、逐题和批量回答；一组题目全部回答后才同步确认通知。回答正文不上传，断网补发和服务端重启保留关联状态。部署时先更新服务端，再更新 Windows 客户端并执行 Hook「安装 / 更新」；旧版客户端和旧数据库继续兼容。
+
+当前 Windows Hook bundle 为 **18**；文中 15、16 等数字表示功能引入版本。通知输入与发布限额由服务端执行，旧客户端同样可能收到 `413` / `422` / `429`。客户端升级后才具有旧 metadata 容错和可信“本机”标记处理；Android 需连同 Windows 共享 Web 资源重新构建。详见[输入与发布限额](#通知输入与发布限额)。
 
 ## 本地运行
 
@@ -25,6 +27,8 @@ uv run uvicorn app.main:app --reload --port 8765 --log-config logging.json
 ```
 
 Windows 桌面端首次 HTTPS 连接可自动固定证书指纹（TOFU），也可以预先填写证书脚本输出的 SHA-256 指纹。首台设备仍需按下节使用初始化配对码；绑定成功后，桌面端才能通过「绑定新设备」生成二维码。Android 扫码会填入地址、指纹和配对码，再点「连接 / 绑定」完成配对。
+
+核对已有后端证书时，在服务器上只读运行 `openssl x509 -in runtime/secrets/server.crt -noout -fingerprint -sha256`，通过可信渠道将结果与客户端显示的实际 SHA-256 指纹比较；自定义证书路径须对应实际监听入口。Windows 的操作位置见[人工核对说明](../session_notify_windows/README.md#首次连接与更新)。无需重新生成证书。
 
 二维码中的协议取自服务端请求，Android 只接受 HTTPS。手机应选用可达的局域网地址；`127.0.0.1` 仅供服务端本机使用，`10.0.2.2` 仅供 Android Emulator 访问宿主机。局域网设备连接时，服务端需监听 `0.0.0.0` 或对应网卡，并在防火墙放行 8765 入站。
 
@@ -105,6 +109,7 @@ Linux 首次部署、日常更新和旧更新脚本迁移见 [部署与更新说
 | `SESSION_NOTIFY_HOST_PORT` | 跟随 `SESSION_NOTIFY_PORT` | Compose 宿主机发布端口 |
 | `SESSION_NOTIFY_PAIR_MODE` | `strict` | 新设备配对门禁 |
 | `SESSION_NOTIFY_CERT_FILE` | `runtime/secrets/server.crt` | 配对二维码所需的服务端证书指纹来源 |
+| `SESSION_NOTIFY_GATEWAY_STATUS_URL` | 空；Compose 默认 `http://public-https:9080/status` | 网关实际加载证书的内部状态地址；空值禁用网关查询，不影响后端证书查询 |
 | `SESSION_NOTIFY_ACCESS_TTL_SECONDS` | `7200` | 访问令牌有效秒数，默认 2 小时 |
 | `SESSION_NOTIFY_REFRESH_TTL_DAYS` | `90` | 默认新设备刷新令牌有效天数（管理员可覆盖） |
 | `SESSION_NOTIFY_PAIR_CODE_TTL_SECONDS` | `300` | 已绑定设备签发的配对码有效秒数；本地初始化脚本使用默认五分钟 |
@@ -112,7 +117,7 @@ Linux 首次部署、日常更新和旧更新脚本迁移见 [部署与更新说
 | `SESSION_NOTIFY_PERMISSION_TTL_MINUTES` | `30` | 普通工具权限审批通知有效分钟数 |
 | `SESSION_NOTIFY_DEVICE_PRESENCE_TTL_SECONDS` | `90` | Windows 在线状态有效秒数 |
 | `SESSION_NOTIFY_EXPIRE_POLL_SECONDS` | `60` | 后台清理到期通知并广播过期事件的检查间隔 |
-| `SESSION_NOTIFY_PUBLISH_PER_MINUTE` | `600` | 每台认证设备每分钟最多接收的通知 / Hook 请求数，正整数 |
+| `SESSION_NOTIFY_PUBLISH_PER_MINUTE` | `600` | 每台认证设备每分钟允许发布的通知 / Hook 请求数，正整数 |
 | `SESSION_NOTIFY_PUBLISH_BYTES_PER_DAY` | `67108864` | 每台认证设备每日通知 / Hook 载荷预算，默认 64 MiB，正整数 |
 
 直接启动时，监听地址和端口由 `run_dev_server.ps1 -HostAddress ... -Port ...` 或 uvicorn 参数决定；`SESSION_NOTIFY_HOST` 不被应用读取，`SESSION_NOTIFY_PORT` 不替代这些启动参数。Compose 则通过上述端口变量配置 uvicorn 和端口映射。若通过 `-CertFile` 指定其他证书，还需把 `SESSION_NOTIFY_CERT_FILE` 指向同一文件，保证二维码指纹一致。
@@ -123,9 +128,11 @@ Linux / macOS 的脚本入口是 `scripts/generate_self_signed_cert.sh` 和 `scr
 
 ## 通知输入与发布限额
 
-应用自身限制 POST / PUT / PATCH / DELETE 请求体为 **256 KiB**，超过返回 `413 / request_too_large`；读取请求体最多等待 15 秒。直连 Uvicorn 和经网关访问均生效。通知 `metadata` 和完整 Hook 输入（包含额外字段）各自按紧凑 JSON 的 UTF-8 编码限制为 **64 KiB**、嵌套深度 **8**、总值数 **4096**；Hook 生成或去重合并后的 metadata 也会检查。超出或类型不符返回 `422`。`kind`、标签、事件名称、工具名称等控制字段只接受标量，`tool_input` 等结构化字段仍可使用对象和数组。
+应用自身限制 POST / PUT / PATCH / DELETE 请求体为 **256 KiB**，超过返回 `413 / request_too_large`；应用读取请求体最多等待 15 秒，超时返回 `408`。直连 Uvicorn 和经网关访问均生效。通知 `metadata` 和完整 Hook 输入（包含额外字段）各自按紧凑 JSON 的 UTF-8 编码限制为 **64 KiB**、嵌套深度 **8**（根为 0）、总值数 **4096**（包含根、容器和叶值，不另计对象键）；Hook 生成或去重合并后的 metadata 也会检查。超出或类型不符返回 `422`。`kind`、标签、事件名称、工具名称等控制字段（含 `raw` 内同名字段）只接受字符串、数字、布尔值或 null，`tool_input` 等结构化字段仍可使用对象和数组。
 
-两个发布端点共享每设备限额，适用于所有角色，按 UTC 自然分钟 / 自然日计数；字节数以通过模型校验后的完整 JSON 为准。重试和被通知策略抑制的 Hook 也计入额度。计数存于 SQLite，重启和多进程不会重置。超过请求数返回 `429 / publish_rate_limited`，超过日字节预算返回 `429 / publish_daily_quota`，`Retry-After` 表示距相应窗口结束的秒数。调用端应延迟重试；查询和确认通知不受发布额度影响。上述两个环境变量可通过 Compose `.env` 调整，修改后需重建容器。
+`POST /api/v1/notifications` 和 `POST /api/v1/hooks/{source}` 共享每设备限额，适用于所有角色，按 UTC 自然分钟 / 自然日计数；字节数以通过模型校验后的完整 JSON 为准。通过入口校验、鉴权和额度检查的重试、重复投递及被通知策略抑制的 Hook 也计入；后续业务处理失败不退还额度。入口拒绝的 `413` / `422` 以及额度拒绝的 `429` 不增加计数。计数存于 SQLite，重启和共享同一数据库的多进程不会重置。超过请求数返回 `429 / publish_rate_limited`，超过日字节预算返回 `429 / publish_daily_quota`，`Retry-After` 表示距相应窗口结束的秒数。调用端应延迟重试；查询和确认通知不受发布额度影响。上述两个环境变量可通过 Compose `.env` 调整，修改后需重新创建后端容器，见[部署配置](deploy/README.zh-CN.md#配置发布限额)。
+
+错误响应并非统一格式：应用的 `413`、`429` 及生成/合并 metadata 的 `422` 使用 `detail: {code, message}`；入口模型校验的 `422` 使用 FastAPI 的 `detail` 数组。应用的 `408` 使用字符串 `detail`；前置网关先拒绝请求时也可能返回其他格式。调用端应先按 HTTP 状态分类，不要假设每次都存在 `detail.code`。`413` / `422` 需修正载荷后再投递，持续重发相同内容不会解决。当前 Bridge 与 Codex 失败队列的重试策略不同，见[Bridge 说明](../session_notify_windows/hook_bridge/README.md#输入拒绝与限流处理)。
 
 限额用于控制写入速率，不是数据库总容量上限，也不会删除历史记录。磁盘仍需按保留需求管理。服务端会从新通知及旧记录的下发副本移除 `local_only`、`countdown_local`、`alarm_local`、`controllable`、`alarm_preview` 等仅供客户端本机使用的标记（包括 camelCase 形式）；本机来源由服务端认证的 `origin_device_id` 或客户端自身创建的本地通知决定。
 
@@ -158,7 +165,7 @@ uv run pytest
 - 幂等确认：任一设备确认后，通知状态以服务端为准。
 - Codex / Claude Code / Cursor / Devin / DeepSeek Harness Hook 载荷到统一通知的基础映射。
 - `SESSION_NOTIFY_TAG` 作为 `metadata.tag` 随通知保存，供客户端展示和历史筛选。
-- `SESSION_NOTIFY_PRIVACY_TAG`：`hide` 时所有设备下发的正文替换为 `***`；`local` 时仅来源设备看到明文。正文不可见时，元数据仅保留展示与关联控制字段，移除原始载荷、工具输入和自由文本诊断。服务端存储保持明文；不可见的正文不会进入历史关键词搜索。当前 Windows Hook bundle 15 已包含此能力。
+- `SESSION_NOTIFY_PRIVACY_TAG`：`hide` 时所有设备下发的正文替换为 `***`；`local` 时仅来源设备看到明文。正文不可见时，元数据仅保留展示与关联控制字段，移除原始载荷、工具输入和自由文本诊断。服务端存储保持明文；不可见的正文不会进入历史关键词搜索。Windows Hook 自 bundle 11 支持此能力。
 - Codex 异步提问按来源设备、会话和完整题目指纹匹配回答，支持跨回合、逐题回答、重复投递和乱序补发；全部回答后持久确认并广播 `notification.acknowledged`。同题歧义时保留；迟到题目使原匹配产生歧义时，撤销未过期通知的自动确认，并通过原 ID 的 `notification.created` 更新两端，手动确认始终保留。Stop 和启动清理不消除未回答的异步问题。旧版引用回答按完整题目指纹唯一匹配；Hook bundle 15 的结构化回答进一步校验调用 ID 与题目序号，错误 ID 不回退为文本猜测。应先更新服务端，再更新 Hook。
 - SQLite + WAL 本地存储。
 - 自签名证书生成脚本和 Docker Compose 部署骨架。
