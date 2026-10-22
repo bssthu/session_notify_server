@@ -8,6 +8,8 @@ services:
       SESSION_NOTIFY_CERT_FILE: /run/secrets/server.crt
       SESSION_NOTIFY_KEY_FILE: /run/secrets/server.key
       SESSION_NOTIFY_GATEWAY_STATUS_URL: "${SESSION_NOTIFY_GATEWAY_STATUS_URL:-http://public-https:9080/status}"
+      SESSION_NOTIFY_PUBLISH_PER_MINUTE: "${SESSION_NOTIFY_PUBLISH_PER_MINUTE:-600}"
+      SESSION_NOTIFY_PUBLISH_BYTES_PER_DAY: "${SESSION_NOTIFY_PUBLISH_BYTES_PER_DAY:-67108864}"
     volumes:
       - session_notify_data:/data
       - ./runtime/secrets:/run/secrets:ro

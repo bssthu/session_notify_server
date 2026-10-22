@@ -6,6 +6,7 @@ from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
+from .payload_limits import validate_json_budget, validate_metadata
 
 
 SCHEMA_VERSION = 1
@@ -203,6 +204,11 @@ class NotificationCreate(BaseModel):
     requires_ack: bool = True
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("metadata")
+    @classmethod
+    def bounded_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return validate_metadata(value)
+
     @field_validator("expires_at")
     @classmethod
     def ensure_timezone(cls, value: datetime | None) -> datetime | None:
@@ -324,6 +330,18 @@ class CodexAsyncQuestionsAnswered(BaseModel):
 
 class HookPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
+
+    @model_validator(mode="before")
+    @classmethod
+    def bounded_payload(cls, value):
+        # Extras and raw/tool_input must fit too, not just the metadata property.
+        validate_json_budget(value)
+        return value
+
+    @field_validator("metadata")
+    @classmethod
+    def bounded_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return validate_metadata(value)
 
     event_type: str | None = None
     hook_event_name: str | None = None

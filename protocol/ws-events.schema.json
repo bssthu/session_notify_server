@@ -67,6 +67,7 @@
         "requires_ack": { "type": "boolean" },
         "metadata": {
           "type": "object",
+          "description": "有界通知元数据。网络下发移除 local_only、countdown_local、alarm_local、controllable、alarm_preview 及其 camelCase 形式；本机来源依据服务端认证的 origin_device_id。",
           "properties": {
             "body_generated": {
               "type": "boolean",

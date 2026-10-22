@@ -9,6 +9,7 @@ import json
 from typing import Any
 
 from .schemas import NotificationPublic, SyncEvent
+from .payload_limits import without_local_metadata
 
 PRIVACY_HIDDEN_BODY = "***"
 PRIVACY_HIDE = "hide"
@@ -141,6 +142,10 @@ def redact_notification_for_device(
     notification: NotificationPublic,
     device_id: str | None,
 ) -> NotificationPublic:
+    # Also clean older persisted records without rewriting notification history.
+    metadata = without_local_metadata(notification.metadata)
+    if metadata != notification.metadata:
+        notification = notification.model_copy(update={"metadata": metadata})
     if body_visible_to_device(
         notification.metadata,
         notification.origin_device_id,

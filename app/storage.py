@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import secrets
 import sqlite3
 import threading
@@ -43,6 +44,13 @@ from .privacy import (
     sqlite_body_visible_to_device,
 )
 from .security import new_token, sha256_text
+from .payload_limits import validate_metadata
+
+
+class PublishLimitError(ValueError):
+    def __init__(self, code: str, retry_after: int):
+        self.code, self.retry_after = code, max(1, retry_after)
+        super().__init__("Device publication limit reached; retry after the indicated delay")
 
 
 class LastAdministratorError(ValueError):
@@ -416,6 +424,10 @@ class Storage:
         self.refresh_ttl = refresh_ttl
         # 配对码有效期:已绑设备签发,新设备消费后绑定。一次性,过期失效。
         self.pair_code_ttl = pair_code_ttl
+        self.publish_per_minute = int(os.getenv("SESSION_NOTIFY_PUBLISH_PER_MINUTE", "600"))
+        self.publish_bytes_per_day = int(os.getenv("SESSION_NOTIFY_PUBLISH_BYTES_PER_DAY", str(64 * 1024 * 1024)))
+        if min(self.publish_per_minute, self.publish_bytes_per_day) <= 0:
+            raise ValueError("Publication limits must be positive")
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(
             str(self.db_path),
@@ -448,6 +460,30 @@ class Storage:
     def close(self) -> None:
         self._conn.close()
 
+    def admit_publication(self, device_id: str, payload_bytes: int) -> None:
+        """Persistent per-device admission, shared across workers and restarts.
+
+        All publish/hook requests count, including retries and suppressed signals.
+        No history is deleted when the budget is exhausted; reads/acks still work.
+        """
+        timestamp = int(utc_now().timestamp())
+        minute, day = timestamp // 60, timestamp // 86400
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute("SELECT * FROM publication_usage WHERE device_id = ?", (device_id,)).fetchone()
+            count = row["minute_count"] if row and row["minute"] == minute else 0
+            size = row["day_bytes"] if row and row["day"] == day else 0
+            if count >= self.publish_per_minute:
+                raise PublishLimitError("publish_rate_limited", 60 - timestamp % 60)
+            if size + payload_bytes > self.publish_bytes_per_day:
+                raise PublishLimitError("publish_daily_quota", 86400 - timestamp % 86400)
+            self._conn.execute(
+                "INSERT INTO publication_usage VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(device_id) DO UPDATE SET minute=excluded.minute, minute_count=excluded.minute_count, "
+                "day=excluded.day, day_bytes=excluded.day_bytes",
+                (device_id, minute, count + 1, day, size + payload_bytes),
+            )
+
     def _init_schema(self) -> None:
         with self._conn:
             self._conn.executescript(
@@ -479,6 +515,14 @@ class Storage:
                     expires_at TEXT NOT NULL,
                     consumed_at TEXT,
                     consumed_device_id TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS publication_usage (
+                    device_id TEXT PRIMARY KEY REFERENCES devices(id),
+                    minute INTEGER NOT NULL,
+                    minute_count INTEGER NOT NULL,
+                    day INTEGER NOT NULL,
+                    day_bytes INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS notifications (
@@ -1445,7 +1489,7 @@ class Storage:
                 "body": preferred.body,
                 "level": preferred.level,
                 "updated_at": updated_at,
-                "metadata": merged_metadata,
+                "metadata": validate_metadata(merged_metadata),
             }
         )
         self._conn.execute(
@@ -1507,6 +1551,7 @@ class Storage:
             merged["ingest_sources"] = sorted(sources)
         if "app_server" in sources and "hook_bridge" in sources:
             merged["event_correlation"] = "remote_correlated"
+        merged = validate_metadata(merged)
         if merged != existing.metadata:
             now = utc_now()
             self._conn.execute(

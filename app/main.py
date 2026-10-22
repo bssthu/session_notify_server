@@ -53,8 +53,9 @@ from .schemas import (
     utc_now,
 )
 from .hook_policy import is_noise_hook_event
-from .storage import AuthenticationError, LastAdministratorError, Storage
+from .storage import AuthenticationError, LastAdministratorError, PublishLimitError, Storage
 from .security import sha256_text
+from .payload_limits import PayloadValidationError, RequestBodyLimitMiddleware, validate_metadata
 
 configure_server_logging()
 
@@ -361,8 +362,18 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             storage.close()
 
     app = FastAPI(title="Session Notify", version="0.1.0", lifespan=lifespan)
+    app.add_middleware(RequestBodyLimitMiddleware)
     app.state.storage = storage
     app.state.hub = hub
+
+    @app.exception_handler(PayloadValidationError)
+    async def payload_validation_handler(_request: Request, error: PayloadValidationError):
+        return JSONResponse(status_code=422, content={"detail": {"code": "invalid_metadata", "message": str(error)}})
+
+    @app.exception_handler(PublishLimitError)
+    async def publish_limit_handler(_request: Request, error: PublishLimitError):
+        return JSONResponse(status_code=429, headers={"Retry-After": str(error.retry_after)},
+                            content={"detail": {"code": error.code, "message": str(error)}})
 
     @app.exception_handler(AuthenticationError)
     async def authentication_error_handler(_request: Request, error: AuthenticationError):
@@ -565,6 +576,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         request: NotificationCreate,
         device: DevicePublic = Depends(current_device),
     ) -> NotificationPublic:
+        storage.admit_publication(device.id, len(request.model_dump_json().encode("utf-8")))
         notification, event = storage.create_notification(request, origin_device=device)
         if event is not None:
             await publish(event)
@@ -576,9 +588,10 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         payload: HookPayload,
         device: DevicePublic = Depends(current_device),
     ) -> Optional[NotificationPublic]:
+        storage.admit_publication(device.id, len(payload.model_dump_json().encode("utf-8")))
         level, title = _resolve_hook_notification(source, payload)
         body, body_generated = _resolve_hook_body(payload)
-        hook_meta = _hook_metadata(payload, body_generated)
+        hook_meta = validate_metadata(_hook_metadata(payload, body_generated))
         hook_meta.setdefault("ingest_source", "hook_bridge")
         dedupe_key = _hook_delivery_dedupe_key(source, payload, hook_meta, title)
         signal = payload.codex_async

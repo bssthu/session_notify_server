@@ -112,12 +112,22 @@ Linux 首次部署、日常更新和旧更新脚本迁移见 [部署与更新说
 | `SESSION_NOTIFY_PERMISSION_TTL_MINUTES` | `30` | 普通工具权限审批通知有效分钟数 |
 | `SESSION_NOTIFY_DEVICE_PRESENCE_TTL_SECONDS` | `90` | Windows 在线状态有效秒数 |
 | `SESSION_NOTIFY_EXPIRE_POLL_SECONDS` | `60` | 后台清理到期通知并广播过期事件的检查间隔 |
+| `SESSION_NOTIFY_PUBLISH_PER_MINUTE` | `600` | 每台认证设备每分钟最多接收的通知 / Hook 请求数，正整数 |
+| `SESSION_NOTIFY_PUBLISH_BYTES_PER_DAY` | `67108864` | 每台认证设备每日通知 / Hook 载荷预算，默认 64 MiB，正整数 |
 
 直接启动时，监听地址和端口由 `run_dev_server.ps1 -HostAddress ... -Port ...` 或 uvicorn 参数决定；`SESSION_NOTIFY_HOST` 不被应用读取，`SESSION_NOTIFY_PORT` 不替代这些启动参数。Compose 则通过上述端口变量配置 uvicorn 和端口映射。若通过 `-CertFile` 指定其他证书，还需把 `SESSION_NOTIFY_CERT_FILE` 指向同一文件，保证二维码指纹一致。
 
 两小时 access token 为每小时执行的任务留出调度余量，但任务仍应根据 `access_expires_at` 提前刷新，或在 401 后刷新并重试一次。新默认值只影响后续签发/刷新的 token；已有 token 的到期时间不会被修改。refresh 默认 90 天，由管理员管理；首台及最后可用管理员永久。每次刷新会立即使该设备的旧 access token 失效，因此自动化调用端应独立配对。
 
 Linux / macOS 的脚本入口是 `scripts/generate_self_signed_cert.sh` 和 `scripts/run_dev_server.sh`。后者使用 `HOST_ADDRESS`、`PORT`、`CERT_FILE`、`KEY_FILE` 环境变量设置监听与 TLS，与上表的应用配置区分；自定义证书时同样需要设置 `SESSION_NOTIFY_CERT_FILE`。Shell 证书生成器需要支持 `req -addext` 的 OpenSSL，默认 SAN 为 `DNS:localhost, IP:127.0.0.1`；PowerShell 生成器另外包含 `IP:10.0.2.2`。两个生成器都会写入指定输出目录，不能用重新运行生成器代替已有证书的检查。
+
+## 通知输入与发布限额
+
+应用自身限制 POST / PUT / PATCH / DELETE 请求体为 **256 KiB**，超过返回 `413 / request_too_large`；读取请求体最多等待 15 秒。直连 Uvicorn 和经网关访问均生效。通知 `metadata` 和完整 Hook 输入（包含额外字段）各自按紧凑 JSON 的 UTF-8 编码限制为 **64 KiB**、嵌套深度 **8**、总值数 **4096**；Hook 生成或去重合并后的 metadata 也会检查。超出或类型不符返回 `422`。`kind`、标签、事件名称、工具名称等控制字段只接受标量，`tool_input` 等结构化字段仍可使用对象和数组。
+
+两个发布端点共享每设备限额，适用于所有角色，按 UTC 自然分钟 / 自然日计数；字节数以通过模型校验后的完整 JSON 为准。重试和被通知策略抑制的 Hook 也计入额度。计数存于 SQLite，重启和多进程不会重置。超过请求数返回 `429 / publish_rate_limited`，超过日字节预算返回 `429 / publish_daily_quota`，`Retry-After` 表示距相应窗口结束的秒数。调用端应延迟重试；查询和确认通知不受发布额度影响。上述两个环境变量可通过 Compose `.env` 调整，修改后需重建容器。
+
+限额用于控制写入速率，不是数据库总容量上限，也不会删除历史记录。磁盘仍需按保留需求管理。服务端会从新通知及旧记录的下发副本移除 `local_only`、`countdown_local`、`alarm_local`、`controllable`、`alarm_preview` 等仅供客户端本机使用的标记（包括 camelCase 形式）；本机来源由服务端认证的 `origin_device_id` 或客户端自身创建的本地通知决定。
 
 ## 手动发送测试通知
 

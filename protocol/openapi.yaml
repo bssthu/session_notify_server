@@ -2,6 +2,7 @@ openapi: 3.1.0
 info:
   title: Session Notify API
   version: 0.1.0
+  description: POST / PUT / PATCH / DELETE 请求体上限 256 KiB，读取期限 15 秒；限制在应用层生效，直连后端同样受限。
 servers:
   - url: https://localhost:8765
 security:
@@ -225,6 +226,7 @@ paths:
                 items:
                   $ref: "#/components/schemas/Notification"
     post:
+      description: 与 Hook 共享每设备发布额度，默认每个 UTC 分钟 600 次、每个 UTC 日 64 MiB 模型 JSON 载荷。重试同样计入；查询与确认不受此发布额度影响。
       requestBody:
         required: true
         content:
@@ -238,6 +240,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Notification"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "422":
+          $ref: "#/components/responses/InvalidPublication"
+        "429":
+          $ref: "#/components/responses/PublicationLimit"
   /api/v1/notifications/recent:
     get:
       description: 先应用游客可见范围，再筛选、分页、计数和生成筛选建议；游客仅能查看来源为本机的通知。按时间从新到旧返回游标分页；请求超过 30 天时限制为 30 天。
@@ -372,6 +380,7 @@ paths:
                 $ref: "#/components/schemas/EventsResponse"
   /api/v1/hooks/{source}:
     post:
+      description: 与通知发布共享每设备额度，默认每个 UTC 分钟 600 次、每个 UTC 日 64 MiB 模型 JSON 载荷。重试和被策略抑制的事件同样计入；额度可由管理员配置。
       parameters:
         - name: source
           in: path
@@ -393,6 +402,12 @@ paths:
                 oneOf:
                   - $ref: "#/components/schemas/Notification"
                   - type: "null"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "422":
+          $ref: "#/components/responses/InvalidPublication"
+        "429":
+          $ref: "#/components/responses/PublicationLimit"
   /api/v1/ws:
     get:
       summary: WebSocket 连接入口。
@@ -413,6 +428,18 @@ paths:
           description: 升级为 WebSocket；消息格式见 ws-events.schema.json。
 components:
   responses:
+    RequestTooLarge:
+      description: 请求体超过 262144 字节，detail.code 为 request_too_large；缩小载荷后重试。
+    InvalidPublication:
+      description: 字段类型、metadata 或完整 Hook 输入不满足大小 / 深度 / 总值数约束；修正载荷后重试。
+    PublicationLimit:
+      description: 每设备发布额度耗尽。detail.code 为 publish_rate_limited 或 publish_daily_quota；计数跨重启和多进程保持。
+      headers:
+        Retry-After:
+          description: 距对应 UTC 分钟或 UTC 日窗口结束的秒数。
+          schema:
+            type: integer
+            minimum: 1
     AuthenticationRequired:
       description: >-
         结构化鉴权错误。业务请求 invalid_token 也可能是 access 已被另一调用端轮换，
@@ -764,7 +791,11 @@ components:
           type: boolean
         metadata:
           type: object
-          description: 任意通知元数据。Hook 通知在服务端因 payload 没有可展示文本而写入默认正文时会带 `body_generated=true`。
+          description: >-
+            紧凑 JSON 的 UTF-8 编码最多 65536 字节，嵌套深度最多 8（根为 0）、总值数最多 4096（包含根和容器）。
+            kind、标签、事件名称、工具名称等控制字段（含 raw 内同名字段）只接受标量；tool_input 等保留结构化 JSON。
+            local_only、countdown_local、alarm_local、controllable、alarm_preview 及其 camelCase 形式会从网络 metadata 移除。
+            本机来源按 origin_device_id 判断，不采用上述标记。Hook 缺少可展示文本而使用默认正文时带 body_generated=true。
           properties:
             body_generated:
               type: boolean
@@ -964,6 +995,7 @@ components:
             $ref: "#/components/schemas/CodexAsyncAnswerItem"
     HookPayload:
       type: object
+      description: 完整输入（包含额外字段）按紧凑 JSON 的 UTF-8 编码最多 65536 字节，深度最多 8（根为 0）、总值数最多 4096；生成和合并后的 metadata 同样校验。
       additionalProperties: true
       properties:
         hook_event_name:

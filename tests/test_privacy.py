@@ -15,6 +15,16 @@ from app.privacy import (
 from app.schemas import NotificationLevel, NotificationPublic, NotificationStatus, utc_now
 
 
+def test_legacy_local_flags_are_removed_from_delivery_without_changing_stored_metadata():
+    original = _notification("Done", origin="desktop", privacy=None).model_copy(update={
+        "metadata": {"local_only": "1", "alarmLocal": True, "tag": "work"},
+    })
+    delivered = redact_notification_for_device(original, "phone")
+    assert delivered.metadata == {"tag": "work"}
+    assert delivered.origin_device_id == "desktop"
+    assert original.metadata["local_only"] == "1"
+
+
 def test_normalize_privacy_tag_accepts_hide_and_local_only():
     assert normalize_privacy_tag(" HIDE ") == "hide"
     assert normalize_privacy_tag("Local") == "local"
