@@ -8,7 +8,7 @@
 
 Codex 异步提问回答兼容旧版引用文本和 Hook bundle 15 的新版结构化格式。新版 `answered_batch` 使用调用 ID、题目序号及完整题目指纹关联，支持选项、自由输入、逐题和批量回答；一组题目全部回答后才同步确认通知。回答正文不上传，断网补发和服务端重启保留关联状态。部署时先更新服务端，再更新 Windows 客户端并执行 Hook「安装 / 更新」；旧版客户端和旧数据库继续兼容。
 
-当前 Windows Hook bundle 为 **18**；文中 15、16 等数字表示功能引入版本。通知输入与发布限额由服务端执行，旧客户端同样可能收到 `413` / `422` / `429`。客户端升级后才具有旧 metadata 容错和可信“本机”标记处理；Android 需连同 Windows 共享 Web 资源重新构建。详见[输入与发布限额](#通知输入与发布限额)。
+当前 Windows Hook bundle 为 **19**；文中 15、16 等数字表示功能引入版本。通知输入与发布限额由服务端执行，旧客户端同样可能收到 `413` / `422` / `429`。bundle 19 会裁剪超预算的原始诊断数据并隔离永久请求错误，不要求放宽服务端深度限制。客户端升级后才具有旧 metadata 容错和可信“本机”标记处理；Android 需连同 Windows 共享 Web 资源重新构建。详见[输入与发布限额](#通知输入与发布限额)。
 
 ## 本地运行
 
@@ -132,7 +132,7 @@ Linux / macOS 的脚本入口是 `scripts/generate_self_signed_cert.sh` 和 `scr
 
 `POST /api/v1/notifications` 和 `POST /api/v1/hooks/{source}` 共享每设备限额，适用于所有角色，按 UTC 自然分钟 / 自然日计数；字节数以通过模型校验后的完整 JSON 为准。通过入口校验、鉴权和额度检查的重试、重复投递及被通知策略抑制的 Hook 也计入；后续业务处理失败不退还额度。入口拒绝的 `413` / `422` 以及额度拒绝的 `429` 不增加计数。计数存于 SQLite，重启和共享同一数据库的多进程不会重置。超过请求数返回 `429 / publish_rate_limited`，超过日字节预算返回 `429 / publish_daily_quota`，`Retry-After` 表示距相应窗口结束的秒数。调用端应延迟重试；查询和确认通知不受发布额度影响。上述两个环境变量可通过 Compose `.env` 调整，修改后需重新创建后端容器，见[部署配置](deploy/README.zh-CN.md#配置发布限额)。
 
-错误响应并非统一格式：应用的 `413`、`429` 及生成/合并 metadata 的 `422` 使用 `detail: {code, message}`；入口模型校验的 `422` 使用 FastAPI 的 `detail` 数组。应用的 `408` 使用字符串 `detail`；前置网关先拒绝请求时也可能返回其他格式。调用端应先按 HTTP 状态分类，不要假设每次都存在 `detail.code`。`413` / `422` 需修正载荷后再投递，持续重发相同内容不会解决。当前 Bridge 与 Codex 失败队列的重试策略不同，见[Bridge 说明](../session_notify_windows/hook_bridge/README.md#输入拒绝与限流处理)。
+错误响应并非统一格式：应用的 `413`、`429` 及生成/合并 metadata 的 `422` 使用 `detail: {code, message}`；入口模型校验的 `422` 使用 FastAPI 的 `detail` 数组。应用的 `408` 使用字符串 `detail`；前置网关先拒绝请求时也可能返回其他格式。调用端应先按 HTTP 状态分类，不要假设每次都存在 `detail.code`。`413` / `422` 需修正载荷后再投递，持续重发相同内容不会解决。Windows 原生 Bridge bundle 19 和 Codex App Server 失败队列均会隔离永久请求错误；两者的队列与恢复流程仍各自独立，见[Bridge 说明](../session_notify_windows/hook_bridge/README.md#输入拒绝与限流处理)。
 
 限额用于控制写入速率，不是数据库总容量上限，也不会删除历史记录。磁盘仍需按保留需求管理。服务端会从新通知及旧记录的下发副本移除 `local_only`、`countdown_local`、`alarm_local`、`controllable`、`alarm_preview` 等仅供客户端本机使用的标记（包括 camelCase 形式）；本机来源由服务端认证的 `origin_device_id` 或客户端自身创建的本地通知决定。
 
