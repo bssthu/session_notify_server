@@ -488,6 +488,13 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     ) -> DevicePresenceSummary:
         return storage.device_presence_summary(DEVICE_PRESENCE_TTL, viewer_device_id=device.id)
 
+    @app.get("/api/v1/devices/me/notification-policy")
+    def get_notification_policy(device: DevicePublic = Depends(current_device)) -> dict[str, bool]:
+        return {
+            "hook_notifications_enabled": device.hook_notifications_enabled,
+            "silent_notifications": device.silent_notifications,
+        }
+
     @app.post("/api/v1/devices/me/presence", response_model=DevicePresenceSummary)
     async def update_current_device_presence(
         request: DevicePresenceUpdateRequest,
@@ -535,6 +542,8 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 device_id,
                 name=request.name,
                 notifications_enabled=request.notifications_enabled,
+                hook_notifications_enabled=request.hook_notifications_enabled,
+                silent_notifications=request.silent_notifications,
                 role=request.role,
                 actor_id=device.id,
                 **request.model_dump(include={"refresh_ttl_days", "refresh_expires_at"}, exclude_unset=True),
@@ -608,7 +617,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         suppress = _should_suppress_hook_notification(source, payload, body_generated, title)
         notification: Optional[NotificationPublic] = None
         events_to_broadcast: list[SyncEvent] = []
-        if not suppress:
+        if not suppress and device.hook_notifications_enabled:
             # approval 类(needs confirmation)即时性强,用短 TTL;其它 hook 通知维持默认 24h。
             permission_ttl = HOOK_PERMISSION_TTL if "needs confirmation" in title else HOOK_NOTIFICATION_TTL
             request = NotificationCreate(
@@ -625,6 +634,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 origin_device=device,
                 dedupe_key=dedupe_key,
                 correlate_claude_approval=True,
+                enforce_hook_policy=True,
             )
             if event is not None:
                 events_to_broadcast.append(event)

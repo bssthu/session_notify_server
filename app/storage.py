@@ -499,6 +499,8 @@ class Storage:
                     last_seen_at TEXT,
                     revoked_at TEXT,
                     notifications_enabled INTEGER NOT NULL DEFAULT 1,
+                    hook_notifications_enabled INTEGER NOT NULL DEFAULT 1,
+                    silent_notifications INTEGER NOT NULL DEFAULT 0,
                     notification_pause_until TEXT,
                     session_state TEXT NOT NULL DEFAULT 'unknown',
                     session_state_updated_at TEXT,
@@ -633,6 +635,8 @@ class Storage:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(devices)").fetchall()}
         additions = {
             "notifications_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "hook_notifications_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "silent_notifications": "INTEGER NOT NULL DEFAULT 0",
             "notification_pause_until": "TEXT",
             "session_state": "TEXT NOT NULL DEFAULT 'unknown'",
             "session_state_updated_at": "TEXT",
@@ -851,6 +855,7 @@ class Storage:
     def update_device(
         self, device_id: str, *, name: str | None = None,
         notifications_enabled: bool | None = None, role: DeviceRole | None = None,
+        hook_notifications_enabled: bool | None = None, silent_notifications: bool | None = None,
         actor_id: str | None = None, refresh_ttl_days=_UNSET, refresh_expires_at=_UNSET,
     ) -> DevicePublic:
         changing_expiry = refresh_ttl_days is not _UNSET or refresh_expires_at is not _UNSET
@@ -874,6 +879,11 @@ class Storage:
             if notifications_enabled is not None:
                 assignments.append("notifications_enabled = ?")
                 values.append(int(notifications_enabled))
+            for field, value in (("hook_notifications_enabled", hook_notifications_enabled),
+                                 ("silent_notifications", silent_notifications)):
+                if value is not None:
+                    assignments.append(f"{field} = ?")
+                    values.append(int(value))
             new_role = DeviceRole(role) if role is not None else DeviceRole(row["role"])
             if role is not None:
                 if new_role != DeviceRole.admin and row["role"] == DeviceRole.admin.value:
@@ -972,6 +982,7 @@ class Storage:
             row = self._conn.execute(
                 """
                 SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
+                       hook_notifications_enabled, silent_notifications,
                        notification_pause_until, session_state, session_state_updated_at,
                        suppress_codex_permission_requests, refresh_expires_at, access_expires_at
                 FROM devices
@@ -1022,6 +1033,7 @@ class Storage:
             row = self._conn.execute(
                 """
                 SELECT id, name, platform, role, created_at, last_seen_at, revoked_at, notifications_enabled,
+                       hook_notifications_enabled, silent_notifications,
                        notification_pause_until, session_state, session_state_updated_at, access_expires_at, refresh_expires_at
                 FROM devices
                 WHERE id = ?
@@ -1362,7 +1374,8 @@ class Storage:
         *,
         dedupe_key: str | None = None,
         correlate_claude_approval: bool = False,
-    ) -> tuple[NotificationPublic, SyncEvent | None]:
+        enforce_hook_policy: bool = False,
+    ) -> tuple[NotificationPublic | None, SyncEvent | None]:
         now = utc_now()
         notification = NotificationPublic(
             id=new_id(),
@@ -1382,10 +1395,20 @@ class Storage:
             metadata=canonicalize_privacy_metadata(request.metadata),
         )
         with self._lock, self._conn:
+            # Serialize policy reads with device changes and publication. A stale
+            # authenticated device snapshot must not bypass an administrator's update.
+            self._conn.execute("BEGIN IMMEDIATE")
+            policy = self._conn.execute(
+                "SELECT hook_notifications_enabled, silent_notifications FROM devices WHERE id = ?",
+                (origin_device.id,),
+            ).fetchone() if origin_device else None
+            if enforce_hook_policy and policy and not policy["hook_notifications_enabled"]:
+                return None, None
+            silent = bool(policy and policy["silent_notifications"])
             if correlate_claude_approval:
                 correlated = self._find_correlated_claude_approval(notification)
                 if correlated is not None:
-                    return self._merge_correlated_claude_approval(correlated, notification)
+                    return self._merge_correlated_claude_approval(correlated, notification, silent=silent)
             if dedupe_key:
                 # Delivery IDs and session/turn IDs are client supplied. Namespace
                 # by the authenticated origin, including when retrying older keys.
@@ -1394,14 +1417,16 @@ class Storage:
                     (dedupe_key, notification.origin_device_id),
                 ).fetchone()
                 if legacy is not None:
-                    return self._merge_duplicate_notification(legacy, notification), None
+                    merged = self._merge_duplicate_notification(legacy, notification)
+                    return self._silently_acknowledge_locked(merged) if silent else (merged, None)
                 dedupe_key = json.dumps(["origin", notification.origin_device_id, dedupe_key])
                 existing = self._conn.execute(
                     "SELECT * FROM notifications WHERE dedupe_key = ?",
                     (dedupe_key,),
                 ).fetchone()
                 if existing is not None:
-                    return self._merge_duplicate_notification(existing, notification), None
+                    merged = self._merge_duplicate_notification(existing, notification)
+                    return self._silently_acknowledge_locked(merged) if silent else (merged, None)
             try:
                 self._insert_notification(notification, dedupe_key=dedupe_key)
             except sqlite3.IntegrityError:
@@ -1415,7 +1440,10 @@ class Storage:
                 ).fetchone()
                 if existing is None:
                     raise
-                return self._merge_duplicate_notification(existing, notification), None
+                merged = self._merge_duplicate_notification(existing, notification)
+                return self._silently_acknowledge_locked(merged) if silent else (merged, None)
+            if silent:
+                return self._silently_acknowledge_locked(notification)
             event = self._append_event(
                 SyncEvent(
                     event_id=new_id(),
@@ -1425,6 +1453,27 @@ class Storage:
                 )
             )
         return notification, event
+
+    def _silently_acknowledge_locked(self, notification: NotificationPublic) -> tuple[NotificationPublic, SyncEvent | None]:
+        """Confirm within the publishing transaction, without a created event."""
+        if notification.status != NotificationStatus.active:
+            return notification, None
+        now = utc_now()
+        self._conn.execute(
+            "UPDATE notifications SET status = ?, updated_at = ? WHERE id = ?",
+            (NotificationStatus.acknowledged.value, _dt(now), notification.id),
+        )
+        self._conn.execute(
+            "INSERT OR REPLACE INTO acks(notification_id, device_id, ack_at, reason) VALUES (?, ?, ?, ?)",
+            (notification.id, notification.origin_device_id, _dt(now), "silent_send"),
+        )
+        updated = notification.model_copy(update={"status": NotificationStatus.acknowledged, "updated_at": now})
+        event = self._append_event(SyncEvent(
+            event_id=new_id(), event_type=EventType.notification_acknowledged, created_at=now,
+            notification_id=notification.id, ack_by_device_id=notification.origin_device_id,
+            ack_at=now, reason="silent_send",
+        ))
+        return updated, event
 
     def _find_correlated_claude_approval(
         self,
@@ -1463,6 +1512,7 @@ class Storage:
         self,
         existing_row: sqlite3.Row,
         incoming: NotificationPublic,
+        *, silent: bool = False,
     ) -> tuple[NotificationPublic, SyncEvent | None]:
         """Upsert Claude's PermissionRequest + permission_prompt transport pair."""
         existing = self._notification_from_row(existing_row)
@@ -1508,6 +1558,8 @@ class Storage:
             ),
         )
 
+        if silent:
+            return self._silently_acknowledge_locked(updated)
         visible_change = incoming_is_preferred and (
             incoming.title != existing.title
             or incoming.body != existing.body
@@ -2552,6 +2604,8 @@ class Storage:
             access_expires_at=_parse_dt(row["access_expires_at"]),
             refresh_expires_at=_parse_dt(row["refresh_expires_at"]),
             notifications_enabled=bool(row["notifications_enabled"]),
+            hook_notifications_enabled=bool(row["hook_notifications_enabled"]),
+            silent_notifications=bool(row["silent_notifications"]),
             notification_pause_until=_parse_dt(row["notification_pause_until"]),
             session_state=DeviceSessionState(row["session_state"] or DeviceSessionState.unknown.value),
             session_state_updated_at=_parse_dt(row["session_state_updated_at"]),

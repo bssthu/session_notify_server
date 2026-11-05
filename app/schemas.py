@@ -79,6 +79,8 @@ class DevicePublic(BaseModel):
     refresh_expires_at: datetime | None = None
     access_expires_at: datetime | None = None
     notifications_enabled: bool = True
+    hook_notifications_enabled: bool = True
+    silent_notifications: bool = False
     notification_pause_until: datetime | None = None
     session_state: DeviceSessionState = DeviceSessionState.unknown
     session_state_updated_at: datetime | None = None
@@ -105,6 +107,8 @@ class RefreshExpiryPolicy(BaseModel):
 class DeviceUpdateRequest(RefreshExpiryPolicy):
     name: str | None = Field(default=None, min_length=1, max_length=80)
     notifications_enabled: bool | None = None
+    hook_notifications_enabled: bool | None = None
+    silent_notifications: bool | None = None
     role: DeviceRole | None = None
 
 
