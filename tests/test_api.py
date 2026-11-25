@@ -1321,6 +1321,25 @@ def test_devin_hook_event_mapping_and_prompt_id_resolution(tmp_path):
     assert completed.json()["source"] == "devin"
     assert completed.json()["metadata"]["turn_id"] == "devin-prompt-1"
 
+    compaction = client.post(
+        "/api/v1/hooks/devin",
+        headers=auth(token),
+        json={
+            "event_type": "compaction_completed",
+            "hook_event_name": "PostCompact",
+            "hook_status": "compaction_completed",
+            "session_id": "devin-compact",
+            "message": "Devin /compact 上下文压缩完成。",
+            "turn_id": "devin-compact-turn",
+            "metadata": {"raw": {"trigger": "manual"}},
+        },
+    )
+    assert compaction.status_code == 200, compaction.text
+    assert compaction.json()["level"] == "success"
+    assert compaction.json()["title"] == "devin compaction completed"
+    assert compaction.json()["body"] == "Devin /compact 上下文压缩完成。"
+    assert compaction.json()["metadata"]["turn_id"] == "devin-compact-turn"
+
     question = client.post(
         "/api/v1/hooks/devin",
         headers=auth(token),

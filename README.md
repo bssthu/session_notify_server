@@ -8,7 +8,7 @@
 
 Codex 异步提问回答兼容旧版引用文本和 Hook bundle 15 的新版结构化格式。新版 `answered_batch` 使用调用 ID、题目序号及完整题目指纹关联，支持选项、自由输入、逐题和批量回答；一组题目全部回答后才同步确认通知。回答正文不上传，断网补发和服务端重启保留关联状态。部署时先更新服务端，再更新 Windows 客户端并执行 Hook「安装 / 更新」；旧版客户端和旧数据库继续兼容。
 
-当前 Windows Hook bundle 为 **20**；文中 15、16 等数字表示功能引入版本。通知输入与发布限额由服务端执行，旧客户端同样可能收到 `413` / `422` / `429`。bundle 19 会裁剪超预算的原始诊断数据并隔离永久请求错误，不要求放宽服务端深度限制。客户端升级后才具有旧 metadata 容错和可信“本机”标记处理；Android 需连同 Windows 共享 Web 资源重新构建。详见[输入与发布限额](#通知输入与发布限额)。
+当前 Windows Hook bundle 为 **21**；文中 15、16 等数字表示功能引入版本。通知输入与发布限额由服务端执行，旧客户端同样可能收到 `413` / `422` / `429`。bundle 19 会裁剪超预算的原始诊断数据并隔离永久请求错误，不要求放宽服务端深度限制。客户端升级后才具有旧 metadata 容错和可信“本机”标记处理；Android 需连同 Windows 共享 Web 资源重新构建。详见[输入与发布限额](#通知输入与发布限额)。
 
 ## 本地运行
 
@@ -169,7 +169,7 @@ uv run pytest
 - WebSocket 推送 `notification.created`、`notification.acknowledged`、`notification.expired`、`device.presence_changed`，配对成功通过 `pair.consumed` 仅通知签发设备；支持查询参数 `token` 或 `Authorization` 请求头，后者优先。
 - 汇总 Windows 锁屏与通知暂停状态；Android 可按“未锁屏且未暂停”的电脑可用性决定是否展示提醒。
 - 幂等确认：任一设备确认后，通知状态以服务端为准。
-- Codex / Claude Code / Cursor / Devin / DeepSeek Harness Hook 载荷到统一通知的基础映射。
+- Codex / Claude Code / Cursor / Devin / DeepSeek Harness Hook 载荷到统一通知的基础映射，包括 Devin 手动 `/compact` 完成事件。
 - `SESSION_NOTIFY_TAG` 作为 `metadata.tag` 随通知保存，供客户端展示和历史筛选。
 - `SESSION_NOTIFY_PRIVACY_TAG`：`hide` 时所有设备下发的正文替换为 `***`；`local` 时仅来源设备看到明文。正文不可见时，元数据仅保留展示与关联控制字段，移除原始载荷、工具输入和自由文本诊断。服务端存储保持明文；不可见的正文不会进入历史关键词搜索。Windows Hook 自 bundle 11 支持此能力。
 - Codex 异步提问按来源设备、会话和完整题目指纹匹配回答，支持跨回合、逐题回答、重复投递和乱序补发；全部回答后持久确认并广播 `notification.acknowledged`。同题歧义时保留；迟到题目使原匹配产生歧义时，撤销未过期通知的自动确认，并通过原 ID 的 `notification.created` 更新两端，手动确认始终保留。Stop 和启动清理不消除未回答的异步问题。旧版引用回答按完整题目指纹唯一匹配；Hook bundle 15 的结构化回答进一步校验调用 ID 与题目序号，错误 ID 不回退为文本猜测。应先更新服务端，再更新 Hook。

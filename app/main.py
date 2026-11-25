@@ -228,6 +228,8 @@ def _resolve_hook_notification(source: str, payload: HookPayload) -> tuple[Notif
         level, title = NotificationLevel.critical, f"{source} needs attention"
     elif any(key in text for key in ("auth", "approval", "permission", "confirm", "input", "elicitation")):
         level, title = NotificationLevel.important, f"{source} needs confirmation"
+    elif source.lower() == "devin" and event_type == "compaction_completed":
+        level, title = NotificationLevel.success, f"{source} compaction completed"
     elif any(key in text for key in ("done", "complete", "success", "finish", "stop", "taskcompleted")):
         level, title = NotificationLevel.success, f"{source} completed"
     elif "idle" in text:
